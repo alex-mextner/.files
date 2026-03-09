@@ -55,18 +55,7 @@ alias %=' '
 
 
 
-if [[ $RANDOM > 8191 ]]; then
-  echo
-  echo
-  get-random-alias-help
-  echo '_____________________________'
-  echo '       \'
-  echo '        \  .\__/.       '
-  echo '         \  (oo)\_______'
-  echo '            (_.)\       )\/\'
-  echo '                ||----w |'
-  echo '                ||     ||'
-fi
 eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
 # eval "$(/opt/homebrew/bin/brew shellenv)"
 
+. "$HOME/.cargo/env"

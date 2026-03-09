@@ -2,7 +2,8 @@
 # fpath=( $fpath)
 # __zplug::utils::ansi::remove:17: maximum nested function level reached; increase FUNCNEST?
 FUNCNEST=1500
-export ZPLUG_HOME=/usr/local/opt/zplug
+#export ZPLUG_HOME=/usr/local/opt/zplug
+export ZPLUG_HOME=/opt/homebrew/opt/zplug
 source $ZPLUG_HOME/init.zsh
 
 # zplug load # --verbose
@@ -135,5 +136,20 @@ eval "$(gh copilot alias -- zsh)"
 
 export GOPATH=$HOME/go
 #golang
-export PATH=$PATH:$GOPATH/bin
+export PATH=/Users/ultra/.bun/bin:$PATH:$GOPATH/bin
 #dart
+
+eval $(thefuck --alias)
+
+if [[ $RANDOM > 8191 ]]; then
+  echo
+  echo
+  get-random-alias-help
+  echo '_____________________________'
+  echo '       \'
+  echo '        \  .\__/.       '
+  echo '         \  (oo)\_______'
+  echo '            (_.)\       )\/\'
+  echo '                ||----w |'
+  echo '                ||     ||'
+fi
