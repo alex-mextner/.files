@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GRACEFUL_TIMEOUT=5
+
+usage() {
+  echo "Usage: ppkill <port> [timeout_seconds]"
+  echo "  Kill process(es) listening on a given port."
+  echo "  First sends SIGTERM, waits up to timeout (default: ${GRACEFUL_TIMEOUT}s), then SIGKILL."
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+[[ "$1" =~ ^[0-9]+$ ]] || { echo "Error: port must be a number, got '$1'" >&2; exit 1; }
+
+PORT="$1"
+TIMEOUT="${2:-$GRACEFUL_TIMEOUT}"
+
+# Find PIDs listening on the port
+pids=$(lsof -t -i :"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+
+if [[ -z "$pids" ]]; then
+  echo "No process listening on port $PORT"
+  exit 0
+fi
+
+# Deduplicate PIDs
+pids=$(echo "$pids" | sort -u)
+pid_count=$(echo "$pids" | wc -l | tr -d ' ')
+
+# Show what we're dealing with
+echo "=== Processes on port $PORT ($pid_count) ==="
+for pid in $pids; do
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null || echo "???")
+  cwd=$(lsof -p "$pid" -Fn 2>/dev/null | grep '^n/' | grep cwd | sed 's/^n//' | head -1)
+  [[ -z "$cwd" ]] && cwd=$(ls -l /proc/"$pid"/cwd 2>/dev/null | awk '{print $NF}') || true
+  echo "  PID $pid: $cmd"
+  [[ -n "$cwd" ]] && echo "    cwd: $cwd"
+done
+echo ""
+
+# Phase 1: SIGTERM
+echo ">>> Sending SIGTERM (graceful shutdown)..."
+for pid in $pids; do
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -15 "$pid" 2>/dev/null && echo "  SIGTERM -> PID $pid" || echo "  Failed to signal PID $pid (permission denied?)"
+  fi
+done
+
+# Wait for graceful shutdown
+echo ">>> Waiting up to ${TIMEOUT}s for exit..."
+elapsed=0
+while [[ $elapsed -lt $TIMEOUT ]]; do
+  still_alive=false
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      still_alive=true
+      break
+    fi
+  done
+  $still_alive || break
+  sleep 1
+  elapsed=$((elapsed + 1))
+  echo "  ... ${elapsed}s"
+done
+
+# Check survivors
+survivors=""
+for pid in $pids; do
+  if kill -0 "$pid" 2>/dev/null; then
+    survivors="$survivors $pid"
+  fi
+done
+
+if [[ -z "$survivors" ]]; then
+  echo ""
+  echo "All processes exited gracefully."
+  exit 0
+fi
+
+# Phase 2: SIGKILL
+echo ""
+echo ">>> Stubborn process(es):$survivors — sending SIGKILL..."
+for pid in $survivors; do
+  kill -9 "$pid" 2>/dev/null && echo "  SIGKILL -> PID $pid" || echo "  Failed to kill PID $pid"
+done
+
+sleep 1
+
+# Final check
+failed=""
+for pid in $pids; do
+  if kill -0 "$pid" 2>/dev/null; then
+    failed="$failed $pid"
+  fi
+done
+
+if [[ -z "$failed" ]]; then
+  echo ""
+  echo "All processes killed (required SIGKILL)."
+  exit 0
+fi
+
+echo ""
+echo "FAILED to kill:$failed"
+echo ""
+echo "Recommendations:"
+echo "  1. Try with sudo:  sudo ppkill $PORT"
+echo "  2. Check owner:    ps -p $(echo $failed | tr ' ' ',') -o pid,user,command"
+echo "  3. Nuclear:        sudo kill -9$failed"
+exit 1
