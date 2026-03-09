@@ -1,7 +1,7 @@
 [user]
-  name = Alexander Mekhonoshin
-  email = ultra@dubformer.ai
-	signingkey = A95385DFEF9D1FBD
+  name = Alex Ultra
+  email = invntrm@icloud.com
+	signingkey = D8432C6E26F51925
 [core]
 	whitespace=fix,-indent-with-non-tab,trailing-space,cr-at-eol,space-before-tab
 	quotepath = false # Чтобы не упячилась кириллица в путях
@@ -24,7 +24,7 @@
 	trustExitCode = true
 
 [mergetool "vscode"]
-	cmd = "code --wait " # cmd = code --wait $MERGED
+	cmd = code --wait $MERGED #"cursor --wait "
 
 [difftool "ws"]
 	cmd = webide diff $(cd $(dirname "$LOCAL") && pwd)/$(basename "$LOCAL") $(cd $(dirname "$REMOTE") && pwd)/$(basename "$REMOTE")
@@ -78,7 +78,7 @@
 	am = commit --amend
 	cp = cherry-pick
 	amend = commit --amend -C HEAD
-	undo = !legit undo
+	undo = !/opt/homebrew/bin/legit undo
 	cp = cherry-pick
 	lg = log -p
 	rb = rebase
@@ -110,10 +110,10 @@
 	unignore = update-index --no-assume-unchanged
 	switch = !legit switch
 	sw = !legit switch
-	sync = !legit sync
-	publish = !legit publish
-	unpublish = !legit unpublish
-	branches = !legit branches
+	sync = !/opt/homebrew/bin/legit sync
+	publish = !/opt/homebrew/bin/legit publish
+	unpublish = !/opt/homebrew/bin/legit unpublish
+	branches = !/opt/homebrew/bin/legit branches
 
 	# clean-branches-dryrun = "!git branch --merged | egrep -v '(^\*|master|dev)' | xargs echo git branch -d"
 
@@ -172,3 +172,5 @@
 [diff "lockb"]
 	textconv = bun
 	binary = true
+[gpg]
+	program = /opt/homebrew/bin/gpg
