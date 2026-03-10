@@ -32,8 +32,7 @@ pid_count=$(echo "$pids" | wc -l | tr -d ' ')
 echo "=== Processes on port $PORT ($pid_count) ==="
 for pid in $pids; do
   cmd=$(ps -p "$pid" -o command= 2>/dev/null || echo "???")
-  cwd=$(lsof -p "$pid" -Fn 2>/dev/null | grep '^n/' | grep cwd | sed 's/^n//' | head -1)
-  [[ -z "$cwd" ]] && cwd=$(ls -l /proc/"$pid"/cwd 2>/dev/null | awk '{print $NF}') || true
+  cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | grep '^n/' | sed 's/^n//' | head -1)
   echo "  PID $pid: $cmd"
   [[ -n "$cwd" ]] && echo "    cwd: $cwd"
 done
