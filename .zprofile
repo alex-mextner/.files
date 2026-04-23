@@ -131,7 +131,91 @@ setopt always_to_end # move cursor to end if word had one match
 zstyle ':completion:*' menu select # select completions with arrow keys
 zstyle ':completion:*' group-name '' # group results by category
 zstyle ':completion:::::' completer _expand _complete _ignored _approximate # enable approximate matches for completion
-eval "$(gh copilot alias -- zsh)"
+
+# gh 2.89 shadows the legacy gh-copilot extension; use the wrapper command directly.
+if command -v copilot >/dev/null 2>&1; then
+  ghcs() {
+    local TARGET="shell"
+    local GH_DEBUG="$GH_DEBUG"
+    local GH_HOST="$GH_HOST"
+    local OPT OPTARG OPTIND
+
+    while getopts "dht:-:" OPT; do
+      if [ "$OPT" = "-" ]; then
+        OPT="${OPTARG%%=*}"
+        OPTARG="${OPTARG#"$OPT"}"
+        OPTARG="${OPTARG#=}"
+      fi
+
+      case "$OPT" in
+        debug | d)
+          GH_DEBUG=api
+          ;;
+
+        help | h)
+          copilot suggest --help
+          return 0
+          ;;
+
+        hostname)
+          GH_HOST="$OPTARG"
+          ;;
+
+        target | t)
+          TARGET="$OPTARG"
+          ;;
+      esac
+    done
+
+    shift "$((OPTIND-1))"
+
+    local TMPFILE FIXED_CMD
+    TMPFILE="$(mktemp -t gh-copilotXXXXXX)"
+    trap 'rm -f "$TMPFILE"' EXIT
+    if GH_DEBUG="$GH_DEBUG" GH_HOST="$GH_HOST" copilot suggest -t "$TARGET" "$@" --shell-out "$TMPFILE"; then
+      if [ -s "$TMPFILE" ]; then
+        FIXED_CMD="$(cat "$TMPFILE")"
+        print -s -- "$FIXED_CMD"
+        echo
+        eval -- "$FIXED_CMD"
+      fi
+    else
+      return 1
+    fi
+  }
+
+  ghce() {
+    local GH_DEBUG="$GH_DEBUG"
+    local GH_HOST="$GH_HOST"
+    local OPT OPTARG OPTIND
+
+    while getopts "dh-:" OPT; do
+      if [ "$OPT" = "-" ]; then
+        OPT="${OPTARG%%=*}"
+        OPTARG="${OPTARG#"$OPT"}"
+        OPTARG="${OPTARG#=}"
+      fi
+
+      case "$OPT" in
+        debug | d)
+          GH_DEBUG=api
+          ;;
+
+        help | h)
+          copilot explain --help
+          return 0
+          ;;
+
+        hostname)
+          GH_HOST="$OPTARG"
+          ;;
+      esac
+    done
+
+    shift "$((OPTIND-1))"
+    GH_DEBUG="$GH_DEBUG" GH_HOST="$GH_HOST" copilot explain "$@"
+  }
+fi
 
 
 export GOPATH=$HOME/go

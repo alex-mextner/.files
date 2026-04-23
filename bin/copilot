@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+
+set -eu
+
+if [ -x "$HOME/.local/share/gh/copilot/copilot" ]; then
+  exec "$HOME/.local/share/gh/copilot/copilot" "$@"
+fi
+
+if command -v gh >/dev/null 2>&1; then
+  exec gh extension exec copilot "$@"
+fi
+
+printf '%s\n' "GitHub Copilot CLI is unavailable: install GitHub CLI with the gh-copilot extension." >&2
+exit 127
