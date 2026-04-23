@@ -174,3 +174,23 @@
 	binary = true
 [gpg]
 	program = /opt/homebrew/bin/gpg
+[safe]
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /private/tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /private/tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /private/tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /private/tmp/ntgcalls-debug
+	directory = /tmp/ntgcalls-debug
+	directory = /private/tmp/ntgcalls-debug
