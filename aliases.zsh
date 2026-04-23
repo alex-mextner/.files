@@ -209,6 +209,9 @@ alias -g '|/'='| grep -i' # / foo |/ bar #= grep foo | grep bar
 
 alias /='rg'
 
+# claude with permission checks disabled — for sandboxes / trusted dirs
+alias cc='claude --allow-dangerously-skip-permissions --permission-mode bypassPermissions'
+
 # Moshi iOS client detection — trigger adjustments when connected from the app
 # (e.g. narrower prompts, skip nerd-font glyphs, alt keybindings).
 # Tmux-side status-bar clearing lives in .tmux.conf.
