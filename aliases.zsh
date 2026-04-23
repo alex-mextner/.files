@@ -208,3 +208,10 @@ bindkey '\e[4~' end-of-line
 alias -g '|/'='| grep -i' # / foo |/ bar #= grep foo | grep bar
 
 alias /='rg'
+
+# Moshi iOS client detection — trigger adjustments when connected from the app
+# (e.g. narrower prompts, skip nerd-font glyphs, alt keybindings).
+# Tmux-side status-bar clearing lives in .tmux.conf.
+if [ -n "$MOSHI_CLIENT" ]; then
+  : # placeholder; customize when a concrete need appears
+fi
