@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# vscmd — Execute a VS Code command for a specific workspace folder
+#
+# Usage:
+#   vscmd <commandId> [-p <project-path>]
+#
+# Examples:
+#   vscmd workbench.action.reloadWindow -p /Users/ultra/work/ext-test-projects/react-vite-tw4-twitter/
+
+set -euo pipefail
+
+COMMAND=""
+PROJECT_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--project)
+      PROJECT_PATH="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      echo "Usage: vscmd <commandId> [-p <project-path>]" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$COMMAND" ]]; then
+        COMMAND="$1"
+      else
+        echo "Unexpected argument: $1" >&2
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$COMMAND" ]]; then
+  echo "Error: command ID is required" >&2
+  echo "Usage: vscmd <commandId> [-p <project-path>]" >&2
+  exit 1
+fi
+
+# Find code binary
+CODE_BIN=""
+for candidate in /usr/local/bin/code "$HOME/.vscode/bin/code" "$HOME/.cursor/bin/cursor" /opt/homebrew/bin/cursor; do
+  if [[ -x "$candidate" ]]; then
+    CODE_BIN="$candidate"
+    break
+  fi
+done
+[[ -z "$CODE_BIN" ]] && CODE_BIN="$(which code 2>/dev/null || true)"
+
+if [[ -z "$CODE_BIN" ]]; then
+  echo "Error: 'code' CLI not found. Install it via VS Code: Cmd+Shift+P → 'Install code command in PATH'" >&2
+  exit 1
+fi
+
+# Detect app name and process name for AppleScript (Cursor vs VS Code).
+# 'tell application' uses the app bundle name; 'tell process' uses the running process name.
+APP_NAME="Visual Studio Code"
+PROCESS_NAME="Code"
+if [[ "$CODE_BIN" == *cursor* ]]; then
+  APP_NAME="Cursor"
+  PROCESS_NAME="Cursor"
+fi
+
+# Focus the project window if path given
+if [[ -n "$PROJECT_PATH" ]]; then
+  PROJECT_PATH="$(cd "$PROJECT_PATH" 2>/dev/null && pwd)" || {
+    echo "Error: project path does not exist: $PROJECT_PATH" >&2
+    exit 1
+  }
+  "$CODE_BIN" --reuse-window "$PROJECT_PATH" 2>/dev/null || true
+  sleep 1
+fi
+
+# Execute command via AppleScript: set frontmost, open command palette, type, Enter.
+# 'tell application App to activate' must be separate from 'tell application System Events'
+# — combining them in one heredoc causes -609 Connection Invalid on Electron apps.
+# Use clipboard for text input — keystroke is layout-dependent (non-Latin layouts
+# produce garbage). Set clipboard, paste with Cmd+V, restore clipboard after.
+PREV_CLIPBOARD="$(pbpaste 2>/dev/null || true)"
+printf '%s' "$COMMAND" | pbcopy
+
+osascript -e "tell application \"$APP_NAME\" to activate" 2>/dev/null || true
+osascript <<EOF
+tell application "System Events"
+  tell process "$PROCESS_NAME"
+    set frontmost to true
+    delay 0.5
+    key code 35 using {command down, shift down}
+    delay 0.5
+    key code 9 using {command down}
+    delay 0.4
+    key code 36
+  end tell
+end tell
+EOF
+
+# Restore clipboard
+printf '%s' "$PREV_CLIPBOARD" | pbcopy
