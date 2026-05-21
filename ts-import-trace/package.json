@@ -9,6 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "devDependencies": {
+    "stylelint-standard": "^1.2.3"
+  },
   "dependencies": {
     "@types/node": "^20.14.2",
     "ts-morph": "^22.0.0",
