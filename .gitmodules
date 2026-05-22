@@ -16,3 +16,6 @@
 [submodule ".tmux/plugins/tmux-continuum"]
 	path = .tmux/plugins/tmux-continuum
 	url = https://github.com/tmux-plugins/tmux-continuum
+[submodule "repos/tg-cli"]
+	path = repos/tg-cli
+	url = git@github.com:alex-mextner/tg-cli.git
