@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: video-compress [options] <input> [output]
+
+Transcode video to HEVC 1080p using Apple Silicon GPU (hevc_videotoolbox).
+If output is omitted, writes to <input>_1080.mp4 in the same directory.
+
+Options:
+  -r, --resolution <N>   Vertical resolution (default: 1080)
+  -a, --with-audio       Keep audio track (default: removed)
+  -b, --bitrate <M>M     Target bitrate (default: 18M)
+  --cpu                  Use libx265 instead of GPU (slower, smaller)
+  -h, --help             Show this help
+
+Examples:
+  video-compress DJI_0143.MP4
+  video-compress -r 720 -a DJI_0143.MP4 ~/Desktop/out.mp4
+  video-compress --cpu DJI_0143.MP4
+EOF
+  exit 1
+}
+
+RESOLUTION="1080"
+WITH_AUDIO=false
+BITRATE="18M"
+USE_CPU=false
+INPUT=""
+OUTPUT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--resolution)
+      RESOLUTION="$2"
+      shift 2
+      ;;
+    -a|--with-audio)
+      WITH_AUDIO=true
+      shift
+      ;;
+    -b|--bitrate)
+      BITRATE="$2"
+      shift 2
+      ;;
+    --cpu)
+      USE_CPU=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+    help)
+      usage
+      ;;
+    *)
+      if [[ -z "$INPUT" ]]; then
+        INPUT="$1"
+      elif [[ -z "$OUTPUT" ]]; then
+        OUTPUT="$1"
+      else
+        echo "Too many arguments" >&2
+        usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$INPUT" ]] && usage
+[[ -f "$INPUT" ]] || { echo "File not found: $INPUT" >&2; exit 1; }
+
+if [[ -z "$OUTPUT" ]]; then
+  dir=$(dirname "$INPUT")
+  base=$(basename "$INPUT" | sed 's/\.[^.]*$//')
+  OUTPUT="$dir/${base}_1080.mp4"
+fi
+
+# Determine scale filter
+SCALE="scale=-2:${RESOLUTION}:flags=lanczos"
+
+# Determine encoder
+if $USE_CPU; then
+  ENCODER="libx265"
+  ENCODER_OPTS="-crf 21 -preset slow"
+else
+  # Check if hevc_videotoolbox is available
+  if ffmpeg -encoders 2>/dev/null | grep -q hevc_videotoolbox; then
+    ENCODER="hevc_videotoolbox"
+    BVAL=$(echo "$BITRATE" | sed 's/M//')
+    MAXRATE=$(python3 -c "print(f'{int(${BVAL}*1.22)}M')")
+    BUFSIZE=$(python3 -c "print(f'{int(${BVAL}*2)}M')")
+    ENCODER_OPTS="-b:v ${BITRATE} -maxrate ${MAXRATE} -bufsize ${BUFSIZE}"
+  else
+    echo "hevc_videotoolbox not available, falling back to libx265 (CPU)" >&2
+    ENCODER="libx265"
+    ENCODER_OPTS="-crf 21 -preset slow"
+  fi
+fi
+
+# Audio
+AUDIO_OPTS="-an"
+if $WITH_AUDIO; then
+  AUDIO_OPTS="-c:a copy"
+fi
+
+# Tag for Apple compatibility
+TAG_OPTS="-tag:v hvc1 -movflags +faststart"
+
+echo "Encoding: $INPUT -> $OUTPUT"
+echo "  Resolution: ${RESOLUTION}p"
+echo "  Encoder: $ENCODER"
+echo "  Audio: $(if $WITH_AUDIO; then echo "copy"; else echo "removed"; fi)"
+
+ffmpeg -i "$INPUT" $AUDIO_OPTS -vf "$SCALE" -c:v "$ENCODER" $ENCODER_OPTS -profile:v main $TAG_OPTS -y "$OUTPUT"
+
+echo "Done: $OUTPUT"
+ls -lh "$OUTPUT"
