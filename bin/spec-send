@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# spec-send — convert a markdown spec to PDF and send via Tailscale
+# Usage: spec-send <file.md> [tailscale-target]
+set -euo pipefail
+
+TAILSCALE_TARGET="${SPEC_SEND_TARGET:-iphone}"
+
+usage() {
+  echo "Usage: spec-send <file.md> [tailscale-target]"
+  echo "  Default target: iphone (override with SPEC_SEND_TARGET)"
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+INPUT="$1"
+[[ -n "${2:-}" ]] && TAILSCALE_TARGET="$2"
+[[ ! -f "$INPUT" ]] && { echo "Error: file not found: $INPUT"; exit 1; }
+
+# Ensure tectonic (self-contained LaTeX engine, ~30MB, installs once)
+if ! command -v tectonic &>/dev/null; then
+  echo "tectonic not found — installing via brew (one-time, ~30MB)..."
+  brew install tectonic
+fi
+
+BASENAME=$(basename "$INPUT" .md)
+OUTPUT="/tmp/${BASENAME}.pdf"
+
+pandoc "$INPUT" \
+  --pdf-engine=tectonic \
+  --variable "mainfont=Arial Unicode MS" \
+  --variable "monofont=Courier New" \
+  --variable "geometry:margin=2.5cm" \
+  --variable "fontsize=11pt" \
+  --variable "linestretch=1.3" \
+  -o "$OUTPUT"
+
+echo "PDF: $OUTPUT ($(du -sh "$OUTPUT" | cut -f1))"
+
+tailscale file cp "$OUTPUT" "${TAILSCALE_TARGET}:"
+echo "Sent → ${TAILSCALE_TARGET} via Tailscale"
