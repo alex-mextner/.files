@@ -6,6 +6,26 @@
 #
 # Examples:
 #   vscmd workbench.action.reloadWindow -p /Users/ultra/work/ext-test-projects/react-vite-tw4-twitter/
+#
+# Window targeting (fixed 2026-08-27, see AGENTS.md "vscmd" section):
+#   `code --reuse-window <path>` was long documented here as "reuses the last active
+#   window, not a project-matched window" — i.e. potentially destructive: if <path>
+#   wasn't already open anywhere, it silently repurposed whatever window was last
+#   active, discarding that window's content. Verified live (VS Code 1.135.0):
+#     - if <path>'s folder IS already open in some window, --reuse-window correctly
+#       finds and focuses THAT window by full path (safe, no other window is touched).
+#     - if <path>'s folder is NOT open anywhere, --reuse-window hijacks the last
+#       active window and replaces its content (destructive — this was the bug).
+#   Fix: check via `code --status` (no Accessibility permission needed — it just
+#   talks to the running instance's IPC) whether the folder is already open before
+#   deciding which flag to pass. See open_target_window() below.
+#   Residual limitation: `code --status` reports only each open folder's basename,
+#   not its full path, so it can't prove the folder is CLOSED when two distinct
+#   projects share a basename — only one of them may actually be open. In that
+#   case we still call --reuse-window (it matches by full path internally, so it's
+#   correct whenever the target itself is one of the open ones) but warn on stderr,
+#   since the narrow remaining risk is the same hijack this fix targets if the
+#   *exact* target isn't among the same-named open windows.
 
 set -euo pipefail
 
@@ -65,15 +85,77 @@ if [[ "$CODE_BIN" == *cursor* ]]; then
   PROCESS_NAME="Cursor"
 fi
 
-# Focus the project window if path given
+# Single query point for `code --status` — reused below both to decide window
+# targeting and to resolve the main process PID for AppleScript addressing, so a
+# `vscmd -p` invocation spawns the CLI's --status diagnostics probe at most once
+# (it's a real Electron CLI spawn + IPC round-trip, not free).
+STATUS_OUT="$("$CODE_BIN" --status 2>/dev/null || true)"
+
+# Returns how many currently-open windows have a folder whose basename equals
+# "$1", by parsing $STATUS_OUT's "Folder (<basename>):" lines. Prints "unknown"
+# if $STATUS_OUT is empty (no instance running, or --status unsupported).
+count_folder_open() {
+  local basename="$1"
+  [[ -z "$STATUS_OUT" ]] && { echo "unknown"; return; }
+  local count=0 folder
+  while IFS= read -r folder; do
+    [[ "$folder" == "$basename" ]] && count=$((count + 1))
+  done < <(printf '%s\n' "$STATUS_OUT" | grep -oE 'Folder \([^)]+\):' | sed -E 's/^Folder \(//; s/\):$//')
+  echo "$count"
+}
+
+# Decides --reuse-window vs --new-window for $PROJECT_PATH and opens it.
+# Never blindly hijacks a window that has unrelated content in it (the bug) —
+# EXCEPT the narrow case documented at the top of this file: a basename that
+# matches 2+ open windows still resolves via --reuse-window (which matches by
+# full path, verified live), just with a loud warning about the residual risk.
+open_target_window() {
+  local project_path="$1"
+  local basename count
+  basename="$(basename "$project_path")"
+  count="$(count_folder_open "$basename")"
+
+  if [[ "$count" == "0" ]]; then
+    echo "vscmd: '$project_path' is not open in any window — opening a new window" \
+         "instead of reusing one, to avoid clobbering unrelated work." >&2
+    "$CODE_BIN" --new-window "$project_path" 2>/dev/null || true
+  else
+    if [[ "$count" == "unknown" ]]; then
+      echo "vscmd: could not query open windows via '$CODE_BIN --status' — using" \
+           "--reuse-window without the safety check (may hijack the wrong window)." >&2
+    elif [[ "$count" != "1" ]]; then
+      echo "vscmd: $count open windows have a folder named '$basename' — 'code --status'" \
+           "only reports basenames, so this doesn't prove '$project_path' itself is one of" \
+           "them. Proceeding with --reuse-window (it matches by full path); if the exact" \
+           "target isn't actually open, this may still hijack the last-active window." >&2
+    fi
+    "$CODE_BIN" --reuse-window "$project_path" 2>/dev/null || true
+  fi
+  sleep 1
+}
+
 if [[ -n "$PROJECT_PATH" ]]; then
   PROJECT_PATH="$(cd "$PROJECT_PATH" 2>/dev/null && pwd)" || {
     echo "Error: project path does not exist: $PROJECT_PATH" >&2
     exit 1
   }
-  "$CODE_BIN" --reuse-window "$PROJECT_PATH" 2>/dev/null || true
-  sleep 1
+  open_target_window "$PROJECT_PATH"
 fi
+
+# Resolve the running instance's main-process PID from $STATUS_OUT, so the
+# AppleScript below can address that exact accessibility process (`whose unix
+# id is`) instead of `tell process "$PROCESS_NAME"` by name. Name-based
+# addressing is ambiguous whenever a second, unrelated instance is running
+# under the same process name (e.g. the E2E harness launches its own fully
+# separate `Code` process via --user-data-dir) — `code --status` only ever
+# talks to the default-profile instance's IPC socket, so a PID read from it
+# can't accidentally point at an isolated harness instance.
+# If open_target_window() just launched the very first window via --new-window
+# (no instance was running before this invocation), $STATUS_OUT predates that
+# launch and has no PID to give — re-query once, only in that empty case.
+[[ -z "$STATUS_OUT" ]] && STATUS_OUT="$("$CODE_BIN" --status 2>/dev/null || true)"
+CODE_PID="$(printf '%s' "$STATUS_OUT" | awk '/^CPU %/{getline; print $3; exit}')"
+[[ "$CODE_PID" =~ ^[0-9]+$ ]] || CODE_PID=""
 
 # Execute command via AppleScript: set frontmost, open command palette, type, Enter.
 # 'tell application App to activate' must be separate from 'tell application System Events'
@@ -84,9 +166,14 @@ PREV_CLIPBOARD="$(pbpaste 2>/dev/null || true)"
 printf '%s' "$COMMAND" | pbcopy
 
 osascript -e "tell application \"$APP_NAME\" to activate" 2>/dev/null || true
-osascript <<EOF
+
+# Sends Cmd+Shift+P + the clipboard-pasted command + Enter to $1 (an AppleScript
+# process reference, e.g. `process "Code"` or `(first process whose unix id is N)`).
+send_palette_command() {
+  local process_ref="$1"
+  osascript <<EOF
 tell application "System Events"
-  tell process "$PROCESS_NAME"
+  tell $process_ref
     set frontmost to true
     delay 0.5
     key code 35 using {command down, shift down}
@@ -97,6 +184,18 @@ tell application "System Events"
   end tell
 end tell
 EOF
+}
+
+# Prefer pid-targeted addressing (unambiguous even with a second, isolated
+# instance running under the same name), but a valid-looking PID can still be a
+# helper/renderer process System Events can't see — never let that hard-abort
+# the whole command; fall back to name-based addressing on failure instead.
+if [[ -n "$CODE_PID" ]] && send_palette_command "(first process whose unix id is $CODE_PID)"; then
+  :
+else
+  [[ -n "$CODE_PID" ]] && echo "vscmd: pid-targeted AppleScript failed — retrying by process name." >&2
+  send_palette_command "process \"$PROCESS_NAME\""
+fi
 
 # Restore clipboard
 printf '%s' "$PREV_CLIPBOARD" | pbcopy
