@@ -26,6 +26,14 @@
 # USAGE
 #   claude-rotate [claude args/prompt...]   run claude via the current account;
 #                                            auto-rotate on a detected limit hit
+#   claude-rotate --tmux <name> [claude args...]
+#                                            same, but INSIDE a new tmux window
+#                                            named <name> (created in the current
+#                                            tmux session, or in a fresh/attached
+#                                            server when not in tmux) and with
+#                                            `--name <name>` passed to claude, so
+#                                            tg-ctl can both see and reach it.
+#                                            See TMUX GUARD below.
 #   claude-rotate rotate                    show account status, same as
 #                                            'rotate accounts' — at a real
 #                                            interactive terminal with no
@@ -125,6 +133,25 @@
 #   subcommand (only /usage exists, and it's a TUI-only slash command with no
 #   -p/non-interactive equivalent). Check them inside an interactive session
 #   with /usage instead.
+#
+# TMUX GUARD (agent-tools#526 / tg-cli#306)
+#   tg-ctl (the Telegram bridge) discovers agents via `tmux list-panes` and
+#   delivers replies via `tmux send-keys`. An INTERACTIVE session started from a
+#   plain terminal tab (no $TMUX) is therefore only half-reachable from the
+#   phone: it shows up in `tg-ctl status` as "unreachable: not in tmux", and a
+#   message to it is queued to its Stop-hook inbox — delivered at the agent's
+#   NEXT turn end, never typed into its prompt. Incident 2026-09-05: two agents
+#   launched this way were simply invisible for hours. So this launcher:
+#     - WARNS loudly on stderr when $TMUX is unset and the run is interactive
+#       (a TTY, no -p/--print) — CLAUDE_ROTATE_REQUIRE_TMUX=warn (default);
+#     - with CLAUDE_ROTATE_REQUIRE_TMUX=wrap, auto-wraps such a run into a tmux
+#       window (named after --name, else the cwd basename) as if --tmux were given;
+#     - with CLAUDE_ROTATE_REQUIRE_TMUX=off stays silent.
+#   `--tmux <name>` is the explicit form: it re-execs THIS launcher (minus the
+#   flag, plus `--name <name>`) inside a new tmux window named <name>, in the
+#   current session when already in tmux, otherwise in the default server
+#   (created + attached when none is running). rig's `harness.require_tmux`
+#   option is the intended way to set the env var machine-wide (follow-up).
 #
 # HOW ROTATION IS TRIGGERED
 #   The CURRENT account (persisted in the state file) is always tried FIRST —
@@ -525,10 +552,92 @@ looks_exhausted() {
 }
 
 # ---------------------------------------------------------------------------
+# tmux guard (see header: TMUX GUARD)
+# ---------------------------------------------------------------------------
+
+# True when the invocation is an INTERACTIVE session: a TTY on stdout and no
+# headless flag among the args (-p/--print, or a bare version/help query).
+is_interactive_run() {
+  [[ -t 1 ]] || return 1
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -p | --print | -v | --version | -h | --help) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# The `--name <v>` / `--name=<v>` value among the claude args, if any.
+name_from_args() {
+  local prev="" a
+  for a in "$@"; do
+    if [[ "$prev" == "--name" ]]; then printf '%s' "$a"; return 0; fi
+    case "$a" in --name=*) printf '%s' "${a#--name=}"; return 0 ;; esac
+    prev="$a"
+  done
+  return 1
+}
+
+# Run THIS launcher inside a new tmux window named $1 with the remaining args
+# (plus `--name $1` unless the args already carry one). Inside tmux: a window in
+# the current session. Outside: a window in the default server (a fresh `main`
+# session when no server runs), then attach so the user lands in it.
+run_in_tmux_window() {
+  local name="$1"; shift
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "$PROG: --tmux needs tmux on PATH" >&2
+    return 1
+  fi
+  local -a args=("$@")
+  name_from_args "$@" >/dev/null || args=(--name "$name" "${args[@]}")
+  # Re-exec ourselves (not the raw binary) so rotation still applies in the window.
+  local cmd
+  cmd="exec $(printf '%q ' "$0" "${args[@]}")"
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux new-window -n "$name" -c "$PWD" "$cmd" || return 1
+    return 0
+  fi
+  if tmux has-session 2>/dev/null; then
+    tmux new-window -n "$name" -c "$PWD" "$cmd" || return 1
+  else
+    tmux new-session -d -s main -n "$name" -c "$PWD" "$cmd" || return 1
+  fi
+  exec tmux attach
+}
+
+# The warn/wrap decision for a plain (no --tmux) interactive run outside tmux.
+# Returns 0 when the caller should CONTINUE running claude here; in wrap mode it
+# hands the run to a tmux window and exits.
+tmux_guard() {
+  local mode="${CLAUDE_ROTATE_REQUIRE_TMUX:-warn}"
+  [[ "$mode" == "off" ]] && return 0
+  [[ -n "${TMUX:-}" ]] && return 0
+  is_interactive_run "$@" || return 0
+  local name
+  name="$(name_from_args "$@" || basename "$PWD")"
+  if [[ "$mode" == "wrap" ]]; then
+    echo "$PROG: not in tmux — wrapping into a tmux window '$name' (CLAUDE_ROTATE_REQUIRE_TMUX=wrap)" >&2
+    run_in_tmux_window "$name" "$@"
+    exit $?
+  fi
+  cat >&2 <<WARN
+$PROG: WARNING — not running inside tmux (\$TMUX is unset).
+  tg-ctl cannot reach this agent from Telegram: it will show as "unreachable: not in
+  tmux" and a message to it is only queued to its Stop-hook inbox (delivered at the
+  agent's next turn end, never typed into its prompt).
+  Fix: start it inside tmux — \`$PROG --tmux $name\` — or run it in a tmux window.
+  Silence: CLAUDE_ROTATE_REQUIRE_TMUX=off; auto-wrap: CLAUDE_ROTATE_REQUIRE_TMUX=wrap.
+WARN
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # main: try the current account, rotate forward on exhaustion
 # ---------------------------------------------------------------------------
 
 main_run() {
+  tmux_guard "$@"
   mkdir -p "$ACCOUNTS_ROOT"
   local -a accounts
   mapfile -t accounts < <(list_accounts)
@@ -931,6 +1040,11 @@ $PROG — run claude through one of several personal accounts,
 auto-rotating on a detected session/weekly limit hit.
 
   $PROG [claude args/prompt...]         run claude via the current account
+  $PROG --tmux <name> [claude args...]  same, inside a new tmux window <name>
+                                           (+ --name <name>) so tg-ctl reaches it;
+                                           a plain interactive run outside tmux
+                                           WARNS (CLAUDE_ROTATE_REQUIRE_TMUX=
+                                           warn|wrap|off, default warn)
   $PROG rotate                          show accounts — an arrow-key picker
                                            at a real terminal (↑/↓ + Enter to
                                            switch, q/Esc to cancel), else the
@@ -1016,6 +1130,18 @@ case "${1:-}" in
   accounts)
     shift
     rotate_dispatch "$@"
+    ;;
+  --tmux)
+    # `claude-rotate --tmux <name> [claude args...]` → the same run, inside a new
+    # tmux window named <name> and with `--name <name>` (see TMUX GUARD).
+    shift
+    if [[ -z "${1:-}" || "${1:-}" == -* ]]; then
+      echo "$PROG: --tmux needs a window/agent name: $PROG --tmux <name> [claude args...]" >&2
+      exit 1
+    fi
+    tmux_name="$1"; shift
+    run_in_tmux_window "$tmux_name" "$@"
+    exit $?
     ;;
   --rotate-setup | --rotate-status | --rotate-use | --rotate-next | --rotate-help)
     # Old flag-prefix interface, replaced today by the 'rotate'/'accounts'
