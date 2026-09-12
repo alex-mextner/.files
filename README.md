@@ -3,6 +3,37 @@ dotfiles (mac, webdev, frontend, iterm)
 
 #### installation
 
+The optional completion manager is available at `bin/zsh-completion`.
+
+```sh
+~/.files/bin/zsh-completion install
+```
+
+It scans commands only when explicitly run, trying `completion zsh`,
+`completions zsh`, `generate-completion zsh`, `gen-completion zsh`, and
+`completion-script zsh`, plus the corresponding `--shell`, `--format`, and
+top-level completion flags. The installer lists every missing candidate,
+explains which interface found it, shows safe history-based usage counts and
+probe/output cost, and asks before installing. Rarely or never used commands
+default to **No**; large or slow candidates are marked `LARGE/EXPENSIVE`.
+`--yes` (or `--all`) installs all discovered candidates noninteractively.
+Discovery is restricted to a small trusted CLI list (or commands named with
+`--command NAME`) and first looks for a completion advertisement in
+`command --help`; it does not send guessed completion arguments to ordinary
+utilities. Use `--trust-path DIR` for a private CLI directory, or
+`--scan-all` only when every executable in the current `PATH` is trusted.
+
+Completion state is kept outside the repository:
+
+- `~/.local/state/zsh-completions/registry.tsv` is the explicit registry,
+- `~/.local/state/zsh-completions/snapshot.tsv` prevents repeat probes,
+- `~/.local/state/zsh-completions/init.zsh` is the atomic startup fragment,
+- `~/.local/share/zsh-completions/completions/` contains installed files.
+
+`.zprofile` only sources `init.zsh` before `compinit`; it never probes commands
+on shell startup. Failed registrations stay in the registry and are retried by
+the next explicit `install`. State writes are lock-protected and atomic.
+
 
 #### Fancy Gallery
 

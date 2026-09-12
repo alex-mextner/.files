@@ -1,0 +1,1015 @@
+#!/usr/bin/env zsh
+
+# Explicitly invoked completion discovery and installer. The zsh startup hook
+# only sources the generated init fragment; probes never run during startup.
+# Registry and snapshots live under STATE_DIR, installed autoload files under
+# DATA_DIR, and all writes require a lock and use same-directory replacements.
+
+setopt errexit nounset pipefail
+zmodload zsh/datetime
+
+typeset -r SCRIPT_NAME=${0:t}
+typeset -r VERSION=1
+typeset STATE_DIR=${ZSH_COMPLETION_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zsh-completions}
+typeset DATA_DIR=${ZSH_COMPLETION_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zsh-completions}
+typeset HISTORY_FILE=${ZSH_COMPLETION_HISTORY_FILE:-${HISTFILE:-$HOME/.zsh_history}}
+typeset -r DISCOVERY_PATH=$PATH
+typeset SCAN_PATH=${ZSH_COMPLETION_SCAN_PATH:-$DISCOVERY_PATH}
+typeset TIMEOUT_COMMAND=${ZSH_COMPLETION_TIMEOUT_COMMAND:-}
+typeset PROBE_TIMEOUT=${ZSH_COMPLETION_PROBE_TIMEOUT:-2}
+typeset FORCE_DISCOVERY=0
+typeset NONINTERACTIVE=0
+typeset SAFE_SCAN=1
+typeset -A requested_commands
+typeset -A trusted_paths
+typeset -a trusted_commands=(
+  brew bun cargo docker docker-compose gh git go helm jq kubectl make npm npx
+  pnpm poetry python3 ruby rustup terraform tmux uv yarn
+)
+
+typeset REGISTRY_FILE SNAPSHOT_FILE INIT_FILE PROBE_DIR COMPLETION_DIR SOURCE_DIR LOCK_DIR
+typeset -A registry_lines
+typeset -A snapshot_lines
+typeset -A command_paths
+typeset -A history_counts
+typeset -A blocked_commands
+typeset REPLY_HELP_RESULT
+
+typeset -r UTILITY_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+typeset -r SAFE_PROBE_PATH="$UTILITY_PATH:$HOME/.bun/bin:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/go/bin"
+PATH=$SAFE_PROBE_PATH
+export PATH
+
+usage() {
+  cat <<'EOF'
+Usage: zsh-completion <command> [options]
+
+Discover and install zsh completions without probing commands during shell startup.
+
+Commands:
+  install, add       Discover missing completions and ask before installing each one.
+  discover           Probe commands and update the snapshot and explicit registry.
+  init               Rebuild the compinit fpath fragment from installed entries.
+  status             Show registered completions and their current state.
+
+Options:
+  --yes, --all       Install every discovered completion without prompting.
+  --force            Ignore the command snapshot and probe again.
+  --scan-all         Probe every executable in PATH (unsafe; normally help-gated).
+  --command NAME     Add NAME to the trusted command scan (repeatable).
+  --trust-path DIR   Trust executables from DIR (repeatable).
+  --state-dir DIR    Store registry, snapshot, and probe cache in DIR.
+  --data-dir DIR     Store installed completion files in DIR.
+  --history-file FILE
+                     Read usage counts from FILE instead of the current zsh history.
+  --timeout SECONDS  Timeout for each completion probe (default: 2).
+  -h, --help         Show this help.
+
+The startup hook only sources the generated init.zsh file. Run
+`zsh-completion install` after adding a CLI or changing its completion interface.
+EOF
+}
+
+die() {
+  print -u2 -- "$SCRIPT_NAME: $*"
+  exit 1
+}
+
+parse_options() {
+  typeset command=${1:-install}
+  if (( $# == 0 )) || [[ "$command" == -* ]]; then
+    command=install
+  else
+    shift
+  fi
+
+  while (( $# )); do
+    case "$1" in
+      --yes|--all)
+        NONINTERACTIVE=1
+        ;;
+      --force)
+        FORCE_DISCOVERY=1
+        ;;
+      --scan-all)
+        SAFE_SCAN=0
+        ;;
+      --command)
+        (( $# >= 2 )) || die "--command requires a value"
+        requested_commands[$2]=1
+        shift
+        ;;
+      --trust-path)
+        (( $# >= 2 )) || die "--trust-path requires a value"
+        trusted_paths[$2]=1
+        shift
+        ;;
+      --state-dir)
+        (( $# >= 2 )) || die "--state-dir requires a value"
+        STATE_DIR=$2
+        shift
+        ;;
+      --data-dir)
+        (( $# >= 2 )) || die "--data-dir requires a value"
+        DATA_DIR=$2
+        shift
+        ;;
+      --history-file)
+        (( $# >= 2 )) || die "--history-file requires a value"
+        HISTORY_FILE=$2
+        shift
+        ;;
+      --timeout)
+        (( $# >= 2 )) || die "--timeout requires a value"
+        PROBE_TIMEOUT=$2
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  case "$command" in
+    add) command=install ;;
+    install|discover|init|status) ;;
+    *) die "unknown command: $command" ;;
+  esac
+
+  REPLY_COMMAND=$command
+}
+
+validate_paths() {
+  [[ -n "$STATE_DIR" && "$STATE_DIR" != / ]] || die "invalid state directory"
+  [[ -n "$DATA_DIR" && "$DATA_DIR" != / ]] || die "invalid data directory"
+  [[ "$PROBE_TIMEOUT" =~ '^[0-9]+([.][0-9]+)?$' ]] ||
+    die "timeout must be a number of seconds"
+  (( PROBE_TIMEOUT > 0 )) || die "timeout must be greater than zero"
+
+  [[ "$STATE_DIR" == /* ]] || STATE_DIR=$PWD/$STATE_DIR
+  [[ "$DATA_DIR" == /* ]] || DATA_DIR=$PWD/$DATA_DIR
+  local trusted_path
+  for trusted_path in ${(k)trusted_paths}; do
+    if [[ "$trusted_path" != /* ]]; then
+      trusted_paths[$PWD/$trusted_path]=1
+      unset "trusted_paths[$trusted_path]"
+    fi
+  done
+  REGISTRY_FILE=$STATE_DIR/registry.tsv
+  SNAPSHOT_FILE=$STATE_DIR/snapshot.tsv
+  INIT_FILE=$STATE_DIR/init.zsh
+  PROBE_DIR=$STATE_DIR/probes
+  COMPLETION_DIR=$DATA_DIR/completions
+  SOURCE_DIR=$DATA_DIR/sources
+  LOCK_DIR=$STATE_DIR/.lock
+}
+
+ensure_directories() {
+  mkdir -p "$PROBE_DIR" "$COMPLETION_DIR" "$SOURCE_DIR"
+  chmod 700 "$STATE_DIR" "$PROBE_DIR" "$DATA_DIR" "$COMPLETION_DIR" "$SOURCE_DIR" 2>/dev/null ||
+    die "could not secure completion directories"
+}
+
+release_lock() {
+  if [[ -f "$LOCK_DIR/pid" ]]; then
+    rm -f "$LOCK_DIR/pid"
+  fi
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_lock() {
+  local waited=0 owner reclaim_owner reclaim_lock stale_lock current_owner
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    owner=
+    if [[ -r "$LOCK_DIR/pid" ]]; then
+      owner=$(<"$LOCK_DIR/pid")
+    fi
+    if [[ -n "$owner" && "$owner" == <-> ]] && ! kill -0 "$owner" 2>/dev/null; then
+      reclaim_lock="$LOCK_DIR.reclaim"
+      if [[ -r "$reclaim_lock/pid" ]]; then
+        reclaim_owner=$(<"$reclaim_lock/pid")
+        if [[ -n "$reclaim_owner" && "$reclaim_owner" == <-> ]] &&
+          ! kill -0 "$reclaim_owner" 2>/dev/null; then
+          rm -f "$reclaim_lock/pid"
+          rmdir "$reclaim_lock" 2>/dev/null || true
+        fi
+      fi
+      if mkdir "$reclaim_lock" 2>/dev/null; then
+        print -r -- "$$" >| "$reclaim_lock/pid"
+        current_owner=$(<"$LOCK_DIR/pid")
+        if [[ "$current_owner" == "$owner" ]] &&
+          ! kill -0 "$current_owner" 2>/dev/null; then
+          stale_lock="$LOCK_DIR.stale.$$.$RANDOM"
+          if mv "$LOCK_DIR" "$stale_lock" 2>/dev/null; then
+            rm -f "$stale_lock/pid"
+            rmdir "$stale_lock" 2>/dev/null || true
+          fi
+        fi
+        rm -f "$reclaim_lock/pid"
+        rmdir "$reclaim_lock" 2>/dev/null || true
+      fi
+      continue
+    fi
+    (( waited >= 30 )) && die "could not acquire state lock"
+    sleep 1
+    (( ++waited ))
+  done
+  print -r -- "$$" >| "$LOCK_DIR/pid"
+  trap 'release_lock' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+load_registry() {
+  registry_lines=()
+  [[ -f "$REGISTRY_FILE" ]] || return 0
+  local line command
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    command=${line%%$'\t'*}
+    [[ -n "$command" ]] && registry_lines[$command]=$line
+  done < "$REGISTRY_FILE"
+}
+
+load_snapshot() {
+  snapshot_lines=()
+  [[ -f "$SNAPSHOT_FILE" ]] || return 0
+  local line command
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    command=${line%%$'\t'*}
+    [[ -n "$command" ]] && snapshot_lines[$command]=$line
+  done < "$SNAPSHOT_FILE"
+}
+
+write_map() {
+  local destination=$1
+  local map_name=$2
+  local temp="$destination.$$.$RANDOM"
+  {
+    print -r -- "# zsh-completion state v$VERSION"
+    if [[ "$map_name" == registry_lines ]]; then
+      local key
+      for key in ${(k)registry_lines}; do
+        print -r -- "${registry_lines[$key]}"
+      done
+    else
+      local key
+      for key in ${(k)snapshot_lines}; do
+        print -r -- "${snapshot_lines[$key]}"
+      done
+    fi
+  } >| "$temp"
+  chmod 600 "$temp"
+  mv -f "$temp" "$destination"
+}
+
+write_registry() {
+  write_map "$REGISTRY_FILE" registry_lines
+}
+
+write_snapshot() {
+  write_map "$SNAPSHOT_FILE" snapshot_lines
+}
+
+command_fingerprint() {
+  local executable=$1
+  local stat_output
+  if stat_output=$(stat -L -f '%m:%z' "$executable" 2>/dev/null); then
+    print -r -- "$stat_output"
+  else
+    stat -L -c '%Y:%s' "$executable" 2>/dev/null || print -r -- unknown
+  fi
+}
+
+load_history_counts() {
+  history_counts=()
+  if [[ -r "$HISTORY_FILE" ]]; then
+    local token count
+    while IFS=$'\t' read -r token count; do
+      [[ -n "$token" ]] && history_counts[$token]=$count
+    done < <(
+      LC_ALL=C awk '
+    function strip_prefix(line) {
+      sub(/^: [0-9]+:[0-9]+;/, "", line)
+      sub(/^[ \t]+/, "", line)
+      return line
+    }
+    function strip_wrapper(line) {
+      while (line ~ /^(sudo|command|builtin|exec|env)[ \t]+/) {
+        sub(/^[^ \t]+[ \t]+/, "", line)
+      }
+      while (line ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]+[ \t]+/) {
+        sub(/^[^ \t]+[ \t]+/, "", line)
+      }
+      return line
+    }
+    {
+      line = strip_wrapper(strip_prefix($0))
+      if (line == "" || line ~ /^#/) next
+      token = line
+      sub(/[ \t].*$/, "", token)
+      sub(/^.*\//, "", token)
+      if (token != "") counts[token]++
+    }
+    END {
+      for (token in counts) print token "\t" counts[token]
+    }
+  ' "$HISTORY_FILE"
+    )
+  fi
+  local command
+  for command in ${(k)command_paths}; do
+    [[ -n "${history_counts[$command]-}" ]] || history_counts[$command]=0
+  done
+}
+
+enumerate_commands() {
+  command_paths=()
+  blocked_commands=()
+  local directory executable command registered_path
+  for directory in ${(s.:.)SCAN_PATH}; do
+    [[ -d "$directory" ]] || continue
+    for executable in "$directory"/*(N); do
+      [[ -x "$executable" && ! -d "$executable" ]] || continue
+      command=${executable:t}
+      [[ "$command" =~ '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' ]] || continue
+      [[ -z "${command_paths[$command]-}" && -z "${blocked_commands[$command]-}" ]] || continue
+      if [[ "$executable" != /* ]]; then
+        executable=$PWD/$executable
+      fi
+      if (( SAFE_SCAN )) && [[ -z "${requested_commands[$command]-}" ]] &&
+        (( ${trusted_commands[(Ie)$command]} == 0 )) &&
+        [[ -z "${registry_lines[$command]-}" ]] &&
+        [[ "${trusted_paths[${executable:h}]-}" != 1 ]]; then
+        continue
+      fi
+      registered_path=
+      if [[ -n "${registry_lines[$command]-}" ]]; then
+        registry_fields "${registry_lines[$command]}"
+        registered_path=${REPLY_FIELDS[3]:-}
+      fi
+      if (( SAFE_SCAN )) && ! is_trusted_path "${executable:h}" &&
+        [[ "${trusted_paths[${executable:h}]-}" != 1 ]] &&
+        [[ "$registered_path" != "$executable" ]]; then
+        blocked_commands[$command]=1
+        continue
+      fi
+      command_paths[$command]=$executable
+    done
+  done
+}
+
+is_trusted_path() {
+  case "$1" in
+    /bin|/usr/bin|/usr/local/bin|/opt/homebrew/bin|/opt/homebrew/sbin|\
+    "$HOME"/.bun/bin|"$HOME"/.cargo/bin|"$HOME"/go/bin|"$HOME"/.local/bin|\
+    "$HOME"/.files/bin)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+probe_timeout_command() {
+  if [[ -n "$TIMEOUT_COMMAND" ]]; then
+    print -r -- "$TIMEOUT_COMMAND"
+    return
+  fi
+  if TIMEOUT_COMMAND=$(PATH="$UTILITY_PATH" command -v gtimeout); then
+    :
+  elif TIMEOUT_COMMAND=$(PATH="$UTILITY_PATH" command -v timeout); then
+    :
+  else
+    TIMEOUT_COMMAND=
+  fi
+  print -r -- "$TIMEOUT_COMMAND"
+}
+
+is_unsafe_help_target() {
+  case "$1" in
+    bash|busybox|cat|chmod|chown|cp|curl|dd|env|find|install|ln|mkdir|mv|node|perl|php|python|python3|rm|rmdir|rsync|ruby|scp|sed|sh|sleep|ssh|tar|touch|unzip|wget|xargs|zip|zsh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+advertises_completion() {
+  local command=$1
+  local executable=$2
+  local help_output="$PROBE_DIR/.$command.help"
+  local help_error="$PROBE_DIR/.$command.help.err"
+
+  [[ "$SAFE_SCAN" == 0 || -n "${requested_commands[$command]-}" ||
+    -n "${registry_lines[$command]-}" ]] && {
+      REPLY_HELP_RESULT=advertised
+      return 0
+    }
+  if is_unsafe_help_target "$command"; then
+    REPLY_HELP_RESULT=not-advertised
+    return 1
+  fi
+  rm -f "$help_output" "$help_error"
+  if ! run_probe "$executable" "$help_output" "$help_error" --help; then
+    rm -f "$help_output" "$help_error"
+    REPLY_HELP_RESULT=failed
+    return 1
+  fi
+  if grep -Eiq 'completion|completions|generate-completion|completion-script' "$help_output"; then
+    rm -f "$help_output" "$help_error"
+    REPLY_HELP_RESULT=advertised
+    return 0
+  fi
+  rm -f "$help_output" "$help_error"
+  REPLY_HELP_RESULT=not-advertised
+  return 1
+}
+
+valid_completion() {
+  local file=$1
+  [[ -s "$file" ]] || return 1
+  grep -Eq '(^|[[:space:]])#compdef([[:space:]]|$)|(^|[[:space:]])compdef[[:space:]]|^_[[:alnum:]_-]+[[:space:]]*\(\)' "$file"
+}
+
+completion_name_for() {
+  REPLY_COMPLETION_NAME="_$1"
+}
+
+existing_completion_for() {
+  local command=$1
+  local completion_name directory
+  completion_name_for "$command"
+  [[ -n "${FPATH:-}" ]] || return 1
+  for directory in ${(s.:.)FPATH}; do
+    [[ "${directory%/}" == "${COMPLETION_DIR%/}" ]] && continue
+    [[ -f "$directory/$REPLY_COMPLETION_NAME" ]] && return 0
+  done
+  return 1
+}
+
+probe_one() {
+  local command=$1
+  local executable=$2
+  local -a args
+  local method option shell_argument
+  local output_file="$PROBE_DIR/_$command"
+  local error_file="$PROBE_DIR/_$command.err"
+  local temp_output="$output_file.$$.$RANDOM"
+  local temp_error="$error_file.$$.$RANDOM"
+  local start end elapsed rc invocation
+
+  rm -f "$output_file"
+  start=$EPOCHREALTIME
+  for method in completion completions generate-completion gen-completion completion-script; do
+    args=("$method" zsh)
+    invocation="$command ${(j: :)args}"
+    if run_probe "$executable" "$temp_output" "$temp_error" "$args[@]"; then
+      if valid_completion "$temp_output"; then
+        mv -f "$temp_output" "$output_file"
+        rm -f "$temp_error"
+        end=$EPOCHREALTIME
+        elapsed=$(( (end - start) * 1000 ))
+        print -r -- "$method"$'\t'"$invocation"$'\t'"$output_file"$'\t'"$elapsed"
+        return 0
+      fi
+    else
+      if (( $? == 124 )); then return 124; fi
+    fi
+    rm -f "$temp_output" "$temp_error"
+
+    for option in --shell --format; do
+      args=("$method" "$option" zsh)
+      invocation="$command ${(j: :)args}"
+      if run_probe "$executable" "$temp_output" "$temp_error" "$args[@]"; then
+        if valid_completion "$temp_output"; then
+          mv -f "$temp_output" "$output_file"
+          rm -f "$temp_error"
+          end=$EPOCHREALTIME
+          elapsed=$(( (end - start) * 1000 ))
+          print -r -- "$method"$'\t'"$invocation"$'\t'"$output_file"$'\t'"$elapsed"
+          return 0
+        fi
+      else
+        if (( $? == 124 )); then return 124; fi
+      fi
+      rm -f "$temp_output" "$temp_error"
+    done
+  done
+
+  for option in --completion --completions --generate-completion --gen-completion --completion-script; do
+    for shell_argument in zsh "$option=zsh"; do
+      if [[ "$shell_argument" == zsh ]]; then
+        args=("$option" zsh)
+      else
+        args=("$shell_argument")
+      fi
+      invocation="$command ${(j: :)args}"
+      if run_probe "$executable" "$temp_output" "$temp_error" "$args[@]"; then
+        if valid_completion "$temp_output"; then
+          mv -f "$temp_output" "$output_file"
+          rm -f "$temp_error"
+          end=$EPOCHREALTIME
+          elapsed=$(( (end - start) * 1000 ))
+          print -r -- "$option"$'\t'"$invocation"$'\t'"$output_file"$'\t'"$elapsed"
+          return 0
+        fi
+      else
+        if (( $? == 124 )); then return 124; fi
+      fi
+      rm -f "$temp_output" "$temp_error"
+    done
+  done
+
+  end=$EPOCHREALTIME
+  elapsed=$(( (end - start) * 1000 ))
+  rc=1
+  if [[ -s "$temp_error" ]]; then
+    local error
+    error=$(tr '\n\t' '  ' < "$temp_error" | cut -c1-240)
+    print -r -- "$command"$'\t'"$elapsed"$'\t'"$error" >&2
+  fi
+  rm -f "$temp_output" "$temp_error"
+  return "$rc"
+}
+
+run_probe() {
+  local executable=$1
+  local output_file=$2
+  local error_file=$3
+  shift 3
+  (
+    cd "$STATE_DIR" || exit 125
+    local probe_path=$SAFE_PROBE_PATH
+    local trusted_dir
+    for trusted_dir in ${(k)trusted_paths}; do
+      probe_path="$probe_path:$trusted_dir"
+    done
+    PATH=$probe_path
+    export PATH
+    if [[ -n "$TIMEOUT_COMMAND" ]]; then
+      "$TIMEOUT_COMMAND" -k 1 "$PROBE_TIMEOUT" "$executable" "$@" >| "$output_file" 2>| "$error_file"
+    else
+      local probe_pid start
+      local descendants child
+      start=$EPOCHREALTIME
+      "$executable" "$@" >| "$output_file" 2>| "$error_file" &
+      probe_pid=$!
+      while kill -0 "$probe_pid" 2>/dev/null; do
+        if (( EPOCHREALTIME - start >= PROBE_TIMEOUT )); then
+          descendants=$(list_probe_descendants "$probe_pid")
+          terminate_probe_tree "$probe_pid" TERM
+          for child in ${(f)descendants}; do
+            kill -TERM "$child" 2>/dev/null || true
+          done
+          sleep 0.2
+          terminate_probe_tree "$probe_pid" KILL
+          for child in ${(f)descendants}; do
+            kill -KILL "$child" 2>/dev/null || true
+          done
+          wait "$probe_pid" 2>/dev/null || true
+          return 124
+        fi
+        sleep 0.05
+      done
+      wait "$probe_pid"
+    fi
+  )
+}
+
+list_probe_descendants() {
+  local pid=$1
+  local child
+  command -v pgrep >/dev/null 2>&1 || return 0
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    print -r -- "$child"
+    list_probe_descendants "$child"
+  done
+}
+
+terminate_probe_tree() {
+  local pid=$1
+  local signal=$2
+  local child
+  if command -v pgrep >/dev/null 2>&1; then
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+      terminate_probe_tree "$child" "$signal"
+    done
+  fi
+  kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+update_candidate() {
+  local command=$1
+  local executable=$2
+  local fingerprint=$3
+  local probe_result=$4
+  local output_file=$5
+  local elapsed=$6
+  local output_bytes=0
+  local interface=none
+  local invocation=
+  local record_status=pending
+  local completion_name
+  local used=${history_counts[$command]:-0}
+  local error=
+  local previous=${registry_lines[$command]-}
+  if [[ -n "$previous" ]]; then
+    registry_fields "$previous"
+    record_status=${REPLY_FIELDS[6]:-pending}
+  fi
+
+  if [[ "$probe_result" == success:* ]]; then
+    output_bytes=$(wc -c < "$output_file" | tr -d ' ')
+    local probe_data=${probe_result#success:}
+    interface=${probe_data%%$'\t'*}
+    invocation=${probe_data#*$'\t'}
+    completion_name_for "$command"
+    completion_name=$REPLY_COMPLETION_NAME
+    if existing_completion_for "$command"; then
+      record_status=external
+    else
+      record_status=pending
+    fi
+  else
+    error=${probe_result#failed:}
+    record_status=failed
+  fi
+
+  registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$command" "${completion_name:-_$command}" "$executable" "$interface" "$invocation" "$record_status" \
+    "$output_bytes" "$elapsed" "$used" "$(date +%s)" "$error")
+  snapshot_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$command" "$executable" "$fingerprint" "${probe_result%%$'\t'*}" "$output_bytes" "$elapsed" "$(date +%s)")
+}
+
+refresh_registry_usage() {
+  local command=$1
+  local line=${registry_lines[$command]-}
+  [[ -n "$line" ]] || return 0
+  registry_fields "$line"
+  registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "${REPLY_FIELDS[1]}" "${REPLY_FIELDS[2]}" "${REPLY_FIELDS[3]}" \
+    "${REPLY_FIELDS[4]}" "${REPLY_FIELDS[5]}" "${REPLY_FIELDS[6]}" \
+    "${REPLY_FIELDS[7]}" "${REPLY_FIELDS[8]}" "${history_counts[$command]:-0}" \
+    "$(date +%s)" "${REPLY_FIELDS[11]:-}")
+}
+
+discover() {
+  ensure_directories
+  load_registry
+  load_snapshot
+  enumerate_commands
+  load_history_counts
+  probe_timeout_command >/dev/null
+
+  local command executable fingerprint previous snapshot_fingerprint snapshot_result
+  local should_probe=1 snapshot_reusable=0
+  local result metadata interface invocation output_file elapsed
+  local count=0
+  for command in ${(ok)command_paths}; do
+    executable=$command_paths[$command]
+    fingerprint=$(command_fingerprint "$executable")
+    previous=${snapshot_lines[$command]-}
+    should_probe=1
+    snapshot_reusable=0
+    if [[ "$FORCE_DISCOVERY" != 1 && -n "$previous" ]]; then
+      registry_fields "$previous"
+      snapshot_fingerprint=${REPLY_FIELDS[3]:-}
+      snapshot_result=${REPLY_FIELDS[4]:-}
+      if [[ "$snapshot_result" == skipped:help ]]; then
+        (( SAFE_SCAN )) && snapshot_reusable=1
+      elif [[ "$snapshot_result" != failed:* && -s "$PROBE_DIR/_$command" ]]; then
+        snapshot_reusable=1
+      fi
+      if [[ "${REPLY_FIELDS[2]:-}" == "$executable" &&
+          "$snapshot_fingerprint" == "$fingerprint" &&
+          "${registry_lines[$command]-}" != *$'\tfailed\t'* ]] &&
+        { [[ -z "${requested_commands[$command]-}" ]] ||
+          [[ "$snapshot_result" != skipped:help ]]; } &&
+        (( snapshot_reusable )); then
+        should_probe=0
+      fi
+    fi
+    if (( ! should_probe )); then
+      refresh_registry_usage "$command"
+      continue
+    fi
+
+    if ! advertises_completion "$command" "$executable"; then
+      local discovery_result=skipped:help
+      [[ "$REPLY_HELP_RESULT" == failed ]] && discovery_result=failed:help
+      snapshot_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+        "$command" "$executable" "$fingerprint" "$discovery_result" 0 0 "$(date +%s)")
+      continue
+    fi
+
+    (( ++count ))
+    if metadata=$(probe_one "$command" "$executable" 2>/dev/null); then
+      interface=${metadata%%$'\t'*}
+      metadata=${metadata#*$'\t'}
+      invocation=${metadata%%$'\t'*}
+      metadata=${metadata#*$'\t'}
+      output_file=${metadata%%$'\t'*}
+      elapsed=${metadata#*$'\t'}
+      result="success:$interface"$'\t'"$invocation"
+      update_candidate "$command" "$executable" "$fingerprint" "$result" "$output_file" "$elapsed"
+    else
+      update_candidate "$command" "$executable" "$fingerprint" \
+        "failed:probe did not return a valid zsh completion" "$PROBE_DIR/_$command" 0
+    fi
+  done
+  write_registry
+  write_snapshot
+  print -- "Probed $count command(s); registry: $REGISTRY_FILE"
+}
+
+registry_fields() {
+  local line=$1
+  local remainder=$line field
+  REPLY_FIELDS=()
+  while [[ "$remainder" == *$'\t'* ]]; do
+    field=${remainder%%$'\t'*}
+    REPLY_FIELDS+=("$field")
+    remainder=${remainder#*$'\t'}
+  done
+  REPLY_FIELDS+=("$remainder")
+}
+
+is_missing_candidate() {
+  local command=$1
+  local line=${registry_lines[$command]-}
+  [[ -n "$line" ]] || return 1
+  registry_fields "$line"
+  if [[ -f "$COMPLETION_DIR/${REPLY_FIELDS[2]:-_$command}" &&
+    "${REPLY_FIELDS[6]:-}" == installed ]]; then
+    return 1
+  fi
+  existing_completion_for "$command" && return 1
+  return 0
+}
+
+candidate_label() {
+  local command=$1
+  local line=${registry_lines[$command]}
+  registry_fields "$line"
+  local interface=${REPLY_FIELDS[4]:-unknown}
+  local invocation=${REPLY_FIELDS[5]:-unknown}
+  local candidate_status=${REPLY_FIELDS[6]:-unknown}
+  local bytes=${REPLY_FIELDS[7]:-0}
+  local elapsed=${REPLY_FIELDS[8]:-0}
+  local used=${REPLY_FIELDS[9]:-0}
+  local usage="never used"
+  (( used >= 3 )) && usage="used $used times"
+  (( used > 0 && used < 3 )) && usage="rarely used ($used time(s))"
+  local cost=
+  (( bytes >= 65536 || elapsed >= 1000 )) && cost=" LARGE/EXPENSIVE"
+  print -- "$command — found via $interface; $usage; output ${bytes}B; probe ${elapsed}ms; status $candidate_status$cost"
+  print -- "  probe: $invocation"
+}
+
+install_candidate() {
+  local command=$1
+  local line=${registry_lines[$command]}
+  registry_fields "$line"
+  local source="$PROBE_DIR/_$command"
+  local completion_name=${REPLY_FIELDS[2]:-_$command}
+  local destination="$COMPLETION_DIR/$completion_name"
+  local source_destination="$SOURCE_DIR/$command.zsh"
+  local used=${REPLY_FIELDS[9]:-0}
+  local install_status error
+
+  if [[ ! -s "$source" ]]; then
+    install_status="failed"
+    registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$command" "${REPLY_FIELDS[2]:-_$command}" "${REPLY_FIELDS[3]:-}" \
+      "${REPLY_FIELDS[4]:-}" "${REPLY_FIELDS[5]:-}" "$install_status" \
+      "${REPLY_FIELDS[7]:-0}" "${REPLY_FIELDS[8]:-0}" "$used" "$(date +%s)" \
+      "probe cache is missing")
+    return 1
+  fi
+
+  if ! valid_completion "$source"; then
+    error="probe output failed validation"
+    registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$command" "${REPLY_FIELDS[2]:-_$command}" "${REPLY_FIELDS[3]:-}" \
+      "${REPLY_FIELDS[4]:-}" "${REPLY_FIELDS[5]:-}" failed \
+      "${REPLY_FIELDS[7]:-0}" "${REPLY_FIELDS[8]:-0}" "$used" "$(date +%s)" \
+      "$error")
+    return 1
+  fi
+
+  if ! prepare_completion "$command" "$completion_name" "$source" "$destination" "$source_destination"; then
+    error="completion output could not be made autoloadable"
+    registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$command" "${REPLY_FIELDS[2]:-_$command}" "${REPLY_FIELDS[3]:-}" \
+      "${REPLY_FIELDS[4]:-}" "${REPLY_FIELDS[5]:-}" failed \
+      "${REPLY_FIELDS[7]:-0}" "${REPLY_FIELDS[8]:-0}" "$used" "$(date +%s)" \
+      "$error")
+    return 1
+  fi
+  install_status=installed
+  registry_lines[$command]=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$command" "${REPLY_FIELDS[2]:-_$command}" "${REPLY_FIELDS[3]:-}" \
+    "${REPLY_FIELDS[4]:-}" "${REPLY_FIELDS[5]:-}" "$install_status" \
+    "${REPLY_FIELDS[7]:-0}" "${REPLY_FIELDS[8]:-0}" "$used" "$(date +%s)" "")
+}
+
+prepare_completion() {
+  local command=$1
+  local completion_name=$2
+  local source=$3
+  local destination=$4
+  local source_destination=$5
+  local completion_function=
+  local temp="$destination.$$.$RANDOM"
+  local source_temp="$source_destination.$$.$RANDOM"
+  local first_line
+
+  first_line=$(head -n 1 "$source")
+  if [[ "$first_line" == \#compdef* ]] ||
+    grep -Eq "^${completion_name}[[:space:]]*\\(\\)|^function[[:space:]]+${completion_name}([[:space:]]|\\()" "$source"; then
+    if [[ "$first_line" == \#compdef* ]]; then
+      cp "$source" "$temp" || return 1
+    else
+      {
+        print -r -- "#compdef $command"
+        cat "$source"
+      } >| "$temp" || return 1
+    fi
+    chmod 600 "$temp" || {
+      rm -f "$temp"
+      return 1
+    }
+    mv -f "$temp" "$destination" || {
+      rm -f "$temp"
+      return 1
+    }
+    rm -f "$source_destination" || return 1
+    return 0
+  fi
+
+  completion_function=$(grep -Eo 'compdef[[:space:]]+_[A-Za-z0-9_-]+' "$source" |
+    head -n 1 | awk '{print $2}') || completion_function=
+  [[ -n "$completion_function" ]] || return 1
+
+  cp "$source" "$source_temp" || return 1
+  chmod 600 "$source_temp" || {
+    rm -f "$source_temp"
+    return 1
+  }
+  mv -f "$source_temp" "$source_destination" || {
+    rm -f "$source_temp"
+    return 1
+  }
+  {
+    print -r -- "#compdef $command"
+    print -r -- "$completion_name() {"
+    print -r -- "  source ${(q)source_destination}"
+    print -r -- "  $completion_function \"\$@\""
+    print -r -- "}"
+  } >| "$temp" || return 1
+  chmod 600 "$temp" || {
+    rm -f "$temp"
+    return 1
+  }
+  mv -f "$temp" "$destination" || {
+    rm -f "$temp"
+    return 1
+  }
+}
+
+rebuild_init() {
+  local temp="$INIT_FILE.$$.$RANDOM"
+  {
+    print -r -- '# Generated by zsh-completion; do not edit.'
+    print -r -- "typeset -g _ZSH_COMPLETION_DIR=${(q)COMPLETION_DIR}"
+    print -r -- 'if [[ -d "$_ZSH_COMPLETION_DIR" ]]; then'
+    print -r -- '  fpath=("$_ZSH_COMPLETION_DIR" $fpath)'
+    print -r -- 'fi'
+  } >| "$temp"
+  chmod 600 "$temp"
+  mv -f "$temp" "$INIT_FILE"
+}
+
+ask_to_install() {
+  local command=$1
+  local used=${history_counts[$command]:-0}
+  local answer
+  candidate_label "$command"
+  if (( NONINTERACTIVE )); then
+    return 0
+  fi
+  if (( used >= 3 )); then
+    printf '  Install? [Y/n] '
+  else
+    printf '  Install? [y/N] '
+  fi
+  if ! read -r answer </dev/tty; then
+    print
+    return 1
+  fi
+  answer=${answer:l}
+  if [[ -z "$answer" ]]; then
+    (( used >= 3 ))
+  else
+    [[ "$answer" == y || "$answer" == yes ]]
+  fi
+}
+
+install() {
+  ensure_directories
+  load_registry
+  load_snapshot
+  discover
+  load_registry
+  load_history_counts
+
+  local command installed=0 skipped=0 failed=0 candidates=0
+  for command in ${(ok)registry_lines}; do
+    is_missing_candidate "$command" || continue
+    registry_fields "${registry_lines[$command]}"
+    if [[ ! -x "${REPLY_FIELDS[3]:-}" ]]; then
+      candidate_label "$command"
+      print -- "  Command is no longer on PATH; registration kept for retry."
+      (( ++failed ))
+      continue
+    fi
+    if [[ ! -s "$PROBE_DIR/_$command" ]]; then
+      candidate_label "$command"
+      print -- "  No validated completion output; registration kept for retry."
+      (( ++failed ))
+      continue
+    fi
+    (( ++candidates ))
+    if ask_to_install "$command"; then
+      if install_candidate "$command"; then
+        (( ++installed ))
+      else
+        (( ++failed ))
+        print -u2 -- "  Failed to install $command; it remains registered for retry."
+      fi
+    else
+      (( ++skipped ))
+      print -- "  Skipped $command; it remains registered for a later retry."
+    fi
+  done
+  write_registry
+  rebuild_init
+  print -- "Candidates: $candidates; installed: $installed; skipped: $skipped; failed: $failed"
+}
+
+init() {
+  ensure_directories
+  load_registry
+  rebuild_init
+  print -- "$INIT_FILE"
+}
+
+status() {
+  load_registry
+  local command
+  if (( ${#registry_lines} == 0 )); then
+    print -- "No completion candidates are registered. Run: $SCRIPT_NAME install"
+    return 0
+  fi
+  for command in ${(ok)registry_lines}; do
+    candidate_label "$command"
+  done
+}
+
+main() {
+  parse_options "$@"
+  validate_paths
+  case "$REPLY_COMMAND" in
+    discover)
+      ensure_directories
+      acquire_lock
+      discover
+      ;;
+    install)
+      ensure_directories
+      acquire_lock
+      install
+      ;;
+    init)
+      ensure_directories
+      acquire_lock
+      init
+      ;;
+    status)
+      status
+      ;;
+  esac
+}
+
+main "$@"

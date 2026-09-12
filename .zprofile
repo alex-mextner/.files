@@ -17,6 +17,16 @@ unset file
 # completion
 #
 
+ZSH_COMPLETION_STATE_DIR="${ZSH_COMPLETION_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zsh-completions}"
+ZSH_COMPLETION_INIT="$ZSH_COMPLETION_STATE_DIR/init.zsh"
+if [[ -r "$ZSH_COMPLETION_INIT" ]]; then
+  ZSH_COMPLETION_DUMP="${ZDOTDIR:-$HOME}/.zcompdump"
+  if [[ -e "$ZSH_COMPLETION_DUMP" && "$ZSH_COMPLETION_INIT" -nt "$ZSH_COMPLETION_DUMP" ]]; then
+    rm -f "$ZSH_COMPLETION_DUMP" "$ZSH_COMPLETION_DUMP.zwc"
+  fi
+  source "$ZSH_COMPLETION_INIT"
+fi
+
 zplug "lukechilds/zsh-better-npm-completion", defer:2
 zplug "zsh-users/zsh-completions"
 # autoload -U compinit && compinit
