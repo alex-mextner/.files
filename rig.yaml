@@ -1,0 +1,17 @@
+# rig.yaml — declarative setup for this repo, applied by `rig apply`.
+# Global defaults live at ~/.config/rig/config.yaml; this file overrides them.
+# Schema: rig-cli docs/config-schema.md
+#
+# CI for the dotfiles: a secret scan on every push and PR (gitleaks over the tree). This is
+# what `gh ship` requires as the green-CI gate, and the right gate for a repo of dotfiles.
+# No codeql / dependency-review: there is no package manifest or analysable language here.
+
+version: 1
+ci:
+  enabled: true
+  target: .github/workflows
+  all: false
+  items:
+    secret-scan:
+      enabled: true
+      tier: block
