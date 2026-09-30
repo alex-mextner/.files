@@ -18,9 +18,17 @@ cd "$worktree_path"
 
 [[ -f "package.json" ]] || exit 0
 
-if [[ -f "bun.lockb" || -f "bunfig.toml" ]]; then
-  echo "[worktree-deps] bun install in $worktree_path" >&2
-  /Users/ultra/.bun/bin/bun install --frozen-lockfile 2>&1 || true
+bun_bin=$(command -v bun || echo "${BUN_INSTALL:-$HOME/.bun}/bin/bun")
+
+# bun first: a bun project may also carry a package-lock.json, and npm would then write a full,
+# store-less copy of node_modules. bun.lock is the text lockfile (bun >= 1.2), bun.lockb the
+# binary one.
+if [[ -f "bun.lock" || -f "bun.lockb" ]]; then
+  echo "[worktree-deps] bun install --frozen-lockfile in $worktree_path" >&2
+  "$bun_bin" install --frozen-lockfile 2>&1 || true
+elif [[ -f "bunfig.toml" ]]; then
+  echo "[worktree-deps] bun install in $worktree_path (no bun lockfile yet)" >&2
+  "$bun_bin" install 2>&1 || true
 elif [[ -f "pnpm-lock.yaml" ]]; then
   echo "[worktree-deps] pnpm install in $worktree_path" >&2
   pnpm install --frozen-lockfile 2>&1 || true

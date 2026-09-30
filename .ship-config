@@ -1,0 +1,7 @@
+# .ship-config — audited, committed knobs for `gh ship` (agent-tools ci/ship/ship.sh).
+#
+# This repo is private, and GitHub Actions minutes for private repos are blocked by account
+# billing, so the secret-scan workflow cannot run here; ship then detects CI as structurally down
+# and runs its local fallback gate. The local "test" for a dotfiles repo is the same check the
+# CI workflow runs: gitleaks over the tree, failing on a leak.
+SHIP_LOCAL_TEST_CMD=gitleaks dir . --redact --no-banner --exit-code 1
