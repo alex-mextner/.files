@@ -53,8 +53,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$DIR" ]]; then
-  while IFS= read -r f; do FILES+=("$f"); done < <(find "$DIR" -name "*.png" -o -name "*.PNG" 2>/dev/null | sort)
+  # Skip *.frames-only.png: frames-check artifacts (older runs wrote them beside the source).
+  while IFS= read -r f; do FILES+=("$f"); done < <(find "$DIR" \( -name "*.png" -o -name "*.PNG" \) ! -name "*.frames-only.png" 2>/dev/null | sort)
 fi
+
+# frames-check writes its isolation images here, never beside the reviewed screenshots.
+FC_TMP="$(mktemp -d "${TMPDIR:-/tmp}/review-screenshots.XXXXXX")"
+trap 'rm -rf "$FC_TMP"' EXIT
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
   echo "Usage: review-screenshots.sh <png> [png ...] | --dir <dir> [--send-tg]" >&2
@@ -109,10 +114,10 @@ Always check these regardless of context:
      elements on a LIGHT panel) — a hard-coded color that ignores the theme.
    - Text with poor contrast against its own background (label/value barely readable).
    - Mixed theming within one panel (some controls themed, some not).
-   A UI feature proof should be demonstrated in BOTH light AND dark themes. If the theme
-   handling is part of what is being proved and only ONE theme is shown, say so — a
-   single-theme series is INCOMPLETE for a theme-sensitive feature. (When the caller's
-   --context names a specific theme, judge that the screenshot actually matches it.)
+   You see ONE screenshot of a series; the other theme may be in a separate file, so do
+   NOT reject this one merely for showing a single theme — judge that the theme it shows
+   is rendered correctly. (When the caller's --context names a specific theme, judge that
+   the screenshot actually matches it.)
 
 VERDICT FORMAT (mandatory, exact):
 VERDICT: PASS — [one-line reason: what specifically proves the feature works]
@@ -155,7 +160,7 @@ for f in "${FILES[@]}"; do
   # --- frames-check: isolate + count selection frames (color+shape) BEFORE codex ---
   frames_only=""; frames_n=0
   if [[ -x "$FRAMES_CHECK" ]]; then
-    fc_out="${f%.*}.frames-only.png"
+    fc_out="$FC_TMP/$((FAILED + PASSED)).${fname%.*}.frames-only.png"
     fj="$("$FRAMES_CHECK" "$f" --out "$fc_out" --json 2>/dev/null || true)"
     frames_n="$(printf '%s' "$fj" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("detected") or 0)

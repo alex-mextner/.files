@@ -20,12 +20,14 @@
 #   talks to the running instance's IPC) whether the folder is already open before
 #   deciding which flag to pass. See open_target_window() below.
 #   Residual limitation: `code --status` reports only each open folder's basename,
-#   not its full path, so it can't prove the folder is CLOSED when two distinct
-#   projects share a basename — only one of them may actually be open. In that
-#   case we still call --reuse-window (it matches by full path internally, so it's
-#   correct whenever the target itself is one of the open ones) but warn on stderr,
-#   since the narrow remaining risk is the same hijack this fix targets if the
-#   *exact* target isn't among the same-named open windows.
+#   not its full path, so any basename match — even a single one — may be a
+#   different project that happens to share the folder name. We still call
+#   --reuse-window on a match (it matches by full path internally, so it's correct
+#   whenever the target itself is one of the open ones); 2+ matches also warn on
+#   stderr. The remaining risk is the same hijack this fix targets, only when the
+#   *exact* target isn't open but a same-named folder is. No full-path source is
+#   available without Accessibility (storage.json's openedWindows is only written
+#   on shutdown), so this basename-level check is the best available signal.
 
 set -euo pipefail
 
