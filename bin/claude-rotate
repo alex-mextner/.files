@@ -134,13 +134,15 @@
 #   -p/non-interactive equivalent). Check them inside an interactive session
 #   with /usage instead.
 #
-# TMUX GUARD (agent-tools#526 / tg-cli#306)
+# TMUX GUARD (agent-tools#526 / tg-cli#306 / tg-cli#456)
 #   tg-ctl (the Telegram bridge) discovers agents via `tmux list-panes` and
 #   delivers replies via `tmux send-keys`. An INTERACTIVE session started from a
-#   plain terminal tab (no $TMUX) is therefore only half-reachable from the
-#   phone: it shows up in `tg-ctl status` as "unreachable: not in tmux", and a
-#   message to it is queued to its Stop-hook inbox — delivered at the agent's
-#   NEXT turn end, never typed into its prompt. Incident 2026-09-05: two agents
+#   plain terminal tab (no $TMUX) is therefore unreachable from the phone: it
+#   shows up in `tg-ctl status` as "unreachable: not in tmux". Since tg-cli
+#   1.54.26 (tg-cli#456), tg-ctl reaches Claude Code only inside tmux: a message
+#   to such a session is refused with a one-line restart hint, nothing is queued
+#   (older tg-ctl queued it to the Stop-hook inbox, read only at the agent's next
+#   turn end). Incident 2026-09-05: two agents
 #   launched this way were simply invisible for hours. So this launcher:
 #     - WARNS loudly on stderr when $TMUX is unset and the run is interactive
 #       (a TTY, no -p/--print) — CLAUDE_ROTATE_REQUIRE_TMUX=warn (default);
@@ -624,8 +626,7 @@ tmux_guard() {
   cat >&2 <<WARN
 $PROG: WARNING — not running inside tmux (\$TMUX is unset).
   tg-ctl cannot reach this agent from Telegram: it will show as "unreachable: not in
-  tmux" and a message to it is only queued to its Stop-hook inbox (delivered at the
-  agent's next turn end, never typed into its prompt).
+  tmux" (see TMUX GUARD at the top of $0).
   Fix: start it inside tmux — \`$PROG --tmux $name\` — or run it in a tmux window.
   Silence: CLAUDE_ROTATE_REQUIRE_TMUX=off; auto-wrap: CLAUDE_ROTATE_REQUIRE_TMUX=wrap.
 WARN
