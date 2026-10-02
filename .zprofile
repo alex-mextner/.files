@@ -237,3 +237,6 @@ if [[ $RANDOM > 8191 ]]; then
   echo '                ||----w |'
   echo '                ||     ||'
 fi
+
+# Added by swiftly
+. "/Users/ultra/.swiftly/env.sh"

@@ -1,15 +1,17 @@
 [user]
-  name = Alex Ultra
-  email = invntrm@icloud.com
+	name = Alex Ultra
+	email = invntrm@icloud.com
 	signingkey = D8432C6E26F51925
 [core]
 	whitespace=fix,-indent-with-non-tab,trailing-space,cr-at-eol,space-before-tab
 	quotepath = false # Чтобы не упячилась кириллица в путях
-	editor = "code --wait --new-window "
+	editor = true
 	excludesfile = ~/.gitignore
 	ignorecase = false
 	pager = diff-so-fancy | less --tabs=4 -RFX
 	compression = 0
+	attributesFile = /Users/ultra/.config/git/attributes
+	hooksPath = /Users/ultra/.config/git/hooks
 
 [merge]
 	tool = vscode
@@ -34,7 +36,7 @@
   cmd = code --wait --diff $LOCAL $REMOTE
 
 [diff]
-	noprefix = true # remove a/ b/ from diff
+	noprefix = true
 	algorithm = patience
   tool = vsc-difftool
 
@@ -177,3 +179,14 @@
 [safe]
 	directory = /tmp/ntgcalls-debug
 	directory = /private/tmp/ntgcalls-debug
+[credential "https://github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential
+[merge "mergiraf"]
+	name = mergiraf
+	driver = mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L
+[init]
+	templateDir = /Users/ultra/.config/git/template

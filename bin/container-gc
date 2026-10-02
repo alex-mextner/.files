@@ -1,0 +1,49 @@
+#!/bin/bash
+# container-gc — weekly GC for Apple container CLI storage (user-approved, tg#10562).
+# Run by LaunchAgent com.ultra.container-gc (Mon 11:00). Stops the builder, deletes
+# its rootfs when >5 GB, prunes images. Logs to ~/Library/Logs/container-gc.log.
+set -u
+
+CONTAINER=/opt/homebrew/bin/container
+ROOTFS="$HOME/Library/Application Support/com.apple.container/containers/buildkit/rootfs.ext4"
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') container-gc: $*"
+}
+
+log "run started"
+
+if [ ! -x "$CONTAINER" ]; then
+  log "container binary not found at $CONTAINER, aborting"
+  exit 0
+fi
+
+if "$CONTAINER" builder stop >/dev/null 2>&1; then
+  log "builder stop: ok"
+else
+  log "builder stop: failed or no builder running (ignored)"
+fi
+
+if [ -f "$ROOTFS" ]; then
+  size_gb=$(du -sg "$ROOTFS" 2>/dev/null | awk '{print $1}')
+  log "builder rootfs present, size ${size_gb:-?} GB"
+  if [ "${size_gb:-0}" -gt 5 ] 2>/dev/null; then
+    if "$CONTAINER" builder delete >/dev/null 2>&1; then
+      log "builder delete: ok (rootfs was ${size_gb} GB > 5 GB)"
+    else
+      log "builder delete: FAILED"
+    fi
+  else
+    log "builder delete: skipped (rootfs <= 5 GB)"
+  fi
+else
+  log "builder rootfs absent, nothing to delete"
+fi
+
+if "$CONTAINER" image prune >/dev/null 2>&1; then
+  log "image prune: ok"
+else
+  log "image prune: failed (ignored)"
+fi
+
+log "run finished"

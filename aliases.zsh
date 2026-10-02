@@ -209,34 +209,6 @@ alias -g '|/'='| grep -i' # / foo |/ bar #= grep foo | grep bar
 
 alias /='rg'
 
-# claude with permission checks disabled — for sandboxes / trusted dirs
-alias cc='claude --allow-dangerously-skip-permissions --permission-mode bypassPermissions'
-
-# Route every `claude` invocation through claude-rotate (~/.files/bin/claude-rotate),
-# which tries the current one of 3 personal Claude.ai subscription accounts and
-# auto-rotates to the next on a detected session/weekly limit hit. Deliberately a
-# SHELL ALIAS, not a rename/PATH-shadow of the real ~/.local/bin/claude binary:
-# - ~/.local/bin is first in PATH (ahead of ~/.files/bin), and that binary path is a
-#   symlink claude's own self-updater rewrites — clobbering or shadowing it there is
-#   fragile and would affect every non-interactive caller (rig, hooks, CI, other
-#   tools shelling out to `claude`) that has no business going through account
-#   rotation or a mutable state file.
-# - An alias only expands in THIS interactive shell — exactly the scope of the
-#   original ask (Alex switching accounts by hand at the terminal) — and composes
-#   for free with `cc` above (its expansion's leading `claude` re-expands through
-#   this alias too).
-# `claude-rotate` itself always calls the real binary directly (a bash script never
-# sees zsh aliases), so there's no risk of alias recursion inside the wrapper.
-#
-# DISABLED 2026-08-30: this alias landed before `claude-rotate --rotate-setup`
-# was ever run — ~/.claude-accounts/ had zero account-* directories registered
-# (no interactive OAuth login had been done for any of them), so EVERY `claude`
-# invocation immediately failed with "no accounts registered". Re-enable this
-# alias only after running `claude-rotate --rotate-setup` interactively (a real
-# browser login per account, can't be automated) and confirming
-# `claude-rotate --rotate-status` shows at least one account actually logged in.
-# alias claude='claude-rotate'
-
 # Moshi iOS client detection — trigger adjustments when connected from the app
 # (e.g. narrower prompts, skip nerd-font glyphs, alt keybindings).
 # Tmux-side status-bar clearing lives in .tmux.conf.
