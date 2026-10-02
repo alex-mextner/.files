@@ -34,20 +34,32 @@ PASSED=0
 
 # tg CLI: text -> `tg "msg"`, photo+caption -> `tg --photo /abs/path.png "caption"`
 TG_CLI="$(command -v tg || echo "$HOME/.files/bin/tg")"
+# frames-check: deterministic selection-frame detector (color+shape isolation).
+# ALWAYS run before TG — a "selection works" proof must not ship with no frame
+# drawn (the 2px outline is too thin for a model to see on a full screenshot).
+# Locate it whether or not review-cli/bin is on PATH.
+FRAMES_CHECK="$(command -v frames-check || echo "$HOME/xp/review-cli/bin/frames-check")"
+MIN_FRAMES=""   # if set (or --context mentions a selection), too few frames = hard REJECT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dir) DIR="$2"; shift 2 ;;
     --send-tg) SEND_TG=true; shift ;;
     --context) CONTEXT="$2"; shift 2 ;;
+    --min-frames) MIN_FRAMES="$2"; shift 2 ;;
     *.png|*.PNG) FILES+=("$1"); shift ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if [[ -n "$DIR" ]]; then
-  while IFS= read -r f; do FILES+=("$f"); done < <(find "$DIR" -name "*.png" -o -name "*.PNG" 2>/dev/null | sort)
+  # Skip *.frames-only.png: frames-check artifacts (older runs wrote them beside the source).
+  while IFS= read -r f; do FILES+=("$f"); done < <(find "$DIR" \( -name "*.png" -o -name "*.PNG" \) ! -name "*.frames-only.png" 2>/dev/null | sort)
 fi
+
+# frames-check writes its isolation images here, never beside the reviewed screenshots.
+FC_TMP="$(mktemp -d "${TMPDIR:-/tmp}/review-screenshots.XXXXXX")"
+trap 'rm -rf "$FC_TMP"' EXIT
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
   echo "Usage: review-screenshots.sh <png> [png ...] | --dir <dir> [--send-tg]" >&2
@@ -97,6 +109,16 @@ Always check these regardless of context:
    - Canvas: are elements rendered, or is it gray?
    - Element selection: is an element highlighted with bounding box?"; fi)
 
+5. BROKEN THEME — Does the UI respect the active color theme? REJECT if any of:
+   - Light/white inputs, cards, fields, or popovers sitting on a DARK panel (or dark
+     elements on a LIGHT panel) — a hard-coded color that ignores the theme.
+   - Text with poor contrast against its own background (label/value barely readable).
+   - Mixed theming within one panel (some controls themed, some not).
+   You see ONE screenshot of a series; the other theme may be in a separate file, so do
+   NOT reject this one merely for showing a single theme — judge that the theme it shows
+   is rendered correctly. (When the caller's --context names a specific theme, judge that
+   the screenshot actually matches it.)
+
 VERDICT FORMAT (mandatory, exact):
 VERDICT: PASS — [one-line reason: what specifically proves the feature works]
 or
@@ -135,11 +157,44 @@ for f in "${FILES[@]}"; do
     continue
   fi
 
-  # Codex analysis with image
-  verdict=$(timeout 120 codex exec -i "$f" \
+  # --- frames-check: isolate + count selection frames (color+shape) BEFORE codex ---
+  frames_only=""; frames_n=0
+  if [[ -x "$FRAMES_CHECK" ]]; then
+    fc_out="$FC_TMP/$((FAILED + PASSED)).${fname%.*}.frames-only.png"
+    fj="$("$FRAMES_CHECK" "$f" --out "$fc_out" --json 2>/dev/null || true)"
+    frames_n="$(printf '%s' "$fj" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("detected") or 0)
+except Exception: print(0)' 2>/dev/null || echo 0)"
+    [[ -f "$fc_out" ]] && frames_only="$fc_out"
+  fi
+  # Is a selection/frame claimed here? (explicit --min-frames, or selection words in context)
+  selection_claim=false
+  if [[ -n "$MIN_FRAMES" ]] || printf '%s' "$CONTEXT" | grep -qiE 'select|multi-?select|frame|выдел|рамк'; then
+    selection_claim=true
+  fi
+  min_required="${MIN_FRAMES:-1}"
+  # Deterministic gate: selection claimed but CV found too few frames → REJECT before codex.
+  if $selection_claim && [[ "$frames_n" -lt "$min_required" ]]; then
+    echo "VERDICT: REJECT — selection claimed but frames-check found $frames_n frame(s) (need >= $min_required)"
+    FAILED=$((FAILED + 1))
+    RESULTS+=("REJECT|$fname|frames-check: $frames_n < $min_required selection frames")
+    if $SEND_TG; then
+      "$TG_CLI" --photo "${frames_only:-$f}" "❌ REJECT: $fname — frames-check: $frames_n selection frame(s), need >= $min_required" 2>/dev/null || true
+    fi
+    continue
+  fi
+  frames_note=""
+  [[ -n "$frames_only" ]] && frames_note="A SECOND image is attached showing ONLY those frames (lit on black) — use it to confirm presence and positions."
+  frames_block="
+
+CV FRAME-ISOLATION (deterministic): a detector isolated selection-frame pixels by color (rgb(59,130,246)) and shape (hollow rectangle) and found ${frames_n} frame(s). ${frames_note} If this screenshot claims a selection/multi-select, there MUST be at least 1 frame and the count should match the claim; 0 frames while a selection is claimed = REJECT."
+  fc_img_args=(); [[ -n "$frames_only" ]] && fc_img_args=(-i "$frames_only")
+
+  # Codex analysis with image(s): original + the frames-only isolation
+  verdict=$(timeout 120 codex exec -i "$f" ${fc_img_args[@]+"${fc_img_args[@]}"} \
     --config "model=gpt-5.4" \
     --config 'sandbox_permissions=["disk-full-read-access"]' \
-    "$ATTACK_PROMPT" 2>/dev/null | grep "^VERDICT:" | tail -1 || echo "VERDICT: REJECT — codex analysis failed or timed out")
+    "${ATTACK_PROMPT}${frames_block}" 2>/dev/null | grep "^VERDICT:" | tail -1 || echo "VERDICT: REJECT — codex analysis failed or timed out")
 
   echo "$verdict"
   echo ""
