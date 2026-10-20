@@ -20,7 +20,7 @@ ubuntu/
   packages.toml             # apt / snap / flatpak names
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)
-    machine.toml            # same schema as profile.toml; wins over it
+    machine.toml            # same schema as profile.toml; wins over it (no [machine] table: hostname = dir name)
     settings/<panel>.ini    # key-level overlay on top of the shared panel files
     files/                  # path-level overlay: same relative path wins over shared files/
     packages.toml  system.toml   # same schema, merged (lists union, scalars replace)
@@ -35,6 +35,14 @@ when `ubuntu-tweak capture --commit` writes it.
 gh repo clone alex-mextner/.files ~/.files
 git clone --recurse-submodules https://github.com/alex-mextner/ubuntu-tweaks ~/xp/ubuntu-tweaks
 ~/xp/ubuntu-tweaks/bin/ubuntu-tweak init      # doctor -> submodules -> apply preview -> --commit
+```
+
+`init` also symlinks the CLI into `~/.local/bin/ubuntu-tweak` (only at `--commit`), which is what makes the
+bare `ubuntu-tweak` in the daily workflow work. Until then call it by full path, or link it yourself
+(make sure `~/.local/bin` is on `PATH`):
+
+```sh
+mkdir -p ~/.local/bin && ln -sfnT ~/xp/ubuntu-tweaks/bin/ubuntu-tweak ~/.local/bin/ubuntu-tweak
 ```
 
 The profile is found at `~/.files/ubuntu`; override with `--profile DIR` or `$UBUNTU_TWEAK_PROFILE`.
@@ -57,8 +65,25 @@ On another machine, after pulling:
 ## Per-machine overlays
 
 Merge order, last wins: module defaults < shared profile < `machines/<hostname>/`.
-Tables merge, scalars replace, lists in `packages.toml` union. A machine without an overlay
+`profile.toml` + `machine.toml`: tables merge, scalars replace, **lists replace** (a machine's
+`[capture] exclude = [...]` replaces the shared list, it does not extend it). `packages.toml` and
+`system.toml` (shared + overlay): lists **union**, scalars replace. A machine without an overlay
 directory uses the shared files only.
+
+### `[capture]` and the engine defaults
+
+The engine ships its own capture rules (`ubuntu_tweaks/capture/defaults.toml`); the profile's
+`[capture]` table (after the merge above) is evaluated together with them, not instead:
+
+- `exclude`: checked first and always wins; it adds to the built-in secret/identity/hardware excludes
+  and can never weaken them.
+- `machine`: adds to the built-in machine rules (power, touchpad, mouse, audio device keys), so
+  listing a key there only routes it to `machines/<hostname>/`; defaults keep working.
+- `include_files`: extends the built-in file allow-list.
+- Unknown keys under `[capture]` are a config error.
+
+Because lists replace between `profile.toml` and `machine.toml`, a machine that sets its own
+`[capture] machine = [...]` must repeat any shared entries it still wants.
 
 Example: power keys differ between a laptop and a desktop. `capture` routes the power plugin
 keys to the machine overlay through the engine's built-in default `machine` rules (extend them with `[capture] machine` in `profile.toml`), so each machine keeps its own:

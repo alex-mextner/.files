@@ -1,0 +1,6 @@
+# The repo-root .gitignore carries Node/macOS patterns that would silently drop captured files
+# under files/ (a *.log or logs/ dir inside a config dir). Un-ignore only those. .env, .DS_Store,
+# node_modules and similar stay ignored here on purpose: they are junk or secrets.
+!*.log
+!logs
+!.cache

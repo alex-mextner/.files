@@ -1,3 +1,3 @@
-# Overlay for the machine whose /etc/hostname is "home"; wins over ../../profile.toml.
-[machine]
-hostname = "home"
+# Overlay for the machine whose /etc/hostname is "home" (the directory name is the hostname).
+# Same schema as ../../profile.toml and wins over it. Empty on purpose: the engine reads no
+# [machine] table; add overrides here, e.g. [modules.memguard] enabled = false
