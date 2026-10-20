@@ -1,0 +1,9 @@
+# Shared configuration for the ubuntu-tweak engine; machines/<hostname>/machine.toml wins over it.
+[profile]
+description = "alex personal Ubuntu settings"
+
+# Capture rules, evaluated by `ubuntu-tweak capture`. Uncomment and adjust as needed.
+# [capture]
+# exclude = ["/org/gnome/shell/app-picker-layout"]            # never captured
+# machine = ["/org/gnome/settings-daemon/plugins/power/**"]   # captured into machines/<host>/
+# include_files = [".config/mimeapps.list", ".config/gtk-3.0/bookmarks"]  # file allow-list

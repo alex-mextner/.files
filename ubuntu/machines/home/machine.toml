@@ -1,0 +1,3 @@
+# Overlay for the machine whose /etc/hostname is "home"; wins over ../../profile.toml.
+[machine]
+hostname = "home"
