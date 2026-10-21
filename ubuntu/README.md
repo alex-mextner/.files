@@ -15,19 +15,57 @@ Files under `files/` are the symlink targets of the live config, so editing
 ubuntu/
   README.md
   profile.toml              # shared config: modules, capture rules
-  settings/<panel>.ini      # dconf keyfile per GNOME Settings panel, shared by all machines
+  settings/**/*.ini         # settings bundles: dconf keyfiles named by purpose (dev-keyboard.ini, laptop/power.ini), shared by all machines
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
   packages.toml             # apt / snap / flatpak names
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)
     machine.toml            # same schema as profile.toml; wins over it (no [machine] table: hostname = dir name)
-    settings/<panel>.ini    # key-level overlay on top of the shared panel files
+    settings/**/*.ini       # key-level overlay bundles on top of the shared ones
     files/                  # path-level overlay: same relative path wins over shared files/
     packages.toml  system.toml   # same schema, merged (lists union, scalars replace)
 ```
 
 Only `profile.toml` and `machines/home/machine.toml` exist initially; the rest appears
-when `ubuntu-tweak capture --commit` writes it.
+when `ubuntu-tweak capture --commit` writes it (by default one bundle per Settings panel:
+`settings/keyboard.ini`, `settings/appearance.ini`, ...).
+
+## Settings bundles and reasons
+
+Any `settings/**/*.ini` file is a *bundle*: one file per purpose, holding keys from any dconf path,
+merged with the other bundles at load (the idea is Home Assistant's `packages:`). The name is the
+path without `.ini`; `machines/<hostname>/settings/**/*.ini` are bundles of the overlay and win key by
+key. The same key with different values in two bundles of one layer is an error (exit 2, both
+files and lines named); identical values only warn. `ubuntu-tweak bundles` shows what applies here
+and the shadowed / duplicated / conflicting keys.
+
+```ini
+# settings/dev-keyboard.ini
+[ubuntu-tweak]                  # optional header, not a dconf section
+description = "Keys for working on the dev keyboard"
+machines = ["home"]             # apply only on these hostnames (also: requires-module = "hyperdock")
+
+[org/gnome/desktop/wm/keybindings]
+# Super+arrows belong to the tiler, so workspaces move on Alt   <- the reason: the comment above a key
+switch-to-workspace-left=['<Super><Alt>Left']
+```
+
+A reason is the full-line `#` comment directly above a key (or, in `packages.toml`, a trailing
+comment: `"tmux",  # shell tools`). `apply` prints it next to the key, `status` shows it for modified
+keys, and `capture --commit` rewrites only the changed values, keeping every comment and the order.
+`ubuntu-tweak note <bundle>:<dconf key> "reason"` (also `packages:apt:<name>`, `system:<key>`) adds one;
+`ubuntu-tweak bundle-move <bundle> '<key-or-glob>'...` regroups keys with their comments. Both are
+previews until `--commit`.
+
+Capture only writes values you changed (never schema defaults). Keys the system or an app registered
+by itself (notification app ids, Ptyxis profile uuids, input-source MRU order, ...) are listed in an
+`auto` section of the preview instead; promote any of them with `[capture] include`.
+`ubuntu-tweak capture --dry-run` is the explicit no-write preview (SUMMARY block first, `--summary`
+prints only that).
+
+`packages.toml` takes the arrays `apt`, `snap`, `flatpak` plus two optional scalars:
+`flatpak_remote = "flathub"` (the remote flatpaks install from) and `apt_update = true` (run
+`apt-get update` before the apt batch).
 
 ## Fresh machine bootstrap
 
@@ -49,13 +87,14 @@ The profile is found at `~/.files/ubuntu`; override with `--profile DIR` or `$UB
 
 ## Daily workflow
 
-Every mutating command previews by default; only `--commit` changes anything.
+Every mutating command previews by default; only `--commit` changes anything. The loop is preview, commit, review the git diff here, PR.
 
 On the machine where you changed settings:
 
-1. `ubuntu-tweak capture` - preview of exactly what the profile would receive.
+1. `ubuntu-tweak capture` (or `capture --dry-run`) - preview of exactly what the profile would receive.
 2. `ubuntu-tweak capture --commit` - writes it into this working tree (no git commit).
-3. Review `git diff` in `~/.files`, then commit and open a PR.
+3. Review `git diff` in `~/.files`, then commit and open a PR. Regroup with `bundle-move`, annotate
+   with `note`.
 
 On another machine, after pulling:
 
@@ -79,7 +118,12 @@ The engine ships its own capture rules (`ubuntu_tweaks/capture/defaults.toml`); 
   and can never weaken them.
 - `machine`: adds to the built-in machine rules (power, touchpad, mouse, audio device keys), so
   listing a key there only routes it to `machines/<hostname>/`; defaults keep working.
-- `include_files`: extends the built-in file allow-list.
+- `include`: globs that lift the `state` and `auto` skips for the keys they match.
+- `bundles`: a table, bundle name -> dconf globs; where *new* keys go (first matching entry wins).
+  A key that a bundle already holds stays there; with no match a key goes to its panel's bundle.
+  Tables merge, so `machine.toml` may add entries; a bundle name present in both replaces its list.
+- `include_files` / `machine_files`: extend the built-in file allow-list (the second adopts into
+  `machines/<hostname>/files/`).
 - Unknown keys under `[capture]` are a config error.
 
 Because lists replace between `profile.toml` and `machine.toml`, a machine that sets its own
