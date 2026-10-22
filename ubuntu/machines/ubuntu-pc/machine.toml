@@ -1,0 +1,14 @@
+# Overlay for the machine whose /etc/hostname is "ubuntu-pc". Same schema as ../../profile.toml and wins over it.
+
+# Phone-QR passkeys in Firefox (engine module `firefox-passkey-qr`, off by default because it replaces the Firefox
+# snap by Mozilla's deb). This PC has no Bluetooth: the installer finds Home Assistant and bridges the ESPHome
+# Bluetooth proxy (ESP32) as a virtual adapter. The long-lived Home Assistant token is NOT here: it lives in the
+# Secret Service (application ubuntu-tweaks, purpose ha-token) and is read at run time.
+[modules.firefox-passkey-qr]
+enabled = true
+# 100.116.57.66 is odroidn2's Tailscale address: plain http is encrypted by the tunnel only while tailscaled is up and
+# routes 100.64.0.0/10, so bring Tailscale up before the first run. A Tailscale IP (not a DNS name) is used so that no
+# resolver can redirect the request. The installer does not check the route yet:
+# https://github.com/alex-mextner/firefox-passkey-qr/issues/17
+# Without ha_url the installer looks for Home Assistant itself.
+ha_url = "http://100.116.57.66:8123"
