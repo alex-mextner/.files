@@ -39,9 +39,9 @@ permissions: {}
 
 env:
   ENGINE_REPOSITORY: alex-mextner/ubuntu-tweaks
-  # ubuntu-tweaks main at #116 (#111's coverage.d and `coverage --check-profile --online`, plus `finish`: the profile's
-  # [[finish]], [finish.apply] and [[finish.steps]] tables are unknown keys to an older engine)
-  ENGINE_REF: "92689cd19c50bbf68a2d350db028dcd73070f6f7"
+  # The pin needs coverage.d, `coverage --check-profile --online`, the profile's [[finish]] tables and the `disk:` item
+  # scheme that machines/ubuntu-pc/coverage.d/disks.toml matches; bump it only to an engine commit that keeps all four.
+  ENGINE_REF: "58063d86ab32032ca59b7f0e3d04ea305bebd01b"
 
 concurrency:
   group: coverage-${{ github.ref }}

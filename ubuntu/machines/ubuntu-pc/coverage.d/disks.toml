@@ -1,0 +1,7 @@
+# Block devices of ubuntu-pc that the `disks` module does not mount. The Mac APFS backup disk is declared in
+# machine.toml ([modules.disks.mounts.*]); a data disk with no declaration is decided here.
+
+[[coverage]]
+match = ["disk:uuid:0C64C2AC64C2983A"]
+class = "excluded"
+reason = "Windows 11 system partition of the dual boot (NTFS). The engine never mounts it: a fast-start or hibernated NTFS must not be forced writable. The desktop (udisks) mounts it when you open it in Files; declare it under [modules.disks.mounts.*] with read_only = true to make a mount permanent"

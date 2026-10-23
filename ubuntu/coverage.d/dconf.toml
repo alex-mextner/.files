@@ -22,3 +22,8 @@ paths of the RDP TLS certificate and private key, written by `grdctl rdp set-tls
 new machine: create a self-signed pair under ~/.local/share/gnome-remote-desktop/certificates with openssl, point \
 grdctl at both files, then set the RDP login with `grdctl rdp set-credentials` (the login lives in the keyring, \
 never in this repository)"""
+
+[[coverage]]
+match = ["dconf:/org/gtk/settings/file-chooser/location-mode"]
+class = "excluded"
+reason = "the GTK file chooser remembers whether the last session typed a path (Ctrl+L) or used the path bar: UI state, not a preference"

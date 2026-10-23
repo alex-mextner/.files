@@ -1,0 +1,10 @@
+# Delete this file after the first `apply --commit` on this PC. These are the hand-written one-line apt sources the PC
+# had before the apt-sources module; the module writes managed deb822 `.sources` files (listed in ../coverage.toml) and
+# removes the old `.list` files after backing them up (`ubuntu-tweak apply --dry-run --only apt-sources` shows both).
+# Until then the two files are claimed here. If a `.list` of these names comes back later, the claim is gone with this
+# file and the finding is visible again.
+
+[[coverage]]
+match = ["etc:/etc/apt/sources.list.d/mozilla.list", "etc:/etc/apt/sources.list.d/tailscale.list"]
+class = "tracked"
+reason = "replaced by the managed .sources file of the apt-sources module at `ubuntu-tweak apply --commit`"

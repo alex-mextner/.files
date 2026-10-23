@@ -295,10 +295,11 @@ match = [
   "file:~/.local/share/ha-physical-desktop",
   "file:~/.local/share/chatgpt-native-ha",
   "file:~/.local/share/tinyprint-bridge",
+  "file:~/.local/share/aisis-yandex",
   "file:~/.config/chatgpt-native-ha.env",
 ]
 class = "untracked"
-reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv); the units are declared but not enabled until this lands"
+reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv, aisis-yandex adapter and STT bridge with its venv); the units are declared but not enabled until this lands"
 ticket = "alex-mextner/.files#58"
 
 # links and leftovers whose owner is declared elsewhere (packages.toml uv/npm lists) or that hold nothing to track
@@ -359,3 +360,15 @@ reason = "empty directory an application created at its first start: nothing in 
 match = ["file:~/.config/.gsd-keyboard.settings-ported", "file:~/.config/enchant", "file:~/.config/blender", "file:~/.local/share/systemd"]
 class = "excluded"
 reason = "app markers and caches: the gnome-settings-daemon keyboard-ported marker, empty enchant dictionaries, the Blender extensions cache, systemd's persistent-timer stamp files"
+
+# firefox-passkey-qr (engine module)
+[[coverage]]
+match = ["file:~/.config/passkey-qr"]
+class = "excluded"
+reason = "the ha-repair marker the firefox-passkey-qr installer writes: state, not configuration"
+
+[[coverage]]
+match = ["file:~/.config/shell"]
+class = "untracked"
+ticket = "alex-mextner/.files#81"
+reason = "bash-env.sh ($BASH_ENV PATH guarantee for non-interactive bash), written by hand; adoption waits for the PATH fixes in #81"
