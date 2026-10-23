@@ -38,6 +38,10 @@ project_tools:
 
 # GitHub rulesets are a paid feature on a private repository (HTTP 403 "Upgrade to GitHub Pro or make
 # this repository public"), so rig cannot own one here; merge policy and Actions settings below it stay on.
+# Also unavailable on this free plan: auto-merge (allow_auto_merge stays off), secret scanning with push
+# protection and CodeQL default setup. They are deliberately NOT declared off: `rig status` keeps
+# reporting them as drift it cannot converge, and they switch on by themselves if the repository is ever
+# made public or the plan is upgraded.
 github:
   ruleset:
     enabled: false
