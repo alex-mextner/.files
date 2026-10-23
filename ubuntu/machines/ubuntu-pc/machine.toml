@@ -44,3 +44,14 @@ enabled = true
 # (never asks for root; the root remainder waits for an interactive `ubuntu-tweak apply --commit`).
 [modules.autoheal]
 enabled = true
+
+# The 1 TB USB disk from the MacBook: APFS container fcbf521d-..., one unencrypted volume "backups" (archives, a
+# 2026-10-02 MacBook backup, work checkouts). Engine module `disks`: apfs-fuse (read-only, built from a pinned commit),
+# an /etc/fstab block with nosuid,nodev,nofail + x-systemd.automount, mounted at /mnt/mac-backups on first access (the
+# volume's files are under /mnt/mac-backups/root). Read-only on purpose: it holds the only copy of some archives.
+[modules.disks.mounts.mac-backups]
+uuid = "fcbf521d-af6b-463d-9959-d25f686b3379"
+fstype = "apfs"
+read_only = true
+automount = true
+description = "MacBook backups (USB, APFS)"
