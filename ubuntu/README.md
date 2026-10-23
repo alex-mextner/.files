@@ -194,11 +194,20 @@ What only a human can do. `ubuntu-tweak apply` never prompts, stores a secret or
 step below is also reported as `needs manual` by the module that owns it, and `ubuntu-tweak status` keeps it
 Missing until it is done. After a step, run `ubuntu-tweak apply --commit` again.
 
+**One command for all of it: `finish-setup`** (also the "Finish setup" / "Завершить настройку" entry in the app grid, which
+opens a terminal). It is the profile's launcher of `ubuntu-tweak finish`: it lists what is still left on this machine in
+the order it can be done (the engine's steps from *Manual steps* of the engine spec, the `[[finish]]` steps of the profile's
+own modules and the machine's `[[finish.steps]]`), runs the machine part of each step itself and checks the result; run it
+again whenever it says something is left. `finish-setup --dry-run` only prints the list. The rows below name what each step
+does by hand. The PC's own values are in `machines/ubuntu-pc/machine.toml` (`[finish.apply]`: `apply` waits while a pull
+request of the dock repository is open; `build-server-cleanup`: two scratch directories on the build server).
+
 | Step | Module / owner | Exact command or action |
 |---|---|---|
 | root part of a fresh machine (apt packages, ssh server, polkit, Firefox policy, memguard, mounts) | engine (`apply --commit`) | `ubuntu-tweak apply --commit` from a normal terminal: it asks for the sudo password once and runs every root action. An agent shell with `no_new_privs` cannot, so it lists the root remainder and exits 6 |
 | iCloud sign-in (Apple ID password, trusted-device code, device passcode) | `passwords-app` | `passwords-app signin`, then `ubuntu-tweak status --only passwords-app` |
-| ChatGPT sign-in of the glide.vc account in its guardian browser (the profile of the other account is signed in) | `chatgpt-guardian` | `systemctl --user stop chatgpt-guardian-glide-browser`, then `~/.local/bin/chatgpt-guardian-chrome --user-data-dir=$HOME/.local/share/agent-tools/chatgpt-guardian/profiles/glide.vc https://chatgpt.com`, sign in as the glide.vc account, close the window, `systemctl --user start chatgpt-guardian-glide-browser` |
+| ChatGPT sign-in of the glide.vc account in its guardian browser (the profile of the other account is signed in) | `chatgpt-guardian` | `finish-setup --step glide-chatgpt-login`, which runs `modules/chatgpt-guardian/relogin run`: it stops the glide guardian units, opens that profile in a visible Chrome window, waits until you have signed in and closed it, starts the units again and checks them. `relogin check` tells without asking whether the glide.vc account is signed in (through the browser's DevTools port, else the marker `~/.local/state/ubuntu-tweaks/chatgpt-guardian-glide-login`) |
+| two scratch directories on the build server | `machines/ubuntu-pc` (optional) | `finish-setup --step build-server-cleanup`: shows the two paths on `ultra@65.21.40.51`, asks y/N, removes them |
 | the guardian tunnel (ChatGPT to a local MCP) | not declared | needs a platform API key with Tunnels Read+Use; without it only the ChatGPT-to-local `pm chatgpt mcp` connector is missing. Store the key with `keychain set <name>`; the key is never in this repository |
 | private submodule `vscode-configs` (GitHub account a-x-) | `dotfiles-link` | `gh auth login` as a-x- (or add this machine's SSH key to that account), then `git -C ~/.files submodule update --init vscode-configs`. The installer reports it as `manual:` instead of pending work. Nothing is lost while it is skipped: the checkout is empty on the laptop and in the Mac disk copy |
 | the Bluetooth dongle of the ODROID and its HDMI cable | hardware (Home Assistant, Kodi) | re-plug the dongle, plug HDMI into the ODROID; then Home Assistant, Developer tools, States, filter `unavailable` shows no leftovers |
