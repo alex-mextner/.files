@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""relogin: sign the glide.vc ChatGPT account into the guardian's own Chrome profile, by hand, once.
+
+The glide.vc guardian browser (chatgpt-guardian-glide-browser) lives on a private Xvfb display, so the owner cannot
+type a password into it. This helper is the human part of the `glide-chatgpt-login` finish step (module.toml):
+
+  relogin check   exit 0 = the glide.vc account is signed in, 1 = it is not (or cannot be told), 2 = usage/config
+  relogin run     stop the glide.vc guardian units, open the SAME profile in a visible Chrome window on the real
+                  desktop, wait until that window is closed, start the units again in dependency order and verify
+
+`run` in order: (1) stop chatgpt-guardian-glide, then -observer, then -browser (the display unit and everything of
+the `home` account are never touched); (2) open <profile> with the module's Chrome wrapper on the WAYLAND_DISPLAY /
+DISPLAY of the calling shell (ozone auto, start page https://chatgpt.com/auth/login, no DevTools port); (3) wait
+until no process uses that --user-data-dir any more. Chrome is single-instance per profile: a second launch hands
+over to the running instance and exits at once, so the wait follows the processes that hold the profile (the
+command line `--user-data-dir=<profile>` of every Chrome process, and the SingletonLock owner), never only the
+launched pid; (4) start -browser, -observer, -guardian; (5) verify, within CHATGPT_RELOGIN_VERIFY_TIMEOUT: the three
+units are active and the journal of the guardian shows a `"health": "connected"` line since the start, then ask the
+browser which account it is signed in to. Whatever happens after step 1 (Chrome fails to open, Ctrl+C, the terminal
+is closed) the units are started again.
+
+`check` rule, no question to the owner, nothing secret printed (only `ok` and an email DOMAIN):
+  1. Ask the running browser. Through its DevTools port (module option glide_port, default 9223) take a chatgpt.com
+     tab and evaluate `fetch('/api/auth/session')` in it; the page script returns only {signed in?, domain of the
+     email}, so the address, the cookies and the access token never leave the browser. Done = signed in with the
+     domain `glide_email_domain` (module option, default glide.vc). Another domain or signed out = NOT done, and
+     the answer of the browser wins over any marker.
+  Only tabs on the real origin https://chatgpt.com count (a look-alike host never runs the page script).
+  2. The browser cannot be asked (units stopped, no DevTools answer, no chatgpt.com tab, an unreadable answer such
+     as a challenge page): fall back to the marker file ~/.local/state/ubuntu-tweaks/chatgpt-guardian-glide-login,
+     and SAY that it could not ask. Done = the marker exists. The marker is "a re-login window was shown to the
+     owner, the stack came back healthy AND the browser showed the glide.vc domain" (written by `run` only after
+     step 5, with that domain; a `run` that cannot read the account fails and writes nothing). It cannot see a later
+     logout: rule 1 does.
+
+Environment (all optional; tests and throwaway experiments set them so the real session is never touched):
+  CHATGPT_RELOGIN_PROFILE         profile dir            default ~/.local/share/agent-tools/chatgpt-guardian/profiles/glide.vc
+  CHATGPT_RELOGIN_CHROME          Chrome (wrapper)       default: the module option `chrome` as install.sh reads it ("user" =
+                                  ~/.local/bin/chatgpt-guardian-chrome, else that absolute path, default /usr/bin/google-chrome)
+  CHATGPT_RELOGIN_CHROME_ARGS     extra Chrome flags (shell syntax), e.g. --headless=new
+  CHATGPT_RELOGIN_URL             start page             default https://chatgpt.com/auth/login
+  CHATGPT_RELOGIN_SYSTEMCTL       command (shell syntax) default "systemctl --user"
+  CHATGPT_RELOGIN_JOURNALCTL      command (shell syntax) default "journalctl --user"
+  CHATGPT_RELOGIN_GUARDIAN_UNIT / _OBSERVER_UNIT / _BROWSER_UNIT    defaults chatgpt-guardian-glide, -observer, -browser
+  CHATGPT_RELOGIN_DEVTOOLS_PORT   default: module option glide_port, else 9223
+  CHATGPT_RELOGIN_MARKER          default ~/.local/state/ubuntu-tweaks/chatgpt-guardian-glide-login
+  CHATGPT_RELOGIN_STOP_TIMEOUT    seconds to stop the units / free the profile (default 120)
+  CHATGPT_RELOGIN_VERIFY_TIMEOUT  seconds for the units and the health line of step 5 (default 180: the guardian polls once a minute)
+  CHATGPT_RELOGIN_ACCOUNT_TIMEOUT seconds to wait for a chatgpt.com tab to answer after the restart (default 30)
+  CHATGPT_RELOGIN_PROBE_TIMEOUT   seconds one question to the browser may take in all (default 40: finish gives `check` 60)
+  CHATGPT_RELOGIN_POLL            seconds between polls (default 1)
+Module options come as JSON in UBUNTU_TWEAK_MODULE_CONFIG; the language in UBUNTU_TWEAK_LANG (ru or en);
+UBUNTU_TWEAK_FINISH_DRY_RUN=1 makes `run` print what it would do and change nothing.
+Exit codes: 0 ok, 1 not done / failed, 2 usage or configuration, 130 interrupted.
+"""
+
+import base64
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import urlparse
+
+DEFAULT_DOMAIN = "glide.vc"
+DEFAULT_PORT = 9223
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+STOPPED_STATES = ("inactive", "failed", "unknown")  # what is-active says of a unit that is not running (or not loaded)
+HEALTH_LINE = re.compile(r'"health"\s*:\s*"connected"')
+
+# Runs inside the chatgpt.com page. It returns only the sign-in state and the DOMAIN of the account email.
+PAGE_SCRIPT = """(async () => {
+  try {
+    const r = await fetch('/api/auth/session', {credentials: 'include', signal: AbortSignal.timeout(15000)});
+    const j = await r.json();
+    const mail = j && j.user && typeof j.user.email === 'string' ? j.user.email : '';
+    return {state: j && j.user ? 'user' : 'none', domain: mail.includes('@') ? mail.split('@').pop().toLowerCase() : ''};
+  } catch (e) {
+    return {state: 'error', domain: ''};
+  }
+})()"""
+
+TEXT = {
+    "en": {
+        "usage": "usage: relogin check | run",
+        "bad_option": "module option {name}: {why}",
+        "ok_account": "glide.vc ChatGPT account is signed in (email domain {domain})",
+        "wrong_account": "the guardian browser is signed in with another account (email domain {domain}, need {want})",
+        "wrong_account_unknown": "the guardian browser is signed in, but the email domain is not visible (need {want})",
+        "signed_out": "the guardian browser is signed out of ChatGPT (need an account with the domain {want})",
+        "no_answer": "could not ask the browser ({reason})",
+        "marker_yes": "{asked}; the marker says the re-login was done on {when}",
+        "marker_no": "{asked}; there is no marker of a finished re-login either",
+        "why_port": "no DevTools answer on port {port}",
+        "why_tab": "no chatgpt.com tab is open",
+        "why_unreadable": "the session answer was not readable",
+        "dry_run": "dry run: would stop {units}, open {chrome} with --user-data-dir={profile} on {url}, wait until the window is closed, "
+        "start {back} and verify; nothing was changed",
+        "no_display": "no graphical session: WAYLAND_DISPLAY and DISPLAY are both unset; run this from a terminal on the desktop",
+        "no_profile": "the glide.vc profile directory does not exist: {path}",
+        "no_chrome": "Chrome not found or not executable: {path}",
+        "stopping": "Stopping the glide.vc guardian units: {units}",
+        "stop_failed": "could not stop {unit}: {why}",
+        "profile_busy": "another process still uses the profile after {seconds:.0f}s (pids {pids}); close it and run again",
+        "opening": "Opening Chrome on the glide.vc profile. Sign in to ChatGPT with the glide.vc account, then CLOSE THE WINDOW.",
+        "no_sandbox": "Note: this is the rootless Chrome of the module, it runs without its sandbox; use the window only to sign in to ChatGPT.",
+        "waiting": "Waiting for the window to be closed...",
+        "chrome_died": "Chrome exited at once with code {code} and no window stayed open",
+        "chrome_start_failed": "could not start Chrome: {why}",
+        "closed": "Window closed.",
+        "interrupted": "Interrupted; closing the window and putting the units back.",
+        "starting": "Starting the units again: {units}",
+        "start_failed": "could not start {unit}: {why}",
+        "verifying": "Verifying (up to {seconds:.0f}s)...",
+        "unit_down": "{unit} is not active",
+        "no_health": 'no "health": "connected" line from {unit} since the restart',
+        "verify_failed": "NOT verified: {what}",
+        "verified_account": 'OK: units are active, the guardian reports "health": "connected", signed in with the domain {domain}',
+        "unreadable_after": "the units are back and healthy, but the account could not be read from the browser ({reason}); "
+        "nothing is recorded, run finish-setup again in a minute",
+        "wrong_after": "the window was closed, but the account is wrong: {what}",
+    },
+    "ru": {
+        "usage": "использование: relogin check | run",
+        "bad_option": "опция модуля {name}: {why}",
+        "ok_account": "аккаунт ChatGPT glide.vc залогинен (домен почты {domain})",
+        "wrong_account": "в браузере стража другой аккаунт (домен почты {domain}, нужен {want})",
+        "wrong_account_unknown": "браузер стража залогинен, но домен почты не виден (нужен {want})",
+        "signed_out": "браузер стража вышел из ChatGPT (нужен аккаунт с доменом {want})",
+        "no_answer": "не удалось спросить браузер ({reason})",
+        "marker_yes": "{asked}; по метке перелогин был сделан {when}",
+        "marker_no": "{asked}; и метки о выполненном перелогине тоже нет",
+        "why_port": "на порту DevTools {port} нет ответа",
+        "why_tab": "нет открытой вкладки chatgpt.com",
+        "why_unreadable": "ответ сессии не удалось прочитать",
+        "dry_run": "пробный запуск: остановил бы {units}, открыл бы {chrome} с --user-data-dir={profile} на {url}, дождался бы закрытия окна, "
+        "запустил бы {back} и проверил; ничего не изменено",
+        "no_display": "нет графической сессии: не заданы ни WAYLAND_DISPLAY, ни DISPLAY; запусти из терминала на рабочем столе",
+        "no_profile": "каталога профиля glide.vc нет: {path}",
+        "no_chrome": "Chrome не найден или не запускается: {path}",
+        "stopping": "Останавливаю юниты стража glide.vc: {units}",
+        "stop_failed": "не удалось остановить {unit}: {why}",
+        "profile_busy": "профиль всё ещё занят другим процессом через {seconds:.0f} с (pid {pids}); закрой его и запусти снова",
+        "opening": "Открываю Chrome с профилем glide.vc. Войди в ChatGPT аккаунтом glide.vc, затем ЗАКРОЙ ОКНО.",
+        "no_sandbox": "Внимание: это Chrome без root от модуля, он работает без песочницы; пользуйся окном только для входа в ChatGPT.",
+        "waiting": "Жду закрытия окна...",
+        "chrome_died": "Chrome сразу завершился с кодом {code}, окно не открылось",
+        "chrome_start_failed": "не удалось запустить Chrome: {why}",
+        "closed": "Окно закрыто.",
+        "interrupted": "Прервано; закрываю окно и возвращаю юниты.",
+        "starting": "Запускаю юниты снова: {units}",
+        "start_failed": "не удалось запустить {unit}: {why}",
+        "verifying": "Проверяю (до {seconds:.0f} с)...",
+        "unit_down": "{unit} не активен",
+        "no_health": 'от {unit} после перезапуска нет строки "health": "connected"',
+        "verify_failed": "НЕ подтверждено: {what}",
+        "verified_account": 'ГОТОВО: юниты активны, страж пишет "health": "connected", вход выполнен с доменом {domain}',
+        "unreadable_after": "юниты снова работают и здоровы, но аккаунт из браузера прочитать не удалось ({reason}); "
+        "ничего не записано, запусти finish-setup ещё раз через минуту",
+        "wrong_after": "окно закрыто, но аккаунт не тот: {what}",
+    },
+}
+
+
+class ConfigError(Exception):
+    pass
+
+
+class RunError(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Settings:
+    profile: Path
+    chrome: str
+    chrome_args: list[str]
+    url: str
+    systemctl: list[str]
+    journalctl: list[str]
+    guardian: str
+    observer: str
+    browser: str
+    port: int
+    marker: Path
+    domain: str
+    stop_timeout: float
+    verify_timeout: float
+    account_timeout: float
+    probe_timeout: float
+    poll: float
+    lang: str
+    dry_run: bool
+
+    def say(self, key: str, **values) -> str:
+        return TEXT[self.lang][key].format(**values)
+
+
+def _number(env: dict, name: str, default: float) -> float:
+    raw = env.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number: {raw}") from None
+    if value <= 0:
+        raise ConfigError(f"{name} must be positive: {raw}")
+    return value
+
+
+def load_settings(env: dict) -> Settings:
+    lang = env.get("UBUNTU_TWEAK_LANG", "en")
+    lang = lang if lang in TEXT else "en"
+    try:
+        options = json.loads(env.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"UBUNTU_TWEAK_MODULE_CONFIG is not JSON: {error}") from None
+    if not isinstance(options, dict):
+        raise ConfigError("UBUNTU_TWEAK_MODULE_CONFIG must be a JSON object")
+    domain = options.get("glide_email_domain", DEFAULT_DOMAIN)
+    if not isinstance(domain, str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", domain):
+        raise ConfigError(TEXT[lang]["bad_option"].format(name="glide_email_domain", why="must be a domain name such as glide.vc"))
+    port_text = env.get("CHATGPT_RELOGIN_DEVTOOLS_PORT") or str(options.get("glide_port", DEFAULT_PORT))
+    if not re.fullmatch(r"[0-9]+", port_text) or not 0 < int(port_text) <= 65535:
+        raise ConfigError(TEXT[lang]["bad_option"].format(name="glide_port", why=f"not a port: {port_text}"))
+    home = Path(env.get("HOME") or Path.home())
+    chrome_option = options.get("chrome", "/usr/bin/google-chrome")
+    if not isinstance(chrome_option, str) or not chrome_option:
+        raise ConfigError(TEXT[lang]["bad_option"].format(name="chrome", why='must be an absolute path or "user"'))
+    # The same Chrome the browser unit runs (install.sh): "user" is the rootless copy behind the dedicated wrapper.
+    if chrome_option == "user":
+        chrome_default = str(home / ".local/bin/chatgpt-guardian-chrome")
+    else:
+        chrome_default = str(home / chrome_option[2:]) if chrome_option.startswith("~/") else chrome_option
+    profile = env.get("CHATGPT_RELOGIN_PROFILE") or str(home / ".local/share/agent-tools/chatgpt-guardian/profiles/glide.vc")
+    return Settings(
+        profile=Path(profile),
+        chrome=env.get("CHATGPT_RELOGIN_CHROME") or chrome_default,
+        chrome_args=shlex.split(env.get("CHATGPT_RELOGIN_CHROME_ARGS", "")),
+        url=env.get("CHATGPT_RELOGIN_URL") or "https://chatgpt.com/auth/login",
+        systemctl=shlex.split(env.get("CHATGPT_RELOGIN_SYSTEMCTL") or "systemctl --user"),
+        journalctl=shlex.split(env.get("CHATGPT_RELOGIN_JOURNALCTL") or "journalctl --user"),
+        guardian=env.get("CHATGPT_RELOGIN_GUARDIAN_UNIT") or "chatgpt-guardian-glide",
+        observer=env.get("CHATGPT_RELOGIN_OBSERVER_UNIT") or "chatgpt-guardian-glide-observer",
+        browser=env.get("CHATGPT_RELOGIN_BROWSER_UNIT") or "chatgpt-guardian-glide-browser",
+        port=int(port_text),
+        marker=Path(env.get("CHATGPT_RELOGIN_MARKER") or home / ".local/state/ubuntu-tweaks/chatgpt-guardian-glide-login"),
+        domain=domain.lstrip("@").lower(),
+        stop_timeout=_number(env, "CHATGPT_RELOGIN_STOP_TIMEOUT", 120.0),
+        verify_timeout=_number(env, "CHATGPT_RELOGIN_VERIFY_TIMEOUT", 180.0),
+        account_timeout=_number(env, "CHATGPT_RELOGIN_ACCOUNT_TIMEOUT", 30.0),
+        probe_timeout=_number(env, "CHATGPT_RELOGIN_PROBE_TIMEOUT", 40.0),
+        poll=_number(env, "CHATGPT_RELOGIN_POLL", 1.0),
+        lang=lang,
+        dry_run=env.get("UBUNTU_TWEAK_FINISH_DRY_RUN") == "1",
+    )
+
+
+# -- the browser's answer: DevTools over a loopback WebSocket, standard library only -------------------------------------
+
+
+class Probe(NamedTuple):
+    kind: str  # "account" (domain may be empty), "signed-out" or "unavailable"
+    domain: str = ""
+    reason: str = ""  # for "unavailable": a TEXT key
+
+
+class WebSocket:
+    """The least of RFC 6455 that Chrome's DevTools needs: one masked text frame out, text frames in."""
+
+    def __init__(self, host: str, port: int, path: str, timeout: float):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        self.sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+        )
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed during the handshake")
+            head += chunk
+            if len(head) > 65536:
+                raise ConnectionError("handshake answer too long")
+        text = head.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        accept = base64.b64encode(hashlib.sha1((key + WEBSOCKET_GUID).encode()).digest()).decode()
+        if " 101 " not in text.split("\r\n", 1)[0] or accept not in text:
+            raise ConnectionError("not a WebSocket answer")
+        self.buffer = head.split(b"\r\n\r\n", 1)[1]
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def _exact(self, count: int) -> bytes:
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("connection closed")
+            self.buffer += chunk
+        data, self.buffer = self.buffer[:count], self.buffer[count:]
+        return data
+
+    def send(self, text: str) -> None:
+        payload = text.encode()
+        mask = secrets.token_bytes(4)
+        size = len(payload)
+        if size < 126:
+            header = bytes([0x81, 0x80 | size])
+        elif size < 65536:
+            header = bytes([0x81, 0x80 | 126]) + struct.pack(">H", size)
+        else:
+            header = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", size)
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def receive(self) -> str:
+        message = b""
+        while True:
+            first, second = self._exact(2)
+            size = second & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", self._exact(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", self._exact(8))[0]
+            if size > MAX_FRAME_BYTES or len(message) + size > MAX_FRAME_BYTES:
+                raise ConnectionError("message too large")
+            mask = self._exact(4) if second & 0x80 else b""
+            payload = self._exact(size)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            opcode = first & 0x0F
+            if opcode == 0x8:
+                raise ConnectionError("closed by the browser")
+            if opcode in (0x9, 0xA):  # ping / pong: DevTools sends none for this exchange
+                continue
+            message += payload
+            if first & 0x80:
+                return message.decode()
+
+
+def _is_chatgpt(url: str) -> bool:
+    """The real origin only: a look-alike such as https://chatgpt.com.example/ would run the page script for a stranger."""
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and parsed.port in (None, 443)
+    except ValueError:
+        return False
+
+
+def _devtools_pages(port: int) -> list[dict]:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=5) as answer:
+        tabs = json.load(answer)
+    if not isinstance(tabs, list):
+        return []
+    return [t for t in tabs if isinstance(t, dict) and t.get("type") == "page" and _is_chatgpt(str(t.get("url", ""))) and t.get("webSocketDebuggerUrl")]
+
+
+def _evaluate(ws_url: str, timeout: float) -> dict | None:
+    parsed = urlparse(ws_url)
+    if parsed.hostname not in ("127.0.0.1", "localhost"):
+        return None
+    ws = WebSocket("127.0.0.1", parsed.port or 80, parsed.path, timeout)
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": PAGE_SCRIPT, "awaitPromise": True, "returnByValue": True}}))
+        while True:
+            reply = json.loads(ws.receive())
+            if not isinstance(reply, dict):
+                return None
+            if reply.get("id") == 1:
+                break
+    finally:
+        ws.close()
+    result = reply.get("result")
+    inner = result.get("result") if isinstance(result, dict) else None
+    value = inner.get("value") if isinstance(inner, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def probe(port: int, budget: float) -> Probe:
+    """Ask the running browser who is signed in, within `budget` seconds in all. Never raises: every failure is an
+    'unavailable' with a reason."""
+    deadline = time.monotonic() + budget
+    try:
+        pages = _devtools_pages(port)
+    except (OSError, urllib.error.URLError, ValueError):  # JSONDecodeError is a ValueError
+        return Probe("unavailable", reason="why_port")
+    if not pages:
+        return Probe("unavailable", reason="why_tab")
+    for page in pages[:3]:
+        left = deadline - time.monotonic()
+        if left <= 0.1:
+            break
+        try:
+            value = _evaluate(page["webSocketDebuggerUrl"], min(left, 20.0))
+        except (OSError, ConnectionError, ValueError):
+            continue
+        if not value:
+            continue
+        if value.get("state") == "user":
+            return Probe("account", domain=str(value.get("domain", "")).lower())
+        if value.get("state") == "none":
+            return Probe("signed-out")
+    return Probe("unavailable", reason="why_unreadable")
+
+
+def tell(text: str, *, error: bool = False) -> None:
+    """print that survives a closed terminal or pipe: a window that went away must not stop the units coming back."""
+    try:
+        print(text, file=sys.stderr if error else sys.stdout, flush=True)
+    except OSError:
+        pass
+
+
+# -- the marker ---------------------------------------------------------------------------------------------------------
+
+
+def marker_time(settings: Settings) -> str | None:
+    try:
+        text = settings.marker.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    return text[0] if text else None
+
+
+def write_marker(settings: Settings, what: str) -> None:
+    settings.marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    tmp = settings.marker.with_name(settings.marker.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{stamp} {what}\n")
+    os.replace(tmp, settings.marker)
+
+
+# -- check --------------------------------------------------------------------------------------------------------------
+
+
+def describe_account(settings: Settings, answer: Probe) -> str:
+    if answer.kind == "signed-out":
+        return settings.say("signed_out", want=settings.domain)
+    if not answer.domain:
+        return settings.say("wrong_account_unknown", want=settings.domain)
+    return settings.say("wrong_account", domain=answer.domain, want=settings.domain)
+
+
+def cmd_check(settings: Settings) -> int:
+    answer = probe(settings.port, settings.probe_timeout)
+    if answer.kind == "account" and answer.domain == settings.domain:
+        tell(settings.say("ok_account", domain=answer.domain))
+        return 0
+    if answer.kind != "unavailable":
+        tell(describe_account(settings, answer))
+        return 1
+    asked = settings.say("no_answer", reason=settings.say(answer.reason, port=settings.port))
+    when = marker_time(settings)
+    if when:
+        tell(settings.say("marker_yes", asked=asked, when=when))
+        return 0
+    tell(settings.say("marker_no", asked=asked))
+    return 1
+
+
+# -- run ----------------------------------------------------------------------------------------------------------------
+
+
+def unit_name(unit: str) -> str:
+    return unit if "." in unit else unit + ".service"
+
+
+def systemctl(settings: Settings, verb: str, unit: str, timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [*settings.systemctl, verb, unit_name(unit)], capture_output=True, text=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL
+    )
+
+
+def unit_state(settings: Settings, unit: str) -> str:
+    """`systemctl is-active` word; empty when systemd could not be asked (no user bus), never taken for "stopped"."""
+    return systemctl(settings, "is-active", unit, timeout=30).stdout.strip()
+
+
+def is_active(settings: Settings, unit: str) -> bool:
+    return unit_state(settings, unit) == "active"
+
+
+def _why(done: subprocess.CompletedProcess) -> str:
+    lines = (done.stderr or done.stdout or "").strip().splitlines()
+    return lines[-1] if lines else f"exit {done.returncode}"
+
+
+def profile_users(profile: Path) -> list[int]:
+    """Pids of every process that runs with --user-data-dir=<profile> (Chrome's helpers carry the flag too)."""
+    wanted = f"--user-data-dir={str(profile).rstrip('/')}"
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if any(a.decode("utf-8", "replace").rstrip("/") == wanted for a in argv):
+            found.append(int(entry.name))
+    return found
+
+
+def singleton_owner_alive(profile: Path) -> bool:
+    """Chrome's SingletonLock is a symlink `<host>-<pid>`; a live pid on this host still owns the profile."""
+    try:
+        target = os.readlink(profile / "SingletonLock")
+    except OSError:
+        return False
+    host, _, pid = target.rpartition("-")
+    if host != socket.gethostname() or not pid.isdigit():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def profile_in_use(profile: Path) -> list[int]:
+    users = profile_users(profile)
+    return users if users or not singleton_owner_alive(profile) else [-1]
+
+
+def wait_profile_free(settings: Settings, timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        users = profile_in_use(settings.profile)
+        if not users or time.monotonic() >= deadline:
+            return users
+        time.sleep(settings.poll)
+
+
+class Guard:
+    """`armed` = a signal turns into Interrupted; the cleanup path disarms it, so a second signal cannot cut it short."""
+
+    armed = True
+
+
+@contextmanager
+def interrupts_as_exception():
+    guard = Guard()
+
+    def raise_interrupt(signum, _frame):
+        if guard.armed:
+            guard.armed = False
+            raise Interrupted(signal.Signals(signum).name)
+
+    watched = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    old = {s: signal.signal(s, raise_interrupt) for s in watched}
+    try:
+        yield guard
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+
+
+def stop_units(settings: Settings) -> None:
+    for unit in (settings.guardian, settings.observer, settings.browser):  # the guardian BindsTo the browser: top first
+        try:
+            done = systemctl(settings, "stop", unit, timeout=settings.stop_timeout)
+        except subprocess.TimeoutExpired:
+            raise RunError(settings.say("stop_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s")) from None
+        if done.returncode != 0 and unit_state(settings, unit) not in STOPPED_STATES:
+            raise RunError(settings.say("stop_failed", unit=unit, why=_why(done)))
+
+
+def launch_chrome(settings: Settings) -> subprocess.Popen:
+    argv = [settings.chrome, f"--user-data-dir={settings.profile}", "--no-first-run", "--ozone-platform-hint=auto", *settings.chrome_args, settings.url]
+    try:
+        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        raise RunError(settings.say("chrome_start_failed", why=error.strerror or str(error))) from None
+
+
+def wait_window_closed(settings: Settings, chrome: subprocess.Popen) -> None:
+    started = time.monotonic()
+    while True:
+        running = chrome.poll() is None
+        if not running and not profile_in_use(settings.profile):
+            if time.monotonic() - started < 3 and chrome.returncode != 0:
+                raise RunError(settings.say("chrome_died", code=chrome.returncode))
+            return
+        time.sleep(settings.poll)
+
+
+def close_chrome(settings: Settings, chrome: subprocess.Popen | None) -> None:
+    """After an interruption or an error: the window must be gone before the browser unit takes the profile back."""
+    if chrome is not None and chrome.poll() is None:
+        chrome.terminate()
+        try:
+            chrome.wait(timeout=settings.stop_timeout)
+        except subprocess.TimeoutExpired:
+            chrome.kill()
+            chrome.wait()
+    wait_profile_free(settings, settings.stop_timeout)
+
+
+def start_units(settings: Settings) -> list[str]:
+    failures = []
+    for unit in (settings.browser, settings.observer, settings.guardian):  # dependency order: the browser first
+        try:
+            done = systemctl(settings, "start", unit, timeout=settings.stop_timeout)
+        except subprocess.TimeoutExpired:
+            failures.append(settings.say("start_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s"))
+            continue
+        if done.returncode != 0:
+            failures.append(settings.say("start_failed", unit=unit, why=_why(done)))
+    return failures
+
+
+def health_seen(settings: Settings, since: str) -> bool:
+    done = subprocess.run(
+        [*settings.journalctl, "-u", unit_name(settings.guardian), "--since", since, "-o", "cat", "--no-pager"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    return bool(HEALTH_LINE.search(done.stdout))
+
+
+def verify(settings: Settings, since: str, start_failures: list[str]) -> int:
+    tell(settings.say("verifying", seconds=settings.verify_timeout))
+    deadline = time.monotonic() + settings.verify_timeout
+    while True:
+        missing = []
+        for unit in (settings.browser, settings.observer, settings.guardian):
+            if not is_active(settings, unit):
+                missing.append(settings.say("unit_down", unit=unit))
+        if not missing and not health_seen(settings, since):
+            missing.append(settings.say("no_health", unit=settings.guardian))
+        if not missing:
+            break
+        if time.monotonic() >= deadline:
+            tell(settings.say("verify_failed", what="; ".join([*start_failures, *missing])), error=True)
+            return 1
+        time.sleep(settings.poll)
+    account_deadline = time.monotonic() + settings.account_timeout
+    while True:
+        # one question never outlasts what is left of the account wait (at least a second, so there is always one try)
+        answer = probe(settings.port, max(1.0, min(settings.probe_timeout, account_deadline - time.monotonic())))
+        if answer.kind != "unavailable" or time.monotonic() >= account_deadline:
+            break
+        time.sleep(settings.poll)
+    if answer.kind == "account" and answer.domain == settings.domain:
+        write_marker(settings, settings.domain)
+        tell(settings.say("verified_account", domain=settings.domain))
+        return 0
+    if answer.kind != "unavailable":
+        tell(settings.say("wrong_after", what=describe_account(settings, answer)), error=True)
+        return 1
+    # Healthy units say nothing about WHICH account is signed in: no proof, no marker, not done.
+    tell(settings.say("unreadable_after", reason=settings.say(answer.reason, port=settings.port)), error=True)
+    return 1
+
+
+def cmd_run(settings: Settings) -> int:
+    units = [settings.guardian, settings.observer, settings.browser]
+    back = [settings.browser, settings.observer, settings.guardian]
+    if settings.dry_run:
+        tell(settings.say("dry_run", units=", ".join(units), chrome=settings.chrome, profile=settings.profile, url=settings.url, back=", ".join(back)))
+        return 0
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        tell(settings.say("no_display"), error=True)
+        return 2
+    if not settings.profile.is_dir():
+        tell(settings.say("no_profile", path=settings.profile), error=True)
+        return 2
+    if not (os.access(settings.chrome, os.X_OK) and Path(settings.chrome).is_file()):
+        tell(settings.say("no_chrome", path=settings.chrome), error=True)
+        return 2
+
+    chrome: subprocess.Popen | None = None
+    failure = ""
+    code = 1
+    since = ""
+    start_failures: list[str] = []
+    with interrupts_as_exception() as guard:
+        try:
+            tell(settings.say("stopping", units=", ".join(units)))
+            stop_units(settings)
+            busy = wait_profile_free(settings, settings.stop_timeout)
+            if busy:
+                raise RunError(settings.say("profile_busy", seconds=settings.stop_timeout, pids=" ".join(str(p) for p in busy if p > 0) or "?"))
+            tell(settings.say("opening"))
+            if Path(settings.chrome).name == "chatgpt-guardian-chrome":
+                tell(settings.say("no_sandbox"))
+            chrome = launch_chrome(settings)
+            tell(settings.say("waiting"))
+            wait_window_closed(settings, chrome)
+            guard.armed = False
+            tell(settings.say("closed"))
+        except Interrupted:
+            failure, code = settings.say("interrupted"), 130
+        except RunError as error:
+            failure = str(error)
+        finally:
+            # From the first stop on, the units come back whatever happened: signals no longer interrupt, and nothing
+            # before the start may fail on a terminal that has already gone away (tell swallows that).
+            guard.armed = False
+            if failure:
+                tell(failure, error=True)
+            close_chrome(settings, chrome)
+            since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(time.time())))
+            tell(settings.say("starting", units=", ".join(back)))
+            start_failures = start_units(settings)
+    if failure:
+        for line in start_failures:
+            tell(line, error=True)
+        return code
+    return verify(settings, since, start_failures)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or argv[0] not in ("check", "run"):
+        print(TEXT["en"]["usage"], file=sys.stderr)
+        return 2
+    try:
+        settings = load_settings(dict(os.environ))
+    except ConfigError as error:
+        print(f"relogin: {error}", file=sys.stderr)
+        return 2
+    code = cmd_check(settings) if argv[0] == "check" else cmd_run(settings)
+    for stream in (sys.stdout, sys.stderr):  # a hung-up terminal must not turn the exit code into 120 at shutdown
+        try:
+            stream.flush()
+        except OSError:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

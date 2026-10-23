@@ -1,0 +1,88 @@
+#!/bin/sh
+# build-server-cleanup: finish step of the ubuntu-pc profile (machine.toml, [[finish.steps]] build-server-cleanup).
+#
+# The Hetzner build server ultra@65.21.40.51 (plain ssh key login, it is not in ~/.ssh/config) still holds two scratch
+# directories of finished ctmux work: not git repositories, nothing in them is the only copy.
+#   /home/ultra/projects/rig-ctmux-20261023            (137M)
+#   /home/ultra/projects/ubuntu-sync-ctmux-20261022    (424K)
+#
+#   build-server-cleanup check   exit 0 = both are gone; 1 = one is still there, or the server cannot be asked (said why)
+#   build-server-cleanup run     show the two paths, ask y/N, remove exactly those two over ssh
+#
+# The two paths are literals of this script, never taken from an argument or the environment (the arguments after the
+# subcommand are dropped before they are set). Anything but `y` or `Y` as the answer removes nothing.
+# UBUNTU_TWEAK_FINISH_DRY_RUN=1 only shows. Every ssh call runs with -n: it must not read the answer meant for the prompt.
+command_word=${1:-}
+set -- /home/ultra/projects/rig-ctmux-20261023 /home/ultra/projects/ubuntu-sync-ctmux-20261022
+
+lang=${UBUNTU_TWEAK_LANG:-en}
+host=ultra@65.21.40.51
+
+say() { # say ENGLISH RUSSIAN
+  if [ "$lang" = ru ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi
+}
+ask() { # ask ENGLISH RUSSIAN: the prompt, no newline
+  if [ "$lang" = ru ]; then printf '%s' "$2"; else printf '%s' "$1"; fi
+}
+# ConnectTimeout bounds the connect; ServerAlive* ends a connection that goes silent afterwards (a stalled server, a dropped network).
+remote() {
+  ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$host" "$@"
+}
+
+# Names what is still on the server. Returns 0 when nothing is left, 1 when something is or the server cannot be asked.
+# `test` answering "it exists" is exit 1; any other failure (ssh itself: 255, a broken remote shell: 126/127) is "cannot ask".
+left() {
+  still_there=0
+  for dir in "$@"; do
+    reason=$(remote test ! -e "$dir" 2>&1) && continue
+    code=$?
+    if [ "$code" != 1 ]; then
+      say "cannot ask the build server $host: ${reason:-exit $code}" "не удалось спросить билд-сервер $host: ${reason:-код $code}"
+      return 1
+    fi
+    say "still on the build server: $dir" "на билд-сервере остался каталог: $dir"
+    still_there=1
+  done
+  [ "$still_there" = 0 ]
+}
+
+case "$command_word" in
+  check)
+    left "$@"
+    ;;
+  run)
+    say "These two scratch directories (not git repositories) will be removed from $host:" \
+        "С билд-сервера $host будут удалены два временных каталога (это не git-репозитории):"
+    for dir in "$@"; do
+      printf '  %s\n' "$dir"
+    done
+    if [ "${UBUNTU_TWEAK_FINISH_DRY_RUN:-}" = 1 ]; then
+      say "dry run: nothing was removed" "пробный запуск: ничего не удалено"
+      exit 0
+    fi
+    # The server must answer before anything is asked: an unreachable host is reported, not confirmed.
+    probe=$(remote true 2>&1) || {
+      say "cannot reach the build server $host: ${probe:-no answer}" "не удалось связаться с билд-сервером $host: ${probe:-нет ответа}"
+      exit 1
+    }
+    ask "Remove them? [y/N] " "Удалить? [y/N] "
+    answer=
+    read -r answer || true
+    case $answer in
+      y | Y) ;;
+      *)
+        say "Nothing was removed." "Ничего не удалено."
+        exit 1
+        ;;
+    esac
+    remote rm -rf -- "$@" || {
+      say "the removal over ssh failed" "удаление по ssh не удалось"
+      exit 1
+    }
+    say "Removed." "Удалено."
+    ;;
+  *)
+    echo "usage: build-server-cleanup check | run" >&2
+    exit 2
+    ;;
+esac

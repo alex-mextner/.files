@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Finish setup
+Name[ru]=Завершить настройку
+Comment=Everything on this computer that only you can do, in one list, step by step
+Comment[ru]=Всё, что на этом компьютере можно сделать только тебе, одним списком и по шагам
+# Terminal=true: GNOME opens the terminal xdg-terminal-exec picks (see ~/.config/xdg-terminals.list). The shell, not the
+# desktop file parser, expands $HOME (the parser expands neither `~` nor $HOME); --pause keeps the window open until
+# Enter so the result can be read. The backslashes are two layers: Exec quoting (\" and \$ inside double quotes), each
+# of them doubled again as a key-file string escape; tests/test_finish_setup_launcher.py pins the argv GLib makes of it.
+Exec=sh -c "exec \\"\\$HOME/.local/bin/finish-setup\\" --pause"
+Icon=system-software-install
+Terminal=true
+Categories=System;Settings;
+Keywords=setup;finish;sign in;login;настройка;вход;
+StartupNotify=true

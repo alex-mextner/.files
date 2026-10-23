@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -76,6 +77,8 @@ def test_unknown_option_is_refused(home, fake_bin):
         ({"chats_home": "https://chatgpt.com/c/x"}, "chats_home must be a list"),
         ({"chats_glide": ["--help"]}, "chats_glide must be a list"),
         ({"chats_home": ["https://example.com/c/x"]}, "chats_home must be a list"),
+        ({"glide_email_domain": 5}, "glide_email_domain must be a domain name"),
+        ({"glide_email_domain": "-x"}, "glide_email_domain must be a domain name"),
     ],
 )
 def test_bad_options_are_refused(home, fake_bin, config, message):
@@ -143,3 +146,19 @@ def test_glide_stack_does_not_depend_on_the_desktop_session():
         text = (MODULE / "units" / f"{name}.service").read_text(encoding="utf-8")
         assert "graphical-session.target" not in text, name
         assert "WantedBy=default.target" in text, name
+
+
+def test_glide_email_domain_option_is_accepted(home, fake_bin):
+    done = run(home, fake_bin, "--plan", config={"glide_email_domain": "example.org"})
+    assert done.returncode == 0, done.stderr
+
+
+def test_the_module_declares_the_glide_login_finish_step():
+    manifest = tomllib.loads((MODULE / "module.toml").read_text(encoding="utf-8"))
+    (step,) = [s for s in manifest["finish"] if s["id"] == "glide-chatgpt-login"]
+    for key in ("title", "title_ru", "why", "why_ru", "action", "action_ru"):
+        assert step[key].strip(), key
+    assert step["check"] == ["./relogin", "check"]
+    assert step["run"] == ["./relogin", "run"]
+    assert "requires" not in step
+    assert os.access(MODULE / "relogin", os.X_OK)

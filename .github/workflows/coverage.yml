@@ -39,8 +39,9 @@ permissions: {}
 
 env:
   ENGINE_REPOSITORY: alex-mextner/ubuntu-tweaks
-  # ubuntu-tweaks main at #111 (coverage.d, ticketed untracked rules, `coverage --check-profile --online`, adapter classification)
-  ENGINE_REF: "07adc5dc953dbd9ee71597377ddf6a54924d21f8"
+  # ubuntu-tweaks main at #116 (#111's coverage.d and `coverage --check-profile --online`, plus `finish`: the profile's
+  # [[finish]], [finish.apply] and [[finish.steps]] tables are unknown keys to an older engine)
+  ENGINE_REF: "92689cd19c50bbf68a2d350db028dcd73070f6f7"
 
 concurrency:
   group: coverage-${{ github.ref }}
