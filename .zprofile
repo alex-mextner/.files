@@ -45,19 +45,23 @@ zmodload -i zsh/complist
 # prompt
 #
 
-#setopt PROMPT_SUBST
-#export PS1='%S%B %2~ ❯ %s%b '
-export PS1='%2~ ❯ %s'
+# An installed oh-my-posh owns the prompt (ubuntu-pc); the spaceship/PS1 setup is for machines without it.
+typeset -i _files_has_omp=$+commands[oh-my-posh]
+if (( ! _files_has_omp )); then
+  #setopt PROMPT_SUBST
+  #export PS1='%S%B %2~ ❯ %s%b '
+  export PS1='%2~ ❯ %s'
 
-setopt PROMPT_SUBST
-# export RPROMPT='$(~/.cabal/bin/git-prompt green)'
-export RPROMPT='$(git-get-branch 2>/dev/null)'
+  setopt PROMPT_SUBST
+  # export RPROMPT='$(~/.cabal/bin/git-prompt green)'
+  export RPROMPT='$(git-get-branch 2>/dev/null)'
+fi
 
 #
 # Plugins
 #
 
-zplug "denysdovhan/spaceship-prompt", use:spaceship.zsh, from:github, as:theme
+(( _files_has_omp )) || zplug "denysdovhan/spaceship-prompt", use:spaceship.zsh, from:github, as:theme
 SPACESHIP_PROMPT_SEPARATE_LINE=false
 SPACESHIP_CHAR_SYMBOL='❯'
 SPACESHIP_CHAR_SUFFIX=' '
@@ -225,7 +229,7 @@ fi
 
 export GOPATH=$HOME/go
 #golang
-export PATH=/Users/ultra/.bun/bin:$PATH:$GOPATH/bin
+export PATH=$HOME/.bun/bin:$PATH:$GOPATH/bin
 #dart
 
 command -v thefuck >/dev/null 2>&1 && eval $(thefuck --alias)

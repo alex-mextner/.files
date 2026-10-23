@@ -1,0 +1,13 @@
+description = "Applies the dotfiles repository to this home (links, merged shell and git config, zplug, vim-plug, submodules, the rig global config): ~/.files/install-ubuntu.sh"
+enabled = true
+order = 111              # right after the `dotfiles` module (110) that checks the repository out
+manual = "read the `manual:` lines of `~/.files/install-ubuntu.sh --plan`: the private vscode-configs submodule needs access to its repository, bun must be installed; then re-run"
+
+# User level: the installer writes only into $HOME and ~/.files, never as root. Exit codes follow the
+# system-module protocol: install-ubuntu.sh answers 1 for pending work under --check, which is drift (3).
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"

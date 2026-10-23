@@ -1,0 +1,116 @@
+# Portable git settings shared by every machine (macOS and Linux): behaviour, colours, aliases.
+# Included from .gitconfig (macOS symlink) and, on Ubuntu, from the machine's own ~/.gitconfig by
+# install-ubuntu.sh. Identity, signing, editor, pager, merge tools and brew-only helpers stay in the
+# per-machine file — they depend on what is installed there. So do diff.noprefix (a patch without
+# a/ b/ prefixes breaks `git apply` and `patch -p1` in the agents' workflows) and core.compression
+# (uncompressed objects cost disk), and [diff "lockb"] (bun textconv); see .gitconfig.
+
+[core]
+	whitespace=fix,-indent-with-non-tab,trailing-space,cr-at-eol,space-before-tab
+	quotepath = false # Чтобы не упячилась кириллица в путях
+	ignorecase = false
+
+[merge]
+	conflictstyle = diff3
+
+[diff]
+	algorithm = patience
+
+[branch]
+	autosetuprebase = always
+
+[push]
+	default = current
+
+[color]
+	diff = yes
+	ui = true
+
+[color "branch"]
+	current = yellow reverse
+	local = yellow
+	remote = green
+
+[color "diff"]
+	meta = yellow
+	frag = magenta bold
+	old = red bold
+	new = green bold
+	whitespace = red reverse
+	commit = yellow bold
+
+[color "status"]
+	added = yellow
+	changed = green
+	untracked = cyan
+
+[color "diff-highlight"]
+	oldNormal = red bold
+	oldHighlight = red bold 52
+	newNormal = green bold
+	newHighlight = green bold 22
+
+[alias]
+	st = status
+	br = branch
+	co = checkout
+	dc = diff --cached
+	ds = diff --staged
+	c = commit
+	pr = pull-request
+	am = commit --amend
+	cp = cherry-pick
+	amend = commit --amend -C HEAD
+	lg = log -p
+	rb = rebase
+	# Нормальный лог, который сильно упрощает понимание
+	lol = log --graph --decorate --pretty=oneline --abbrev-commit
+	# Такой же лог как git lol, но для всех веток
+	lola = log --graph --decorate --pretty=oneline --abbrev-commit --all
+	l    = log --graph --decorate --pretty=oneline --abbrev-commit --all
+	hist = log --pretty=format:'%C(yellow)%h%C(reset) %ad | %C(75)%s%C(reset) %C(yellow)%d%C(reset) [%an]' --graph --date=short --branches
+	h    = log --pretty=format:'%C(yellow)%h%C(reset) %ad | %C(75)%s%C(reset) %C(yellow)%d%C(reset) [%an]' --graph --date=short --branches
+
+	lod = log --graph --decorate --format='%C(yellow)%h %Cblue%d %Cred%ad %Creset%s' --date=short
+	standup = "!git log --since '1 day ago' --oneline --author $USER"
+	week = "!git log --since '7 day ago' --oneline --author $USER"
+	changedfile = "!git log $(git-get-default-branch)...HEAD --pretty=oneline --abbrev-commit --stat=80 --reverse --follow $(git status -s | cut -c4-)"
+
+	# Show files ignored by git:
+	ign = ls-files -o -i --exclude-standard
+
+	# search commits by message
+	search = "!f() { git log --all --grep=$1; }; f"
+
+	# Find Merge — найти мерж-коммит, с которым был влит коммит. Пример как `git fm 0c23f92`
+	# Тред в рассылке: https://ml.yandex-team.ru/thread/2370000000877081412/
+	fm = "!sh -c 'git show `git rev-list --ancestry-path $0..dev --merges | tail -f`'"
+
+	ignore = update-index --assume-unchanged
+	unignore = update-index --no-assume-unchanged
+
+[tag]
+	sort = version:refname
+
+[url "git@github.com:"]
+	pushInsteadOf = "git://github.com/"
+
+[url "git://github.com/"]
+	insteadOf = "gh:"
+
+[help]
+	autocorrect = 1
+
+[rebase]
+	autoStash = true
+	autoSquash = true
+
+[pull]
+	rebase = true
+
+[hub]
+	host = github.com
+
+[status]
+	relativePaths = true
+	submoduleSummary = true

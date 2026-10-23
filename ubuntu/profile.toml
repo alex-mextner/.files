@@ -15,3 +15,13 @@ description = "alex personal Ubuntu settings"
 # [capture.bundles]
 # "dev-keyboard" = ["org/gnome/desktop/wm/keybindings/**", "org/gnome/shell/extensions/tiling-assistant/**"]
 # "laptop/power" = ["org/gnome/settings-daemon/plugins/power/**"]
+
+# rig (skills, agent hooks for omp/claude/codex, tmux, bun, tools, sysmon): off in the engine, on for every
+# machine of this profile. The global rig config comes from ../rig/config.yaml through the dotfiles-link
+# module, so the rig profile repo is not used. There is no `rig activate` before rig-cli#746 lands: the
+# dotfiles-link module runs `rig apply commit` after the installer instead.
+[modules.rig]
+enabled = true
+repo = "https://git.hyperide.ai/ultrabricks/rig-cli"
+profile_sync = false
+activate = false

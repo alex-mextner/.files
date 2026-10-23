@@ -51,3 +51,18 @@ Ubuntu settings profile (managed by `ubuntu-tweak`): see [ubuntu/README.md](ubun
 - track all git init/clone directories for futher system reinstallation/upgrage
 - try to use `.ondirc` ([example](https://github.com/tenorok/dotfiles/blob/master/bash_osx#L1-L11))
 - add rare used git aliases tip, add rare used bin tip
+
+#### Ubuntu (user level, no root)
+
+```sh
+git clone https://github.com/alex-mextner/.files ~/.files
+~/.files/install-ubuntu.sh --plan   # what it would change
+~/.files/install-ubuntu.sh          # link, merge, zplug, vim-plug, submodules, rig global config
+rig apply commit                    # converge the machine to rig/config.yaml
+```
+
+It links `.zprofile .vimrc .gitattributes .hyper.js .tmux`, adds one marked block each to the
+machine's `~/.profile`, `~/.bashrc`, `~/.zshrc`, includes `.gitconfig.shared` from `~/.gitconfig`
+and merges `rig/config.yaml` into `~/.config/rig/config.yaml`. Machine-specific files are merged,
+never overwritten; running it twice changes nothing. The private `vscode-configs` submodule needs
+access to its repository (the script says so when it cannot clone it).
