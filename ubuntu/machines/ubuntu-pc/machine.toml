@@ -33,6 +33,12 @@ chats_glide = [
   "https://chatgpt.com/c/6ace8a63-3aec-83eb-a59f-202a585bc0ce",
 ]
 
+# iCloud Passwords (engine module `passwords-app`, enabled in ../../profile.toml). `finish-setup` runs
+# `passwords-app signin` for the owner and prefills this Apple ID, so only the password and the 2FA code are typed.
+# An Apple ID is an address, not a secret: the password and the code are never written anywhere.
+[modules.passwords-app]
+apple_id = "invntrm@ya.ru"
+
 # Laptop parity (the laptop `home` had these GNOME extensions enabled; modules live in the engine).
 [modules.gsconnect]
 enabled = true
@@ -177,3 +183,32 @@ nvidia_runtime = "auto"
 memory_high = "24G"
 memory_max = "32G"
 memory_swap_max = "4G"
+
+# ---- finish-setup (ubuntu-tweak finish): the steps only the owner can do, in one list ----------------------------------------
+# The engine's own steps (apply, icloud-signin, amo-key, firefox-backend-prompt) come from the modules; what is set here is
+# what belongs to this PC alone.
+
+# `apply` links the dock code of the hyperdock checkout into the shell. While a pull request of that repository is still
+# open, the code on its branch is not the release, so applying now would link unfinished work: the gate prints the open pull
+# requests (one line each, empty = go) and finish says WAIT with that list. A gate that cannot run (gh logged out, no
+# network) is WAIT with the error, never a silent go.
+[finish.apply]
+gate = ["gh", "pr", "list", "--repo", "alex-mextner/hyperdock", "--state", "open", "--json", "number,title", "--jq", ".[] | \"#\\(.number) \\(.title)\""]
+gate_why = "the dock code that apply links must be released first; these pull requests of hyperdock are still open"
+gate_why_ru = "код дока, который подключает apply, сначала должен выйти релизом; эти pull request-ы hyperdock ещё открыты"
+
+# Two scratch directories of finished ctmux work on the Hetzner build server (not git repositories, 137M and 424K). The
+# server is reached as ultra@65.21.40.51 with the plain ssh key, it has no entry in ~/.ssh/config. Optional: leaving them
+# costs disk space only, so they never keep finish-setup from reporting "all done". The script asks y/N before it removes
+# anything and its two paths are literals (scripts/build-server-cleanup).
+[[finish.steps]]
+id = "build-server-cleanup"
+title = "Remove two scratch directories from the build server"
+title_ru = "Удалить два временных каталога на билд-сервере"
+why = "finished ctmux work left /home/ultra/projects/rig-ctmux-20261023 and /home/ultra/projects/ubuntu-sync-ctmux-20261022 on ultra@65.21.40.51; deleting is the owner's call"
+why_ru = "после завершённой работы над ctmux на ultra@65.21.40.51 остались /home/ultra/projects/rig-ctmux-20261023 и /home/ultra/projects/ubuntu-sync-ctmux-20261022; удалять их решаешь ты"
+action = "Read the two paths and answer y to remove them"
+action_ru = "Посмотри два пути и ответь y, чтобы удалить их"
+check = ["./machines/ubuntu-pc/scripts/build-server-cleanup", "check"]
+run = ["./machines/ubuntu-pc/scripts/build-server-cleanup", "run"]
+optional = true
