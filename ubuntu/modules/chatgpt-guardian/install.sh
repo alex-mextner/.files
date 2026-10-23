@@ -259,11 +259,14 @@ stale_list() {
 }
 login_state() { # login_state PORT: yes | no | unreachable (no CDP answer). Opens a short-lived chatgpt.com tab when none is open.
   [ -x "$vpy" ] || { echo unreachable; return 0; }
-  "$vpy" -B - "$1" <<'PY' 2>/dev/null || echo unreachable
+  # The probe prints exactly one word; any failure before it means no answer (unreachable), and the whole call is time-boxed.
+  timeout 90 "$vpy" -B - "$1" <<'PY' 2>/dev/null || echo unreachable
 import sys
 from playwright.sync_api import sync_playwright
 
-FETCH = """async () => { const r = await fetch('/api/auth/session', {credentials: 'include'}); const j = await r.json(); return !!(j && j.user) }"""
+# A challenge page or a non-JSON answer means the profile needs a human: that is "no", not a dead browser.
+FETCH = """async () => { try { const r = await fetch('/api/auth/session', {credentials: 'include', signal: AbortSignal.timeout(20000)}); const j = await r.json(); return !!(j && j.user) } catch (e) { return false } }"""
+answer = "unreachable"
 with sync_playwright() as p:
     browser = p.chromium.connect_over_cdp("http://127.0.0.1:" + sys.argv[1], timeout=8000)
     try:
@@ -275,12 +278,16 @@ with sync_playwright() as p:
             opened.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=20000)
             pages = [opened]
         try:
-            print("yes" if pages[0].evaluate(FETCH) else "no")
+            answer = "yes" if pages[0].evaluate(FETCH) else "no"
         finally:
             if opened is not None:
                 opened.close()
     finally:
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
+print(answer)
 PY
 }
 
@@ -480,7 +487,13 @@ for ws in "${workspaces[@]}"; do
 done
 tunnel_gate_ok || install_text "$tunnel_gate" "$(tunnel_gate_text)"
 while IFS= read -r f; do rm -f -- "$f"; changed=1; done < <(stale_list)
-[ "$changed" = 0 ] || sc daemon-reload
+if [ "$changed" != 0 ]; then
+  sc daemon-reload
+  # systemd keeps a running unit on its old definition: say which ones need a restart (a running browser keeps its windows, so this is never done silently)
+  restart_needed=()
+  for n in "${!rewritten[@]}"; do is_active "$n" && restart_needed+=("$n"); done
+  [ ${#restart_needed[@]} -eq 0 ] || echo "changed units run on their old definition until restarted: systemctl --user restart ${restart_needed[*]}"
+fi
 
 enable_unit() { # a rewritten unit is re-enabled: a changed [Install] section must drop the old wants link
   if [ -n "${rewritten[$1]:-}" ] && is_enabled "$1"; then sc reenable "$1.service" >/dev/null
