@@ -1,0 +1,32 @@
+# Ghostty на Ubuntu (2026-10-11). Основа — конфиг с Mac (оригинал:
+# ~/Documents/msi-desktop/backup-20261011/ghostty-config.orig-from-mac-20260924).
+# Откат: скопировать оригинал обратно или удалить этот файл (Ghostty со значениями по умолчанию).
+
+# Шрифт как на Mac. FiraCode Nerd Font Mono в Ubuntu нет — используется Fira Code
+# из пакета fonts-firacode; значки Nerd Font Ghostty рисует встроенным символьным шрифтом.
+font-family = Fira Code
+font-size = 13
+adjust-cell-height = 5%
+
+# Тема следует светлой/тёмной теме GNOME.
+theme = light:Adwaita,dark:Adwaita Dark
+
+window-save-state = never
+confirm-close-surface = false
+mouse-hide-while-typing = true
+
+# Копирование/вставка: Linux-стандарт Ctrl+Shift+C/V (по умолчанию, задано явно)
+# и Mac-подобные Cmd+C/Cmd+V (на Apple-клавиатуре Cmd = Super) — только внутри Ghostty.
+keybind = ctrl+shift+c=copy_to_clipboard
+keybind = ctrl+shift+v=paste_from_clipboard
+keybind = super+c=copy_to_clipboard
+keybind = super+v=paste_from_clipboard
+
+# Через ssh передавать TERM=xterm-256color (на удалённые хосты ничего не устанавливается).
+shell-integration-features = ssh-env
+
+# С Mac не перенесено:
+# - macos-titlebar-style = tabs — только macOS.
+# - keybind = global:cmd+grave_accent=toggle_quick_terminal — quick terminal на Linux требует
+#   wlr-layer-shell, которого нет в GNOME/Mutter. Замена: GNOME-сочетание, запускающее Ghostty.
+# Скроллбэк по-прежнему определяет tmux (~/.tmux.conf), как и на Mac.

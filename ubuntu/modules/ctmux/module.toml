@@ -1,0 +1,28 @@
+description = "ctmux (tmux sessions as workspaces) and its terminal entry: cloned, installed to ~/.local/bin, ctmux.desktop for xdg-terminal-exec"
+enabled = true
+order = 90   # after Homebrew (40: fzf fallback) and the shell steps; before autoheal (95)
+manual = "set [modules.ctmux] repo / dir if the clone fails; a checkout of another origin at `dir` is yours to move"
+
+# User level: the installer clones into $HOME and writes ~/.local/bin and ~/.local/share/applications,
+# so it never needs root (`root = false`); `preview` prints the exact steps. ctmux's own install.sh does
+# the dependency step (tmux, fzf: apt with sudo when it is usable, else Homebrew, else it prints the
+# `sudo apt install` line) and owns --check. rig installs the same tool too (tools.items.ctmux): both
+# end in the same install.sh, so whichever runs first wins and the other is a no-op.
+# Options ([modules.ctmux] in profile.toml / machine.toml): repo, dir.
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
+repo = "https://github.com/alex-mextner/ctmux-cli.git"
+
+[[coverage]]
+match = ["file:~/.config/ctmux*"]
+class = "tracked"
+reason = "ctmux: user tmux key overrides (~/.config/ctmux/tmux.conf); the module owns the directory"
+
+[[coverage]]
+match = ["file:~/.local/share/applications/ctmux.desktop", "file:~/.local/bin/ctmux"]
+class = "tracked"
+reason = "written by ctmux's install.sh (this module)"
