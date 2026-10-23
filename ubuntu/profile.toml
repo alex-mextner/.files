@@ -93,3 +93,19 @@ enabled = true
 # tmux sessions return after a reboot (A19): see modules/tmux-boot.
 [modules.tmux-boot]
 enabled = true
+
+
+# memguard (engine module: swap-drain, the macOS-like "pull swap back into RAM when there is room"). The engine's
+# memguard.toml ships the heavy-run gate and the heavy lock OFF for everyone; these three are the values the laptop ran
+# with (read from its installed /etc/memguard/memguard.toml, 23 Oct 2026) and they hold for every machine of this
+# profile because they name the owner's own tooling, not hardware:
+#   heavy_locks  /tmp/3d-cli-heavy.lock is the flock the 3d-cli heavy runs queue on; a drain never starts while it is held
+#   heavy_gate   "auto": ask the omp heavy-op memory gate how many test suites / review passes are live, skip the drain
+#   heavy_hook   the omp hook file that names that gate script (it exists on the PC: ~/.omp/agent/hooks/)
+# The numeric thresholds stay the engine's: they are percentages of RAM (headroom max(8 GB, 20 %), abort below
+# max(6 GB, 12 %)), so they already scale to the PC's 62 GB (12.4 GB headroom, 7.4 GB abort): `swap-drain --dry-run`
+# on the PC, rendered with these options, says "would drain /swap2.img 21190M" (swap used 21 GB of 32 GB, 41 GB available).
+[modules.memguard.swap]
+heavy_locks = ["/tmp/3d-cli-heavy.lock"]
+heavy_gate = "auto"
+heavy_hook = "~/.omp/agent/hooks/heavy-op-memory-gate.pre-bash.json"

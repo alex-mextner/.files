@@ -59,3 +59,58 @@ fstype = "apfs"
 read_only = true
 automount = true
 description = "MacBook backups (USB, APFS)"
+
+# ---- Memory-protection stack of this PC: 62 GB RAM (55 GB of it "user memory" to earlyoom), 32 GB swap file, AMD ----
+# Three layers, the earliest first: mem-sentinel steers the agent session that eats the RAM (25 % available), earlyoom
+# ends a process when both RAM and swap are nearly gone, memguard drains swap back into RAM while there is room.
+# The values come from the laptop `home` (48 GB RAM, 44 GB of it user memory, 16 GB swap, a hand-written /etc/default/earlyoom and the sentinel
+# installed by hand) and were re-judged for this machine; each block says what was taken and what was changed.
+
+# earlyoom. Laptop file: EARLYOOM_ARGS="-m 4 -s 10 -r 60 --prefer '(^|/)(pytest|python3?|node|bun|cc1plus|chrome|chromium|
+# WebKitWebProcess)$' --avoid '(^|/)(omp|gnome-shell|ptyxis|systemd|dbus-daemon|Xwayland|pipewire|sshd|tailscaled)$' -n".
+[modules.earlyoom]
+# TAKEN -m 4: SIGTERM at 4 % of user memory, SIGKILL at 2 %. On the laptop that was 1.7 GB; here (measured with earlyoom
+# 1.9 run as a user: 55 283 MiB user memory) it is 2.2 GB, SIGKILL at 1.1 GB. That is plenty for the kernel and gnome-shell
+# to keep running while earlyoom picks a victim, and a higher figure would only act earlier while tens of GB of page
+# cache are still reclaimable. earlyoom acts only when swap is low too, so swap is the first cushion under it.
+mem_percent = 4
+# TAKEN -s 10: 3.2 GB of the 32 GB swap file left. memguard keeps draining the swap file, so it is rarely near this.
+swap_percent = 10
+# TAKEN -r 60: one memory line per minute in the journal. The Ubuntu default is one per hour; the minute trail is what
+# showed how the 11 October thrash developed (the laptop's reason), and it costs 1 440 journal lines a day.
+report_interval = 60
+# CHANGED: `chrome|chromium` dropped. A match adds 300 to the oom score, so a 500 MB renderer of a listed process
+# outranks a 20 GB unlisted one. On the laptop chrome was the browser; on this PC every `chrome` is one of the two
+# dedicated ChatGPT-guardian browsers (chatgpt-guardian module), whose login must not be the first thing to go.
+# KEPT: pytest, python/python3, node, bun, cc1plus (test runners, agent tooling, compilers: they restart or rerun),
+# WebKitWebProcess.
+prefer = "(^|/)(pytest|python3?|node|bun|cc1plus|WebKitWebProcess)$"
+# TAKEN: omp (the agent sessions: 22 are running), gnome-shell, ptyxis, systemd, dbus-daemon, Xwayland, pipewire, sshd,
+# tailscaled (remote access to this PC). ADDED for this PC: gnome-session-b (gnome-session-binary, 15-character comm),
+# ghostty (the terminal), ctmux and tmux (`tmux: server` is the comm of ctmux's server, ps shows three), passwords-appd
+# (the passwords service), gnome-keyring-d (the secret store the guardian and passwords-app read), wireplumber. The
+# `|^tmux: (server|client)$` alternative exists because that comm has a space and a colon.
+# Validated with libc regcomp (the module refuses anything it rejects) and against the live process names with grep -E.
+avoid = "(^|/)(omp|gnome-shell|gnome-session-b|ptyxis|ghostty|ctmux|passwords-appd|gnome-keyring-d|systemd|dbus-daemon|Xwayland|pipewire|wireplumber|sshd|tailscaled)$|^tmux: (server|client)$"
+# CHANGED -n -> off: -n sends a D-Bus notification that only the `systembus-notify` helper turns into a desktop popup;
+# Ubuntu 26.04 has no such package (`apt-cache policy systembus-notify` is empty), so on this PC it would notify nobody.
+# mem-sentinel raises its own desktop notification before earlyoom ever acts.
+notify = false
+
+# mem-sentinel (agent-tools ops/mem-sentinel, installed by the profile module of the same name). Its defaults were
+# written for the laptop on 11 October ("25 % of 48 GB = 12 GB: at 13:35:30 we passed 12 GB free with 90 s left").
+# Most knobs are percentages or absolute rates and already fit 62 GB, so only two are set here; the others stay at the
+# sentinel's defaults on purpose:
+#   LOW_AVAIL_PCT 25    (gate for every steer) = 15.5 GB here vs 12 GB there: at the incident's 13 GB/min about the same
+#                       ~1 minute of warning, scaled with RAM. Kept.
+#   CRIT_AVAIL_PCT 10   (broadcast + desktop notification) = 6.2 GB, still above earlyoom's 2.2 GB. Kept.
+#   GROWTH_GB 4 / 30 s  (a test fan-out) is an absolute signature, independent of RAM. Kept.
+#   TOP_ABS_GB 8, TOP_SHARE_PCT 30, SWAPFREE_PCT 30, PSI_FULL_AVG10 20, cooldowns: absolute or relative, not RAM-bound. Kept.
+[modules.mem-sentinel.env]
+# CHANGED 6 -> 8 GB/min: the laptop's comment is "6 GB/min means the 48 GB box has < 5 min left"; the same remaining time
+# at 62 GB needs 8 GB/min, so a normal build that pulls 6 GB in a minute does not trip the fast-fall alarm here.
+FALL_GB_PER_MIN = 8
+# CHANGED 16 -> 24 GB: "no legitimate local agent workload needs 16 GB anon" held for the 48 GB laptop (a third of its RAM);
+# the same share of 62 GB is 20 GB, rounded up to 24 for the local 3D/vision jobs this PC runs. It counts only while the
+# machine is short of RAM, and a session here (largest omp process seen: 1.2 GB RSS) is nowhere near it.
+SESSION_MAX_GB = 24

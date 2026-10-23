@@ -1,0 +1,3 @@
+apt = [
+  "mosh",  # mobile shell for ssh from the phone / IDE. The laptop got `mosh-server` through Homebrew plus a /usr/local/bin symlink so sshd could find it; the apt package installs /usr/bin/mosh-server, no symlink needed
+]
