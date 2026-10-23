@@ -18,7 +18,7 @@ ubuntu/
   coverage.toml  coverage.d/*.toml   # [[coverage]] rules: what is tracked, excluded, secret or ticketed (see Coverage)
   settings/**/*.ini         # settings bundles: dconf keyfiles named by purpose (dev-keyboard.ini, laptop/power.ini), shared by all machines
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
-  packages.toml             # apt / snap / flatpak names
+  packages.toml             # apt / snap / flatpak / brew / uv / npm / bun / cargo names, each with a `# reason`
   units.toml                # systemd user units to enable (their files are leaves of files/.config/systemd/user)
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)

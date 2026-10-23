@@ -1,9 +1,11 @@
 # systemd USER units this PC turns on in addition to ../../units.toml (see its header for the rule). Their files are in
 # files/.config/systemd/user of this overlay: they came from the laptop with Linuxbrew paths, and the `90-pc.conf` and
 # `95-pc-bind.conf` drop-ins next to them are what makes them run here.
+# glances.service is linked but not listed: it binds 0.0.0.0:61208 with no authentication, and apply must not open that on a
+# fresh machine; it keeps running on this PC. Choose a loopback or tailnet bind, then enable it
+# (https://github.com/alex-mextner/.files/issues/58).
 
 enable = [
-  "glances.service",            # Glances web UI on :61208 (the unit binds all interfaces, as it did on the laptop); the glances[web] tool is in packages.toml (uv)
   "odroid-remote-log.service",  # streams the ODROID's kernel log and metrics to ~/odroid-logs over ssh (script files/.local/bin/odroid-remote-log; the ssh key is local, without it the unit only retries)
   "ha-host-actions.service",    # Home Assistant's desktop-action bridge, bound to the tailnet address by 95-pc-bind.conf (script files/.local/bin/ha-host-actions.py; its token file is local)
 ]
