@@ -1,0 +1,24 @@
+description = "This PC's speakers as a Music Assistant player: PortAudio, the sendspin client and its user service (unit shipped in the machine overlay)"
+enabled = false   # only machines/ubuntu-pc opts in: the unit file sendspin-ubuntu-pc.service lives in that overlay, another machine needs its own
+order = 140       # after rig (100) and the other profile modules
+requires = ["base-tools", "brew"]   # apt must have succeeded; uv comes from brew
+
+[source]
+kind = "builtin"
+
+# sendspin imports PortAudio through sounddevice: without libportaudio2 `sendspin audio-devices list` fails.
+[install]
+apt = ["libportaudio2"]
+
+[[post]]
+name = "sendspin-tool"
+description = "uv tool install sendspin (the Sendspin client; ~/.local/bin/sendspin)"
+run = ["/bin/sh", "-c", "PATH=\"/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:$PATH\"; UV_TOOL_BIN_DIR=\"$HOME/.local/bin\" uv tool install sendspin"]
+check = ["/bin/sh", "-c", "[ -x \"$HOME/.local/bin/sendspin\" ]"]   # the exact path the unit's ExecStart uses
+
+[[post]]
+name = "enable"
+description = "enable and start sendspin-ubuntu-pc.service (the unit file is in the ubuntu-pc machine overlay, machines/ubuntu-pc/files/.config/systemd/user/)"
+after = "sendspin-tool"
+run = ["systemctl", "--user", "enable", "--now", "sendspin-ubuntu-pc.service"]
+check = ["systemctl", "--user", "is-enabled", "sendspin-ubuntu-pc.service"]

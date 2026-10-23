@@ -1,0 +1,14 @@
+[Unit]
+Description=Sendspin player "Ubuntu PC" (this PC's speakers as a Music Assistant player)
+Documentation=https://github.com/Sendspin-Protocol/sendspin
+After=network-online.target pipewire.service pipewire-pulse.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sendspin daemon --name "Ubuntu PC" --url ws://odroidn2.tailbfe8ea.ts.net:8927/sendspin --audio-device pipewire --settings-dir %h/.config/sendspin-ubuntu-pc --disable-mpris
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

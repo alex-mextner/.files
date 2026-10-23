@@ -12,3 +12,8 @@ enabled = true
 # https://github.com/alex-mextner/firefox-passkey-qr/issues/17
 # Without ha_url the installer looks for Home Assistant itself.
 ha_url = "http://100.116.57.66:8123"
+
+# This PC's speakers as the Music Assistant player "Ubuntu PC" (profile module sendspin-player; replaces the retired
+# laptop's ma-local-audio). The service unit is in this overlay's files/.config/systemd/user/.
+[modules.sendspin-player]
+enabled = true
