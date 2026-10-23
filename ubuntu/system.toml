@@ -1,0 +1,13 @@
+# Root-level basics (applied through sudo at `ubuntu-tweak apply --commit`; each is one action and is satisfied
+# when the machine already matches). Read from the PC ubuntu-pc on 2026-10-23 with timedatectl, localectl and
+# /etc/default/keyboard; the laptop `home` reported the same values, so they are shared, not per machine.
+timezone = "Europe/Belgrade"   # `timedatectl show -p Timezone` on both machines
+locale = "en_US.UTF-8"         # LANG only (English UI); en_US and ru_RU are both generated on the PC
+
+# US + Russian layouts, the Scroll Lock LED shows the active layout (grp_led). The per-user half of this setting
+# (GNOME input sources) is in settings/keyboard.ini.
+[keyboard]
+model = "pc105"
+layout = "us,ru"
+variant = ","
+options = "grp_led:scroll"

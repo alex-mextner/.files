@@ -40,10 +40,14 @@ enabled = true
 [modules.allowlockedremotedesktop]
 enabled = true
 
-# Unattended self-heal: a user timer re-runs `ubuntu-tweak apply --commit --no-sudo` at login and daily
-# (never asks for root; the root remainder waits for an interactive `ubuntu-tweak apply --commit`).
-[modules.autoheal]
-enabled = true
+# autoheal (unattended self-heal) is enabled for every machine in ../../profile.toml.
+
+# apple-hid-battery stays off (its engine default): it livepatches the kernel to show the Bluetooth battery level of
+# Apple Magic Keyboard/Trackpad on kernels before 7.3. This PC runs 7.0 but its Magic Keyboard with Touch ID
+# (05ac:0321) is connected by USB cable and the PC has no Bluetooth adapter at all, so there is no battery to read
+# and a root-built unsigned kernel module would buy nothing.
+[modules.apple-hid-battery]
+enabled = false
 
 # The 1 TB USB disk from the MacBook: APFS container fcbf521d-..., one unencrypted volume "backups" (archives, a
 # 2026-10-02 MacBook backup, work checkouts). Engine module `disks`: apfs-fuse (read-only, built from a pinned commit),

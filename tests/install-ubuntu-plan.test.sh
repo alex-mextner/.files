@@ -21,6 +21,11 @@ printf '# machine zshrc\n' > "$home/.zshrc"
 before=$(cd "$home" && find . -path ./.files -prune -o -type f -print0 | sort -z | xargs -0 sha256sum)
 dirs_before=$(cd "$home" && find . -path ./.files -prune -o -print | sort)
 
+# no network anywhere in this file: every submodule probe answers "reachable" unless a test says otherwise (#43)
+always=$(mktemp)
+printf '#!/bin/sh\nexit 0\n' > "$always"
+chmod +x "$always"
+export INSTALL_UBUNTU_PROBE="$always"
 run() { HOME="$home" XDG_CONFIG_HOME="$home/.config" bash "$repo/install-ubuntu.sh" "$@" 2>&1; }
 
 plan=$(run --plan)
@@ -54,5 +59,19 @@ ln -s "$repo/.profile" "$home/.profile"
 check "a linked ~/.profile gets no block" grep -q "ok: .*/.profile is linked into ~/.files" <<< "$(run --plan)"
 
 check "--check exits 1 while something is pending" bash -c 'HOME="$1" XDG_CONFIG_HOME="$1/.config" bash "$2/install-ubuntu.sh" --check >/dev/null 2>&1; [ $? -eq 1 ]' _ "$home" "$repo"
+
+# a submodule whose repository this machine cannot read is a manual step naming its owner, never pending work:
+# no run can fix it, so it must not keep --check at "pending" forever (#43). The probe is a stub: no network here.
+reach=$(mktemp)
+trap 'rm -rf "$home" "$always" "$reach"' EXIT
+printf '#!/bin/sh\ncase "$1" in *a-x-*) exit 1 ;; esac\nexit 0\n' > "$reach"
+chmod +x "$reach"
+blocked=$(INSTALL_UBUNTU_PROBE="$reach" run --plan)
+check "an unreachable submodule is a manual step naming its owner" \
+  grep -q "manual: submodule vscode-configs: git@github.com:a-x-/vscode-configs.git is not reachable (owner: GitHub account a-x-" <<< "$blocked"
+check "an unreachable submodule is not offered as pending work" \
+  bash -c '! grep -q "initialise submodule vscode-configs" <<< "$1"' _ "$blocked"
+check "a reachable submodule is still offered for cloning" \
+  grep -q "pending: initialise submodule vscode-configs" <<< "$(run --plan)"
 
 exit $fail

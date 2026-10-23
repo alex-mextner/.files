@@ -128,11 +128,38 @@ gitm() {
   if $gh_https; then git -C "$files" -c url."https://github.com/".insteadOf=git@github.com: "$@"
   else git -C "$files" "$@"; fi
 }
+# submodule_url <path>: the url .gitmodules declares for the submodule at <path>
+submodule_url() {
+  local key sub_path name
+  while read -r key sub_path; do
+    [ "$sub_path" = "$1" ] || continue
+    name=${key#submodule.}; name=${name%.path}
+    git -C "$files" config -f .gitmodules --get "submodule.$name.url"
+    return 0
+  done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+}
+# remote_reachable <url>: can this machine read the repository? INSTALL_UBUNTU_PROBE (a command that gets the url)
+# replaces the network probe, for tests.
+remote_reachable() {
+  local opts=()
+  if [ -n "${INSTALL_UBUNTU_PROBE:-}" ]; then "$INSTALL_UBUNTU_PROBE" "$1"; return; fi
+  $gh_https && opts=(-c url."https://github.com/".insteadOf=git@github.com:)
+  GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$files" "${opts[@]}" ls-remote --exit-code "$1" HEAD >/dev/null 2>&1
+}
 while IFS= read -r line; do
   [ -n "$line" ] || continue
   flag=${line:0:1}
   read -r _ path _ <<< "${line:1}"
   if [ "$flag" = "-" ]; then
+    sm_url=$(submodule_url "$path")
+    if [ -n "$sm_url" ] && ! remote_reachable "$sm_url"; then
+      # an unreachable repository is a human step (an account this machine does not have), never pending work:
+      # no run of this script can fix it, so --check must not stay at "pending" forever. The probe cannot tell a
+      # missing account from a network outage; the message names both, and the next run re-probes.
+      sm_owner=${sm_url#*github.com[:/]}; sm_owner=${sm_owner%%/*}
+      manual "submodule $path: $sm_url is not reachable (owner: GitHub account $sm_owner, or the network is down): give this machine access (\`gh auth login\` as $sm_owner, or add an SSH key to that account), then re-run"
+      continue
+    fi
     todo "initialise submodule $path"
     applying || continue
     gitm submodule update --init --recursive -- "$path" >/dev/null 2>&1 \

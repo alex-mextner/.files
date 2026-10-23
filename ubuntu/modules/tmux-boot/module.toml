@@ -1,0 +1,34 @@
+description = "tmux sessions return after a reboot: a user unit starts the tmux server at boot so continuum restores the last snapshot (Linux counterpart of rig's launchd boot agent)"
+enabled = true
+order = 92   # after ctmux (90, which brings tmux and the clone); before autoheal (95)
+manual = "`sudo loginctl enable-linger $USER` once if linger is off (the unit then starts at login instead of at boot); tmux itself comes from packages.toml"
+
+# Why this module exists (audit row A19): rig's tmux block already wires tmux-resurrect + tmux-continuum
+# (save every 15 minutes, `@continuum-restore on`, the omp/cc/codex resume hooks), but rig's own "boot" agent is a
+# macOS launchd plist: on Linux nothing starts a tmux server at boot, so the sessions only came back whenever a
+# terminal happened to start tmux first, and nothing relaunched the harness panes while the PC sat at the login
+# screen. rig-cli's `tmux.boot.enabled` cannot be switched on here: `rig status` would then expect a launchd plist
+# that can never exist and the dotfiles-link module would report drift forever. Until rig grows a systemd boot
+# (https://git.hyperide.ai/ultrabricks/rig-cli/issues/755) this module is the Linux boot path.
+#
+# User level: writes $HOME and talks to the user's systemd, so it never runs as root. No options.
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
+
+# Failover (decided inside install.sh, not by an engine [[fallback]], which would also fire on an unrelated failure):
+# with no user systemd bus (ssh without a bus, a container) install writes an XDG autostart entry, and the server then
+# starts at graphical login instead of at boot. Once the bus is there the unit is the only start path.
+
+[[coverage]]
+match = ["unit:tmux-boot.service", "file:~/.local/bin/tmux-boot"]
+class = "tracked"
+reason = "written by the tmux-boot module"
+
+[[coverage]]
+match = ["file:~/.config/autostart/tmux-boot.desktop"]
+class = "tracked"
+reason = "the tmux-boot module's failover entry when there is no user systemd bus"

@@ -97,6 +97,14 @@ models:
 git_hooks:
   dispatcher:
     enabled: true
+# The Mac's global ignore (~/.config/git/ignore in the disk copy) also ignored Claude Code's per-checkout
+# settings.local.json in every repo; rig's two defaults are kept (MAC-DISK audit, git ignore row).
+gitignore:
+  enabled: true
+  entries:
+  - "**/.claude/worktrees/"
+  - ".metadata_never_index"
+  - "**/.claude/settings.local.json"
 mcp:
   enabled: true
 bun:

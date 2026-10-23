@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=tmux-boot
+Comment=Managed by ubuntu-tweaks (profile module tmux-boot): restore the tmux sessions at login
+Exec="@BIN@"
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
