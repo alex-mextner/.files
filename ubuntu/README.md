@@ -148,6 +148,46 @@ Shared keys in `settings/power.ini` (if any) are overridden key by key; keys abs
 overlay keep the shared value. The same applies to `files/` (same relative path wins) and
 to modules (`[modules.memguard] enabled = false` in a machine's `machine.toml`).
 
+## Manual steps
+
+What only a human can do. `ubuntu-tweak apply` never prompts, stores a secret or touches hardware; every
+step below is also reported as `needs manual` by the module that owns it, and `ubuntu-tweak status` keeps it
+Missing until it is done. After a step, run `ubuntu-tweak apply --commit` again.
+
+| Step | Module / owner | Exact command or action |
+|---|---|---|
+| root part of a fresh machine (apt packages, ssh server, polkit, Firefox policy, memguard, mounts) | engine (`apply --commit`) | `ubuntu-tweak apply --commit` from a normal terminal: it asks for the sudo password once and runs every root action. An agent shell with `no_new_privs` cannot, so it lists the root remainder and exits 6 |
+| iCloud sign-in (Apple ID password, trusted-device code, device passcode) | `passwords-app` | `passwords-app signin`, then `ubuntu-tweak status --only passwords-app` |
+| ChatGPT sign-in of the glide.vc account in its guardian browser (the profile of the other account is signed in) | `chatgpt-guardian` | `systemctl --user stop chatgpt-guardian-glide-browser`, then `~/.local/bin/chatgpt-guardian-chrome --user-data-dir=$HOME/.local/share/agent-tools/chatgpt-guardian/profiles/glide.vc https://chatgpt.com`, sign in as the glide.vc account, close the window, `systemctl --user start chatgpt-guardian-glide-browser` |
+| the guardian tunnel (ChatGPT to a local MCP) | not declared | needs a platform API key with Tunnels Read+Use; without it only the ChatGPT-to-local `pm chatgpt mcp` connector is missing. Store the key with `keychain set <name>`; the key is never in this repository |
+| private submodule `vscode-configs` (GitHub account a-x-) | `dotfiles-link` | `gh auth login` as a-x- (or add this machine's SSH key to that account), then `git -C ~/.files submodule update --init vscode-configs`. The installer reports it as `manual:` instead of pending work. Nothing is lost while it is skipped: the checkout is empty on the laptop and in the Mac disk copy |
+| the Bluetooth dongle of the ODROID and its HDMI cable | hardware (Home Assistant, Kodi) | re-plug the dongle, plug HDMI into the ODROID; then Home Assistant, Developer tools, States, filter `unavailable` shows no leftovers |
+| GitHub merge policy of this repository, and the settings GitHub does not offer on this plan | rig (`rig.yaml` `github:`) | merge policy and Actions: `cd ~/.files && rig apply commit` with the admin token of `gh` (the user has admin on this repository). Rulesets, secret scanning with push protection and CodeQL default setup are plan-gated for a private repository on the free plan (`rig.yaml` explains): they converge by themselves with `rig apply commit` once the repository is public or the plan is upgraded |
+| tg-cli bot credentials, AMO signing key, Home Assistant token | `tg-cli`, `firefox`, `firefox-passkey-qr` | exact commands are in each module's `manual` text and in the engine spec, *Manual steps*: `tg auth login`, `secret-tool store --label='AMO JWT issuer' application ubuntu-tweaks purpose amo-jwt-issuer` (and `amo-jwt-secret`), `secret-tool store --label='Home Assistant token' application ubuntu-tweaks purpose ha-token` |
+
+Browser logins (Firefox, Chrome profiles of this user, 1Password) are state, not configuration: they are
+never in this repository; sign in once on a new machine.
+
+## Not applicable on Linux
+
+Things the macOS machine did that have no meaning here. Each is declared, not forgotten: where a tool owns the
+concept, that tool already reports it as unsupported off macOS (`rig status`, `rig activate` say so).
+
+| Item | Why it does not apply | Linux equivalent |
+|---|---|---|
+| rig `tg_ctl` LaunchAgent (`ai.hyperide.tg-ctl`) | launchd; `rig status`: "unsupported (macOS-only; no-op off darwin)" | profile module `tg-cli`: the systemd user unit `agenttools-tg-ctl-tg-ctl.service` |
+| rig `tgctl_reaper` (`com.hyperide.tgctl-omp-acp-reaper`) | launchd StartInterval sweep of orphan omp/ACP processes; rig: macOS-only | systemd stops the whole cgroup of a unit on restart, so the daemon leaves no orphans of its own |
+| rig `tcc_watch` (`ai.hyperide.tcc-watch`) | watches macOS TCC permission dialogs; rig: macOS-only | none needed: Linux has no TCC |
+| rig `spotlight` sweep (`ai.hyperide.spotlight-exclude`, `.metadata_never_index`) | keeps the Spotlight indexer out of dependency directories | none needed; the ignore entry stays in the global git ignore, harmlessly |
+| rig `tmux.boot` / `tmux.autosave` (`ai.hyperide.tmux-boot`, `ai.hyperide.tmux-autosave`, `com.ultra.ctmux-ensure`) | launchd agents; switching them on would make `rig status` expect a plist that cannot exist here | profile module `tmux-boot` starts the server at boot; tmux-continuum saves every 15 minutes |
+| `com.ultra.container-gc` | its script (`container-gc`, in the Mac copy of `.files/bin`) stops the builder of Apple's `container` CLI and prunes its storage | none: Docker (`docker.io`) is what this PC runs, and no job for it existed on the Mac |
+| `com.alex.tuya-ir-reminder` | a one-shot reminder (`tuya-ir-reminder.sh`) that deletes its own plist after it fired | none |
+| `com.alex.rustdesk-autostart`, `app.openremotecommander.*`, `com.alex.openremotecommander.*` | macOS remote-control apps | `ssh-server` module, mosh, GNOME Remote Desktop (RDP is on in this PC's dconf) and GSConnect |
+| `com.openssh.ssh-agent`, `com.apple.*`, `com.google.*` updater agents | the macOS system and Google's macOS updater | the GNOME session's `gcr-ssh-agent`; apt keeps Chrome current |
+| AeroSpace (`~/.aerospace.toml`) | a tiling window manager for macOS; the file in the Mac copy is AeroSpace's unmodified sample config | GNOME's tiling-assistant keys in `settings/` and the Ptyxis/ctmux key bindings |
+| macOS Dock, Finder and system preference plists (`com.apple.*.plist`) | not on the Mac disk at all (only LaunchAgents are there) | GNOME settings bundles (`settings/`), `hyperdock` |
+| `org.virtualbox.vboxwebsrv`, `homebrew.mxcl.redis` (present on the Mac, not loaded at backup time) | Mac-side services nothing on Linux depends on | none; `redis-server` is not installed on this PC |
+
 ## Secrets
 
 Never store secrets here: no tokens, passwords, private keys, keyring data, online-account

@@ -1,7 +1,7 @@
 description = "Applies the dotfiles repository to this home (links, merged shell and git config, zplug, vim-plug, submodules, the rig global config): ~/.files/install-ubuntu.sh"
 enabled = true
 order = 111              # right after the `dotfiles` module (110) that checks the repository out
-manual = "read the `manual:` lines of `~/.files/install-ubuntu.sh --plan`: the private vscode-configs submodule needs access to its repository, bun must be installed; then re-run"
+manual = "read the `manual:` lines of `~/.files/install-ubuntu.sh --plan`. vscode-configs: the private repository a-x-/vscode-configs belongs to the GitHub account a-x- (this machine's gh login is another account): run `gh auth login` as a-x- or add an SSH key of this machine to it, then `git -C ~/.files submodule update --init vscode-configs`; its checkout is an empty directory on the laptop and in the Mac disk copy, and the laptop has no VS Code settings.json, keybindings or snippets, so nothing is lost while it is skipped. bun must be installed (`brew install oven-sh/bun/bun`). Then re-run apply"
 
 # User level: the installer writes only into $HOME and ~/.files, never as root. Exit codes follow the
 # system-module protocol: install-ubuntu.sh answers 1 for pending work under --check, which is drift (3).

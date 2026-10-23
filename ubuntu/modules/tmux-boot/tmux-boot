@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# tmux-boot: bring the tmux server up with the saved sessions after a reboot (the Linux counterpart of rig's
+# macOS launchd tmux-boot agent). Started by tmux-boot.service at boot (linger) or by the autostart entry at login.
+#
+# `tmux new-session -d` is what loads ~/.tmux.conf, and with it tmux-resurrect + tmux-continuum: continuum's
+# `@continuum-restore on` then restores the last snapshot into the new server (a bare `tmux start-server` loads no
+# config, so nothing would be restored). continuum only restores when the server is very young; under a boot load
+# the config can load slower than that window. So the script compares the windows of the last snapshot with the live
+# ones: when continuum did not bring them back within TMUX_BOOT_WAIT seconds it runs tmux-resurrect's own restore
+# script once. A snapshot that holds at most the one window of the fresh session needs no restore, and a server that
+# already runs is never touched: no extra session, no second restore.
+#
+#   TMUX_BOOT_SESSION  the session that carries the server up (default main: rig's anti-sprawl session)
+#   TMUX_BOOT_WAIT     seconds to wait for continuum before restoring by hand (default 20)
+set -u
+
+session=${TMUX_BOOT_SESSION:-main}
+wait_s=${TMUX_BOOT_WAIT:-20}
+case $wait_s in
+  ''|*[!0-9]*) echo "tmux-boot: TMUX_BOOT_WAIT must be a whole number of seconds, got '$wait_s'" >&2; exit 2 ;;
+esac
+
+# a systemd user manager hands out a minimal PATH (the system dirs only): add the user's tool dirs (rig's resume
+# hooks, bun, Linuxbrew) after it, so a system tmux still wins
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+
+windows() { tmux list-windows -a 2>/dev/null | wc -l; }
+
+# same directory rule as tmux-resurrect's helpers.sh (@resurrect-dir wins, then ~/.tmux/resurrect, then XDG)
+resurrect_dir() {
+  local dir
+  dir=$(tmux show-option -gqv @resurrect-dir 2>/dev/null || true)
+  if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+  fi
+  dir=${dir//\$HOME/"$HOME"}
+  printf '%s\n' "${dir/#\~/"$HOME"}"
+}
+
+command -v tmux >/dev/null 2>&1 || { echo "tmux-boot: tmux is not installed" >&2; exit 1; }
+
+if tmux list-sessions >/dev/null 2>&1; then
+  echo "tmux-boot: a tmux server is already running, nothing to do"
+  exit 0
+fi
+
+tmux new-session -d -s "$session" || { echo "tmux-boot: tmux new-session failed" >&2; exit 1; }
+
+dir=$(resurrect_dir)
+if [ ! -e "$dir/last" ]; then
+  echo "tmux-boot: no saved snapshot ($dir/last), the server runs with the one fresh session"
+  exit 0
+fi
+want=$(grep -c '^window[[:space:]]' "$dir/last" 2>/dev/null || true)
+if [ "${want:-0}" -le 1 ]; then
+  echo "tmux-boot: the snapshot holds at most one window, nothing to restore beyond the fresh session"
+  exit 0
+fi
+
+elapsed=0
+while [ "$elapsed" -lt "$wait_s" ]; do
+  if [ "$(windows)" -ge "$want" ]; then echo "tmux-boot: continuum restored the sessions"; exit 0; fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+
+# continuum may have finished during the last second of the wait: never restore twice
+if [ "$(windows)" -ge "$want" ]; then echo "tmux-boot: continuum restored the sessions"; exit 0; fi
+
+restore=$(tmux show-option -gqv @resurrect-restore-script-path 2>/dev/null || true)
+if [ -z "$restore" ] || [ ! -x "$restore" ]; then
+  echo "tmux-boot: tmux-resurrect is not loaded (no restore script), the server runs with the one fresh session" >&2
+  exit 1
+fi
+echo "tmux-boot: continuum did not restore the $want windows within ${wait_s}s, restoring $(readlink -f "$dir/last")"
+# resurrect's restore script drives tmux relative to the server it runs in: run-shell, not a direct call
+tmux run-shell "$restore" || { echo "tmux-boot: tmux-resurrect restore failed" >&2; exit 1; }

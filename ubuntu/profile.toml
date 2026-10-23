@@ -18,10 +18,78 @@ description = "alex personal Ubuntu settings"
 
 # rig (skills, agent hooks for omp/claude/codex, tmux, bun, tools, sysmon): off in the engine, on for every
 # machine of this profile. The global rig config comes from ../rig/config.yaml through the dotfiles-link
-# module, so the rig profile repo is not used. There is no `rig activate` before rig-cli#746 lands: the
-# dotfiles-link module runs `rig apply commit` after the installer instead.
+# module (the single source of truth), so the rig profile repo is not used: `activate = false` keeps rig from
+# adding a second one. rig-cli#746 (`rig activate`) is merged; `rig activate` here would only write
+# `tools.items.ctmux`, which the ctmux module already provides, and report macOS-only areas (tg_ctl, tcc_watch,
+# tgctl_reaper, spotlight) as "cannot activate", so there is nothing to gain from switching it on.
+# The dotfiles-link module runs `rig apply commit` after the installer instead.
 [modules.rig]
 enabled = true
 repo = "https://git.hyperide.ai/ultrabricks/rig-cli"
 profile_sync = false
 activate = false
+
+# Module decisions (audit row D1, AUDIT.md). Most of these are also the engine default; they are written out so
+# that a later change of an engine default cannot silently switch off something this user relies on, and so that
+# every module has its reason on record. `ubuntu-tweak machine` shows where each value comes from.
+
+# The user's own dotfiles repository is this profile's source: every machine clones it first (request 14).
+[modules.dotfiles]
+enabled = true
+[modules.dotfiles-link]
+enabled = true   # links, shell blocks, zplug, vim-plug, submodules and `rig apply commit` of the same repository
+
+# Init pipeline (requests 9 and 20): zsh first, gh + git identity, brew for Linux, curl/zip/7zip, clipboard tools
+# (gh and tmux copy through them). Laptop and PC both used all of them.
+[modules.base-tools]
+enabled = true
+[modules.zsh]
+enabled = true
+[modules.shell-rc]
+enabled = true
+[modules.git-gh]
+enabled = true
+[modules.brew]
+enabled = true   # the laptop's Linuxbrew held 205 formulae (laptop brew list); here brew provides vale and fzf, and the module's tools step provides uv and bun
+[modules.clipboard]
+enabled = true
+
+# Passwords and Firefox (request A9): iCloud passwords fill into Firefox, which logs itself in. The polkit and
+# policy steps are the root part, the rest runs as the user. Sign-in itself is manual (README, "Manual steps").
+[modules.passwords-app]
+enabled = true
+[modules.passwords-app-polkit]
+enabled = true
+[modules.firefox]
+enabled = true
+[modules.firefox-policy]
+enabled = true
+[modules.firefox-autologin]
+enabled = true
+
+# Remote access and safety on every machine (request A7 and the memory-starved laptop's lessons): ssh server for
+# the phone/mosh/IDE, memguard against runaway memory. The PC has 60 GB RAM, so memguard's thresholds are the
+# PC overlay's business (machines/ubuntu-pc/machine.toml), not a reason to switch it off.
+[modules.ssh-server]
+enabled = true
+[modules.memguard]
+enabled = true
+
+# Desktop the user asked for: the macOS-style dock (A8), Space preview in Files, English-in-overview.
+[modules.hyperdock]
+enabled = true
+[modules.quicklook]
+enabled = true
+[modules.english-in-overview]
+enabled = true
+
+# Unattended self-heal (user directive, request 21: "failover, everything must reproduce"): a user timer re-runs
+# `ubuntu-tweak apply --commit --no-sudo` at login and daily. It never asks for root and never prompts, so the
+# root remainder still waits for an interactive `ubuntu-tweak apply --commit`. Every machine of this profile
+# wants it (it was only in the PC overlay before).
+[modules.autoheal]
+enabled = true
+
+# tmux sessions return after a reboot (A19): see modules/tmux-boot.
+[modules.tmux-boot]
+enabled = true

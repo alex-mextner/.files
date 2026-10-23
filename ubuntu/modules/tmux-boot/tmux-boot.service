@@ -1,0 +1,14 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): tmux comes back after a reboot with the saved sessions.
+[Unit]
+Description=tmux server with the saved sessions restored (tmux-resurrect / tmux-continuum)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/tmux-boot
+# the tmux server this starts is not ours to end: stopping or restarting the unit must not close the sessions
+KillMode=process
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
