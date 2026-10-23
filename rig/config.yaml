@@ -82,6 +82,12 @@ tools:
       repo: ~/xp/keychain-cli
     router:
       repo: ~/xp/router-cli
+    # ctmux (my wrapper over cmux with better tmux support) is first-class in rig (rig-cli#746, rig main after
+    # 0.67.0): `{}` is enough. rig clones alex-mextner/ctmux-cli to ~/xp/ctmux-cli, installs tmux + fzf with apt
+    # where apt-get exists, and runs the checkout's install.sh, which on macOS gets them from Homebrew itself.
+    # The ubuntu-tweak `ctmux` module uses the same checkout path and the same idempotent install.sh, so
+    # whichever runs first installs it and the other reports 0 changed.
+    ctmux: {}
 ci:
   items:
     ship:
