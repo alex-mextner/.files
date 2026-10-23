@@ -37,6 +37,7 @@
 #   glide_port  DevTools port of the glide.vc browser     (default 9223)
 #   xvfb        absolute path of Xvfb    (default: /usr/bin/Xvfb, else the chatgpt-native-ha gui-runtime copy)
 #   chats_home, chats_glide   lists of https://chatgpt.com/... chat URLs to enrol (default none)
+#   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); only `relogin` reads it
 set -euo pipefail
 
 usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
@@ -64,7 +65,7 @@ import json, os, re, shlex, sys
 
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
-         "chats_home": [], "chats_glide": []}
+         "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc"}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -87,6 +88,9 @@ if int(opt["home_port"]) == int(opt["glide_port"]):
 for key in ("repo", "dir", "package", "chrome", "xvfb"):
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
+# read by `relogin`, not by this script: accepted here so that one option set serves both
+if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["glide_email_domain"]):
+    fail("glide_email_domain must be a domain name such as glide.vc")
 if opt["repo"].startswith("-"):
     fail("repo must not start with '-': %s" % opt["repo"])
 for key in ("chats_home", "chats_glide"):
@@ -546,5 +550,5 @@ if [ ${#unreachable[@]} -gt 0 ]; then
   exit 1
 fi
 if [ ${#signed_out[@]} -gt 0 ]; then
-  manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} (home = the browser window on this desktop, DevTools port $home_port; glide.vc = the private display :111, port $glide_port: stop chatgpt-guardian-glide-browser, open the same profile dir ~/.local/share/agent-tools/chatgpt-guardian/profiles/glide.vc in a normal Chrome window once, sign in, close it, start the unit); then run apply again"
+  manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} (home = the browser window on this desktop, DevTools port $home_port; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
 fi

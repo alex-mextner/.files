@@ -5,7 +5,7 @@ manual = "log in to ChatGPT once in each guardian browser profile (home account 
 
 # User level: writes $HOME and talks to the user's systemd, so it never runs as root. Options
 # ([modules.chatgpt-guardian] in profile.toml / machine.toml): repo, dir, package, chrome, home_port, glide_port,
-# xvfb, chats_home, chats_glide (see install.sh).
+# xvfb, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin).
 #
 # Personal module: the two accounts (workspaces `home` and `glide.vc`), their control ports 8790/8791 and the private
 # display :111 are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
@@ -34,3 +34,19 @@ reason = "the guardian venv with the CLI links (chatgpt-guardian, pm), the Chrom
 match = ["file:~/.config/agent-tools"]
 class = "tracked"
 reason = "chatgpt-guardian/<workspace>.json are written by this module (the units' ConditionPathExists); env is written by rig (ship_delegator: AGENT_TOOLS_ROOT); the rest (MEMORY.md, overrides.log, ship-audit.jsonl, agent-browser-reaper.conf, a copy of agent-tools' example) is written by the agent-tools tools themselves"
+
+# The one human step of the glide.vc browser: its Chrome profile lives on the private display, so the owner signs in
+# once in a visible window opened on the same profile. `./relogin` (see its header) stops the glide units, opens the
+# window, waits until it is closed, starts the units again and verifies them. `check` asks the running browser which
+# account is signed in (the email domain `glide_email_domain`, default glide.vc), and falls back to the marker file
+# that `run` writes after a verified relogin. The `home` account is not part of it: its browser is a window on this desktop.
+[[finish]]
+id = "glide-chatgpt-login"
+title = "Sign in to ChatGPT with the glide.vc account"
+title_ru = "Войти в ChatGPT аккаунтом glide.vc"
+why = "the glide.vc guardian browser is signed in to the wrong ChatGPT account; its profile lives on a hidden display, so only you can type the password in a visible window"
+why_ru = "браузер стража glide.vc залогинен не в тот аккаунт ChatGPT; его профиль живёт на скрытом дисплее, поэтому пароль можешь ввести только ты, в видимом окне"
+action = "A Chrome window opens on the glide.vc profile: sign in to ChatGPT with the glide.vc account, then close the window; the guardian units are restarted and checked by themselves"
+action_ru = "Откроется окно Chrome с профилем glide.vc: войди в ChatGPT аккаунтом glide.vc и закрой окно; юниты стража перезапустятся и проверятся сами"
+check = ["./relogin", "check"]
+run = ["./relogin", "run"]
