@@ -228,7 +228,7 @@ export GOPATH=$HOME/go
 export PATH=/Users/ultra/.bun/bin:$PATH:$GOPATH/bin
 #dart
 
-eval $(thefuck --alias)
+command -v thefuck >/dev/null 2>&1 && eval $(thefuck --alias)
 
 if [[ $RANDOM > 8191 ]]; then
   echo

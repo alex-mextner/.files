@@ -69,4 +69,4 @@ if [ -n "${BASH_VERSION:-}" ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc";
 
 # Machine-local settings (not in this repository: ubuntu-tweaks links ~/.profile.local from the profile's
 # machines/<host>/files/, or write it by hand)
-[ -f "$HOME/.profile.local" ] && . "$HOME/.profile.local"
+if [ -f "$HOME/.profile.local" ]; then . "$HOME/.profile.local"; fi
