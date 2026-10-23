@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# omp-steer — send a note into a live omp TUI session from outside (via tg-ctl omp-live).
+#   omp-steer list                      # live sessions with a bridge (pid, cwd, busy)
+#   omp-steer <pid|cwd-substring|all> 'text'
+# Delivery: busy session → steer (like typing into the TUI), idle → aside (starts a turn).
+# Sessions started before the bridge was installed (2026-10-08 01:44) have no endpoint
+# until they are stopped and resumed with `omp -r`.
+set -euo pipefail
+case "${1:-}" in
+  ""|-h|--help) sed -n 2,7p "$0"; exit 0 ;;
+esac
+target=$1; shift
+text=${*:-}
+[ "$target" = list ] || [ -n "$text" ] || { echo "omp-steer: text required" >&2; exit 2; }
+OMP_LIVE_STATUS=$(timeout 20 tg-ctl omp-live status --json) python3 - "$target" "$text" <<'PY'
+import json, os, subprocess, sys, time
+target, text = sys.argv[1], sys.argv[2]
+hosts = json.loads(os.environ["OMP_LIVE_STATUS"] or "[]")
+if target == "list":
+    for h in hosts:
+        print(f'{h["pid"]:>8}  {"busy" if h["busy"] else "idle":4}  {h["cwd"]}  {h.get("title") or ""}')
+    sys.exit(0)
+sel = [h for h in hosts if target == "all" or str(h["pid"]) == target or target in h["cwd"]]
+if not sel:
+    sys.exit(f"omp-steer: no live session matches {target!r} (see: omp-steer list)")
+for h in sel:
+    rid = f"omp-steer-{int(time.time() * 1000)}-{h['pid']}"
+    r = subprocess.run(
+        ["tg-ctl", "omp-live", "send", str(h["pid"]), "--request-id", rid, "--session", h["sessionId"], text],
+        capture_output=True, text=True, timeout=30,
+    )
+    print(f'{h["pid"]} {h["cwd"]}: {r.stdout.strip() or r.stderr.strip()}')
+PY

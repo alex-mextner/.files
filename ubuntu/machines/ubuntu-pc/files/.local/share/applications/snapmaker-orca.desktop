@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Snapmaker Orca
+Comment=3D slicer
+Exec=/home/ultra/Applications/Snapmaker_Orca.AppImage %F
+Icon=snapmaker-orca
+Terminal=false
+Type=Application
+Categories=Graphics;3DGraphics;Engineering;
+MimeType=model/stl;model/3mf;application/vnd.ms-3mfdocument;application/x-amf;
+StartupWMClass=snapmaker-orca

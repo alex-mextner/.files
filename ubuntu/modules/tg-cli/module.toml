@@ -12,3 +12,14 @@ root = false
 install = "install.sh"
 check = "install.sh --check"
 preview = "install.sh --plan"
+
+# What install.sh creates (see the fact list at the top of install.sh).
+[[coverage]]
+match = ["file:~/.local/share/tg-cli", "file:~/.local/bin/tg", "file:~/.local/bin/tg-ctl", "file:~/.local/bin/tg-call", "file:~/.local/bin/tg-mtproto", "file:~/.local/bin/call-cli"]
+class = "tracked"
+reason = "the tg-cli checkout and its links: install.sh links tg and tg-ctl; tg-call, tg-mtproto and call-cli are links into the same checkout made by tg-cli's own scripts"
+
+[[coverage]]
+match = ["file:~/.config/tg-cli"]
+class = "tracked"
+reason = "install.sh sets control.enabled: false in config.yaml and keeps every other key; .env (TG_BOT_TOKEN, TG_CHAT_ID: restore with tg auth login or the module's manual step), the tg-ctl.* state files and the .pre-move backups are runtime state of the daemon"

@@ -109,3 +109,44 @@ enabled = true
 heavy_locks = ["/tmp/3d-cli-heavy.lock"]
 heavy_gate = "auto"
 heavy_hook = "~/.omp/agent/hooks/heavy-op-memory-gate.pre-bash.json"
+
+# Files adopted into files/ (and machines/<host>/files/): a hand-written, credential-free config the user owns.
+# `capture` re-reads these (a file the app rewrote shows as `differs`) and scans them for secrets again. In files/
+# but NOT listed on purpose: guardian-connect, tg-remote-test, ha-host-actions.py, odroid-remote-log, omp. The secret
+# scan reads a docker-bridge address, a tailnet host name, an "sk-admin" string compare, a base64-looking URL and a
+# cgroup path as findings; each file was read by hand and holds no credential, but `capture` would refuse its whole
+# commit with them listed.
+[capture]
+include_files = [
+  ".config/htop/htoprc",
+  ".config/task-cli/config.yaml",
+  ".config/hsw-editor/config.json",
+  ".config/crypt-docs/deny-list.txt",
+  ".config/tasks-backup/age.pub",
+  ".config/user-dirs.dirs",
+  ".config/git/config",
+  ".config/git/attributes",
+  ".config/xdg-desktop-portal/portals.conf",
+  ".config/ralphex/agents/*.txt",
+  ".config/ralphex/prompts/*.txt",
+  ".config/ralphex/scripts/*.sh",
+  ".local/bin/cf-mextner",
+  ".local/bin/fj-login",
+  ".local/bin/hsw-review",
+  ".local/bin/omp-steer",
+  ".cache/oh-my-posh/themes/jandedobbeleer.omp.json",
+  ".local/bin/who-ran",
+  ".local/bin/media-inhibit.sh",
+  ".local/bin/tailnet-bind-exec",
+]
+machine_files = [
+  ".config/monitors.xml",
+  ".config/gtk-3.0/bookmarks",
+  ".config/mimeapps.list",
+  ".local/bin/ha-mdns-publish.py",
+  ".config/environment.d/50-omp.conf",
+  ".bashrc",
+  ".zshrc",
+  ".local/share/applications/hsw-review.desktop",
+  ".local/share/applications/snapmaker-orca.desktop",
+]

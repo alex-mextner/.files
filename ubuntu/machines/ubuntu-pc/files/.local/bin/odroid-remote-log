@@ -1,0 +1,27 @@
+#!/bin/bash
+# Runs on MSI (systemd --user). Streams the ODROID kernel log (all levels),
+# userspace warnings and health metrics into ~/odroid-logs/odroid-YYYY-MM-DD.log,
+# each line prefixed with MSI time. If the ODROID hangs, this file keeps the
+# last seconds before it, and "=== LINK DOWN" marks when it vanished (ssh
+# keepalive notices within ~15 s). systemd restarts this after every disconnect.
+# Line prefixes: K kernel (dmesg), J journal warning+, M metrics line.
+set -u
+HOST=root@odroidn2.tailbfe8ea.ts.net
+OUT=$HOME/odroid-logs
+mkdir -p "$OUT"
+find "$OUT" -name 'odroid-*.log' -mtime +30 -delete
+
+stamp() {
+	local line
+	while IFS= read -r line; do
+		printf '%(%F %T)T %s\n' -1 "$line" >> "$OUT/odroid-$(printf '%(%F)T' -1).log"
+	done
+}
+
+echo "=== connecting $HOST" | stamp
+ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$HOST" '
+	dmesg --follow-new --time-format iso | sed -u "s/^/K /" &
+	journalctl -f -n0 -p warning -o short-iso _TRANSPORT=syslog _TRANSPORT=journal _TRANSPORT=stdout | sed -u "s/^/J /" &
+	tail -n0 -F /var/log/odroid-health/metrics.log 2>/dev/null | sed -u "s/^/M /" &
+	wait' 2>&1 | stamp
+echo "=== LINK DOWN: ssh exited ${PIPESTATUS[0]}" | stamp
