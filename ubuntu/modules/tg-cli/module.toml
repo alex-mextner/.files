@@ -1,0 +1,14 @@
+description = "tg-cli: checkout in ~/.local/share/tg-cli, tg/tg-ctl linked into ~/.local/bin, config control.enabled=false, ONE systemd user unit (agenttools-tg-ctl-tg-ctl.service) owning the tg-ctl bot daemon, enabled and running, with the login shell's PATH pinned"
+enabled = true
+order = 120   # after brew (bun) and rig; the daemon needs bun and tmux on PATH
+manual = "git clone needs your git credentials for git.hyperide.ai (fj auth login); the bot credentials go to ~/.config/tg-cli/.env (TG_BOT_TOKEN, TG_CHAT_ID: migrate them or run `tg auth login`); `sudo loginctl enable-linger $USER` once if linger is off; then run apply again"
+
+# User level: the installer writes $HOME and talks to the user's systemd, so it never runs as root.
+# Options ([modules.tg-cli] in profile.toml / machine.toml): repo, dir (see install.sh). Both matter for the FIRST
+# install only: a unit that already runs another checkout is reported as drift, not rewritten.
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
