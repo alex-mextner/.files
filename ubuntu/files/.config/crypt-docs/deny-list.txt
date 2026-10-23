@@ -1,0 +1,9 @@
+# Case-insensitive substrings that must never appear in the published guides
+# (text, PDFs, DOCX, OCR of screenshots). One per line; # starts a comment.
+# This file is NOT served: Vercel only uploads public/ (see .vercelignore).
+bestintegro
+bestinttest
+hyperide
+alex@
+sergey@
+alex-mextner

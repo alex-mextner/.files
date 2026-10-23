@@ -1,0 +1,5 @@
+#!/bin/sh
+# cf against zone mextner.com with the non-expiring scoped API token kept in keychain (no OAuth login needed).
+# Token: DNS Write + Zone Read on zone mextner.com only. Account id is not a secret.
+exec keychain exec --env CLOUDFLARE_API_TOKEN=agent/cloudflare-mextner-dns -- \
+  env CLOUDFLARE_ACCOUNT_ID=535199eee5a421a25d445e3445394522 cf "$@"

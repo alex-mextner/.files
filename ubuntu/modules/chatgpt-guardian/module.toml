@@ -23,3 +23,14 @@ preview = "install.sh --plan"
 # The glide.vc browser runs on a private X display (Xvfb); mcookie and xauth come with util-linux / xauth.
 [deps]
 apt = ["xvfb", "xauth"]
+
+# What install.sh creates (facts 2, 3, 4 and the dependency files of the units).
+[[coverage]]
+match = ["file:~/.local/bin/chatgpt-guardian", "file:~/.local/bin/chatgpt-guardian-chrome", "file:~/.local/bin/pm", "file:~/.local/share/agent-tools"]
+class = "tracked"
+reason = "the guardian venv with the CLI links (chatgpt-guardian, pm), the Chrome wrapper, and the two dedicated browser profiles under ~/.local/share/agent-tools/chatgpt-guardian; the ChatGPT login inside each profile is a manual step of this module (see `manual`)"
+
+[[coverage]]
+match = ["file:~/.config/agent-tools"]
+class = "tracked"
+reason = "chatgpt-guardian/<workspace>.json are written by this module (the units' ConditionPathExists); env is written by rig (ship_delegator: AGENT_TOOLS_ROOT); the rest (MEMORY.md, overrides.log, ship-audit.jsonl, agent-browser-reaper.conf, a copy of agent-tools' example) is written by the agent-tools tools themselves"

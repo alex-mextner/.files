@@ -1,0 +1,15 @@
+*.ts merge=mergiraf
+*.tsx merge=mergiraf
+*.mts merge=mergiraf
+*.cts merge=mergiraf
+*.js merge=mergiraf
+*.jsx merge=mergiraf
+*.mjs merge=mergiraf
+*.cjs merge=mergiraf
+*.json merge=mergiraf
+*.py merge=mergiraf
+*.rs merge=mergiraf
+*.go merge=mergiraf
+*.yml merge=mergiraf
+*.yaml merge=mergiraf
+*.toml merge=mergiraf

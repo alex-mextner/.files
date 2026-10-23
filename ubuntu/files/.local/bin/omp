@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# omp launcher: start every omp session in its own transient cgroup
+# (user.slice/user-1000.slice/user@1000.service/omp.slice/omp-<N>.scope).
+#
+# Why: on 2026-10-11 13:34 three concurrent `review diff` runs plus mypy/pytest/
+# bun test ate 26 GB in two minutes. All omp sessions lived in ONE cgroup
+# (app.slice/ptyxis-spawn-*.scope), so systemd-oomd and any MemoryMax could only
+# have killed the whole desktop at once -- so nothing killed anything, and the box
+# thrashed for 18 minutes. One scope per session gives oomd a single hog to shoot
+# and gives each session a hard ceiling (MemoryMax) and a throttle (MemoryHigh)
+# that cannot drag the other sessions down with it.
+#
+# The real binary lives in ~/.local/lib/omp/omp; `omp update` (and the install
+# script) write to $PI_INSTALL_DIR, which is pointed there so an update never
+# overwrites this wrapper. Overridable: OMP_MEM_HIGH, OMP_MEM_MAX, OMP_SWAP_MAX,
+# REVIEW_MAX_CONCURRENCY, OMP_NO_SCOPE=1 (skip the scope entirely).
+
+REAL_OMP="${OMP_REAL_BIN:-$HOME/.local/lib/omp/omp}"
+export PI_INSTALL_DIR="${PI_INSTALL_DIR:-$HOME/.local/lib/omp}"
+# `review` spawns up to REVIEW_MAX_CONCURRENCY fat agent CLIs per process; 4 was
+# the per-review default, and three reviews at once meant 12 of them (10-11).
+export REVIEW_MAX_CONCURRENCY="${REVIEW_MAX_CONCURRENCY:-2}"
+
+# Each session runs in its own Landlock signal domain (rig-cli#704): its `kill` reaches only its
+# own process tree, never systemd --user or other sessions. RIG_SIGNAL_SCOPE=0 skips it for one
+# launch. Interim until #692's rig-managed launcher, which must keep this prefix. A missing helper
+# never blocks a launch.
+SIGNAL_SCOPE_HELPER="$HOME/dev/rig-cli/riglib/signal_scope.py"
+SCOPE=()
+if [ "${RIG_SIGNAL_SCOPE:-}" != 0 ] && [ -r "$SIGNAL_SCOPE_HELPER" ] && command -v python3 >/dev/null 2>&1; then
+    SCOPE=(python3 -I -S "$SIGNAL_SCOPE_HELPER" --)
+fi
+
+if [ ! -x "$REAL_OMP" ]; then
+    echo "omp wrapper: real binary not found at $REAL_OMP (run: curl -fsSL https://omp.sh/install | PI_INSTALL_DIR=$HOME/.local/lib/omp sh -s -- --binary)" >&2
+    exit 127
+fi
+
+# Already inside an omp scope (omp spawning omp, e.g. a subagent through PATH):
+# stay in the parent session's cgroup so memory accounting and attribution
+# (scope -> session) stay per session, not per subagent.
+if [ "${OMP_NO_SCOPE:-}" = 1 ] || grep -q '/omp\.slice/' /proc/self/cgroup 2>/dev/null; then
+    exec "${SCOPE[@]}" "$REAL_OMP" "$@"
+fi
+
+# Sessions must never fail to start because of the cgroup layer: prove that a
+# scope can actually be created (user manager reachable, memory controller
+# delegated) with a throwaway one, and only then exec through systemd-run.
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope --quiet --slice=omp.slice \
+        -p MemoryMax="${OMP_MEM_MAX:-20G}" -- true >/dev/null 2>&1; then
+    # --scope: systemd-run forks omp itself, so TTY, cwd, env, signals and the
+    # exit code pass straight through (unlike --service).
+    exec systemd-run --user --scope --quiet \
+        --unit="omp-$$-$(date +%s)" \
+        --slice=omp.slice \
+        -p MemoryHigh="${OMP_MEM_HIGH:-12G}" \
+        -p MemoryMax="${OMP_MEM_MAX:-20G}" \
+        -p MemorySwapMax="${OMP_SWAP_MAX:-2G}" \
+        -- "${SCOPE[@]}" "$REAL_OMP" "$@"
+fi
+
+exec "${SCOPE[@]}" "$REAL_OMP" "$@"

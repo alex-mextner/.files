@@ -1,0 +1,361 @@
+# Coverage rules for the `files` adapter (top-level entries of $HOME dotfiles, ~/.config, ~/.local/share, ~/.local/bin).
+# Every entry is tracked (a file under files/ or machines/<host>/files/, a module's claim), excluded with a reason,
+# secret (coverage.d/secrets.toml) or untracked with a ticket (what the engine or the profile cannot declare yet).
+# Profile modules claim their own entries in their module.toml; this file claims what ENGINE modules create
+# (rig, passwords-app, firefox-passkey-qr, gsconnect) and holds the exclusions and the ticketed gaps.
+# Triage of https://github.com/alex-mextner/.files/issues/44.
+
+# engine module: rig
+[[coverage]]
+match = [
+  "file:~/.agents",
+  "file:~/.claude",
+  "file:~/.config/pi",
+  "file:~/.zshenv",
+  "file:~/.bunfig.toml",
+  "file:~/.local/share/rig",
+  "file:~/.local/bin/runpod-run",
+  "file:~/.local/bin/fj",
+  "file:~/.local/bin/git-credential-fj",
+  "file:~/.local/bin/install-local-hooks.sh",
+  "file:~/.config/gitleaks",
+]
+class = "tracked"
+reason = "written by `rig apply commit` (engine module rig, run from dotfiles-link): agent skills and hooks (~/.agents, ~/.claude: settings.json, hooks/, CLAUDE.md skill blocks), the pi AGENTS.md, the env source line in ~/.zshenv and the bun block in ~/.bunfig.toml, the fj 0.6.0 binary (~/.local/share/rig) with its fj and git-credential-fj wrappers, the git hook dispatcher helpers (install-local-hooks.sh, gitleaks configs copied from agent-tools ci/secret-scan) and the runpod-run link into the synced skills; the Claude login (~/.claude/.credentials.json) is not in the profile: restore with `claude` login"
+
+# engine module: rig, tools.items
+[[coverage]]
+match = [
+  "file:~/.local/bin/task",
+  "file:~/.local/bin/review",
+  "file:~/.local/bin/qa",
+  "file:~/.local/bin/dev",
+  "file:~/.local/bin/keychain",
+  "file:~/.local/bin/router",
+  "file:~/.local/bin/rig",
+]
+class = "tracked"
+reason = "link made by rig's tools.items (rig/config.yaml: task, review, qa, dev, keychain, router) or by the rig module itself (~/.local/bin/rig -> ~/dev/rig-cli); rig clones the repositories and links them"
+
+# engine module: passwords-app
+[[coverage]]
+match = [
+  "file:~/.local/share/passwords-app",
+  "file:~/.local/bin/passwords-app",
+  "file:~/.local/share/glib-2.0",
+]
+class = "tracked"
+reason = "installed by `passwords-app install` (engine module passwords-app): venv, daemon, native-messaging host and the Passwords gschema; the iCloud session in state.db is not in the profile: restore with `passwords-app signin`"
+
+# engine module: firefox-passkey-qr
+[[coverage]]
+match = [
+  "file:~/.config/ha-ble-vhci",
+  "file:~/.local/share/ha-ble-vhci",
+]
+class = "tracked"
+reason = "created by the firefox-passkey-qr installer (engine module, enabled in machines/ubuntu-pc): the ha-ble-vhci venv and its env/token files, the token is read from the Secret Service (application ubuntu-tweaks, purpose ha-token) at install time"
+
+# engine module: gsconnect
+[[coverage]]
+match = [
+  "file:~/.local/share/nautilus-python",
+  "file:~/.local/share/nemo-python",
+]
+class = "tracked"
+reason = "the GSConnect file-manager extensions (nautilus-gsconnect.py, nemo-gsconnect.py) are links created by the gsconnect module (machines/ubuntu-pc enables it)"
+
+[[coverage]]
+match = ["file:~/.bash_logout"]
+class = "excluded"
+reason = "identical to /etc/skel/.bash_logout (stock Ubuntu file)"
+
+[[coverage]]
+match = ["file:~/.tmux.conf"]
+class = "excluded"
+reason = "machine-local tmux state: rig owns its tmux block (rig/config.yaml tmux:) and install-ubuntu.sh never touches it; the user region is not hand-written config"
+
+[[coverage]]
+match = ["file:~/.pam_environment"]
+class = "excluded"
+reason = "inert on Ubuntu 26.04: gdm does not read ~/.pam_environment, so its ru_RU LC_* lines have no effect; locale is set by system.toml"
+
+[[coverage]]
+match = ["file:~/.gitignore_global"]
+class = "excluded"
+reason = "the rig gitignore block (rig/config.yaml gitignore: entries) written by `rig apply commit`; the three Python lines above the block (__pycache__/, *.pyc, *.pyo) are not reproduced and are not worth a file of their own"
+
+[[coverage]]
+match = [
+  "file:~/.vim",
+  "file:~/.zplug",
+]
+class = "excluded"
+reason = "plugin-manager checkouts the dotfiles-link module creates (install-ubuntu.sh: zplug at the pinned 2.4.2 release commit, vim-plug 0.14.0 checked by sha256, plugins from ~/.vimrc/.zprofile), regenerated on every apply"
+
+[[coverage]]
+match = ["file:~/.claude.json"]
+class = "excluded"
+reason = "Claude Code application state (project history, onboarding flags, cached account info, per-project trust); MCP servers come from rig's mcp block and the login from `claude` itself"
+
+[[coverage]]
+match = [
+  "file:~/.claude-server-commander",
+  "file:~/.copilot",
+  "file:~/.agent-browser",
+  "file:~/.semgrep",
+  "file:~/.config/.wrangler",
+  "file:~/.config/gatsby",
+  "file:~/.config/go",
+  "file:~/.config/ibus",
+  "file:~/.config/tiling-assistant",
+  "file:~/.config/qa-cli",
+  "file:~/.config/superpowers",
+  "file:~/.config/Snapmaker_Orca",
+  "file:~/.config/libreoffice",
+]
+class = "excluded"
+reason = "application runtime state: Desktop Commander MCP state, Copilot CLI logs and its self-managed config.json, agent-browser session snapshots, semgrep anonymous id and log, wrangler/gatsby/Go telemetry, ibus runtime sockets, the tiling-assistant window restore file, qa-cli Telegram QR cache, superpowers skill artifacts and evidence logs, the Snapmaker Orca profile (machine id, recent files, hms cache, logs; slicer reinstall is ticket #59), the LibreOffice profile (registrymodifications.xcu rewritten at every start)"
+
+[[coverage]]
+match = [
+  "file:~/.config/jgit",
+  "file:~/.config/passwords-app",
+  "file:~/.config/sendspin-ubuntu-pc",
+]
+class = "excluded"
+reason = "machine-bound identity written by the program itself: JGit's filesystem timestamp probe keyed by the disk device, the passwords-app device id and serial, the sendspin player identity and Music Assistant pairing store (re-pair the player in Music Assistant)"
+
+[[coverage]]
+match = [
+  "file:~/.config/agterm",
+  "file:~/.config/cmux",
+]
+class = "excluded"
+reason = "macOS-only app copies from the Mac (agterm, cmux): no Linux build exists, nothing here runs"
+
+[[coverage]]
+match = ["file:~/.config/configstore"]
+class = "excluded"
+reason = "update-notifier version-check stamps and Lighthouse preferences of Node CLIs; no credential in it"
+
+[[coverage]]
+match = [
+  "file:~/.config/org.gnome.Ptyxis",
+  "file:~/.local/share/org.gnome.Ptyxis",
+]
+class = "excluded"
+reason = "Ptyxis window and session state (session.gvariant)"
+
+[[coverage]]
+match = [
+  "file:~/.local/bin/blueprint-compiler",
+  "file:~/.local/share/pkgconfig",
+]
+class = "excluded"
+reason = "source build (meson prefix ~/.local) of blueprint-compiler 0.20.4 that the passwords-app extension build uses; the distribution package blueprint-compiler 0.19 is the declared one"
+
+[[coverage]]
+match = ["file:~/.local/bin/review-remote"]
+class = "excluded"
+reason = "developer link into a throwaway review-cli worktree (.worktrees/review-remote); the review command itself comes from rig tools.items"
+
+[[coverage]]
+match = ["file:~/.local/bin/google-chrome"]
+class = "excluded"
+reason = "legacy shim to a dpkg -x Chrome copy under ~/.local/opt; the chatgpt-guardian module deliberately uses its own chatgpt-guardian-chrome wrapper because a generic google-chrome in ~/.local/bin is picked up by xdg-open and every launcher"
+
+[[coverage]]
+match = ["file:~/.local/bin/git"]
+class = "excluded"
+reason = "copy of the distribution git (2.53.0, the same version as /usr/bin/git) that sits first in PATH; apt git is declared by the git-gh module"
+
+[[coverage]]
+match = ["file:~/.moshi"]
+class = "excluded"
+reason = "moshi upload spool (handoff documents the app received)"
+
+[[coverage]]
+match = ["file:~/.local/share/tg-cli-releases"]
+class = "excluded"
+reason = "versioned tg-cli release copies and release-config backups made by tg-cli's own release tooling"
+
+[[coverage]]
+match = [
+  "file:~/.local/share/3d",
+  "file:~/.local/share/3d-cli",
+  "file:~/.local/share/hypercal-private",
+  "file:~/.local/share/crypt-guide-screens-raw",
+  "file:~/.local/share/ha-network-devices",
+  "file:~/.local/share/u1-share",
+  "file:~/.local/share/tasks-app-handoff",
+  "file:~/.local/share/tasks-app-migration",
+  "file:~/.local/share/tasks-app-verification",
+  "file:~/.local/share/forgejo-home-acceptance",
+  "file:~/.local/share/browser-assist",
+]
+class = "excluded"
+reason = "work products and data, not configuration: 3d-cli printer history, bed captures and todo lists, review and benchmark logs, raw screenshots for the crypt guide, the network-devices mock and screenshots, one-off provisioning scripts and backups of the U1 share, task-app migration, handoff and verification receipts, a Chrome acceptance-test profile, the browser-assist journal"
+
+[[coverage]]
+match = ["file:~/.local/share/tasks-backup"]
+class = "excluded"
+reason = "age-encrypted database backups and pull/drill status written by the tasks-backup timers; regenerated, data not configuration"
+
+[[coverage]]
+match = [
+  "file:~/.local/share/Fuchsia",
+  "file:~/.local/share/devenv",
+  "file:~/.local/share/gnome-initial-setup",
+  "file:~/.local/share/icons",
+  "file:~/.local/share/opentui",
+  "file:~/.local/share/snapmaker-orca",
+  "file:~/.local/share/tailscale",
+  "file:~/.local/share/user-session-migration",
+  "file:~/.local/share/vale",
+  "file:~/.local/share/bash-completion",
+  "file:~/.local/share/glances",
+  "file:~/.local/share/router-cli",
+  "file:~/.local/share/org.gnome.TextEditor",
+]
+class = "excluded"
+reason = "caches and app state: Fuchsia SDK metrics ids, devenv gc roots, GNOME first-run salts, the icon cache, opentui downloaded tree-sitter parsers, Snapmaker Orca web storage, tailscaled log config and logs, GNOME session migration marker, vale synced styles, the router completion script generated by router-cli, the glances log, the router inventory database, TextEditor recents"
+
+# binaries nobody declares
+[[coverage]]
+match = [
+  "file:~/.local/bin/age",
+  "file:~/.local/bin/age-keygen",
+  "file:~/.local/bin/oh-my-posh",
+  "file:~/.local/bin/ruff",
+  "file:~/.local/bin/runpodctl",
+  "file:~/.local/bin/moshi-hook",
+  "file:~/.local/bin/moshi",
+  "file:~/.local/bin/claude",
+  "file:~/.local/share/claude",
+  "file:~/.local/bin/gh",
+  "file:~/.local/bin/node",
+  "file:~/.local/bin/npm",
+  "file:~/.local/bin/npx",
+  "file:~/.local/bin/gitleaks",
+  "file:~/.local/bin/tunnel-client",
+  "file:~/.local/bin/vastai",
+  "file:~/.local/share/vastai",
+  "file:~/.local/bin/RemoteMouse",
+  "file:~/.local/bin/blender",
+  "file:~/.local/bin/openscad",
+  "file:~/.local/bin/orca-slicer",
+  "file:~/.local/bin/snapmaker-orca",
+  "file:~/.local/bin/bun",
+  "file:~/.local/bin/uv",
+]
+class = "untracked"
+reason = "programs installed by hand (release binaries, a manual node/gh copy under ~/.local/opt, native installers, AppImages in ~/Applications) that no profile file declares, and the bun and uv wrapper scripts around ~/.bun/bin/bun and ~/.local/opt/uv/uv (a wrapper without its binary would shadow brew's bun and uv, so they wait for the binaries); the engine has no sha256-pinned binary download declaration yet"
+ticket = "alex-mextner/.files#59"
+
+[[coverage]]
+match = [
+  "file:~/.cursor",
+  "file:~/.gemini",
+  "file:~/.kimi",
+  "file:~/.qwen",
+]
+class = "untracked"
+reason = "hook entries (and for ~/.gemini the rig skill blocks in GEMINI.md) written by `moshi-hook install`; moshi-hook itself is not declared yet, so its hook installation cannot be reconciled either"
+ticket = "alex-mextner/.files#59"
+
+[[coverage]]
+match = [
+  "file:~/.codex",
+  "file:~/.omp",
+  "file:~/.config/opencode",
+]
+class = "untracked"
+reason = "rig writes hooks, MCP and permissions into config.toml / config.yml / opencode.jsonc next to keys Alex set by hand (omp modelRoles, theme, retry chains); capture treats these directories as mixed and the engine has no key-level merge for generated plus user content"
+ticket = "alex-mextner/.files#60"
+
+[[coverage]]
+match = ["file:~/.config/review-cli"]
+class = "untracked"
+reason = "config.yaml (model pool, seats) holds an account e-mail and the capture secret scan refuses any e-mail; the rest of the directory is run statistics, seat cooldowns and a spec cache; .env stays local"
+ticket = "alex-mextner/.files#61"
+
+[[coverage]]
+match = [
+  "file:~/.local/bin/3d",
+  "file:~/.local/bin/3d-printer-runtime",
+  "file:~/.local/bin/hsw-editor",
+]
+class = "untracked"
+reason = "links into working checkouts (~/xp/3d-cli, ~/dev/hsw-editor) that rig tools.items does not declare, so nothing clones them on a fresh machine"
+ticket = "alex-mextner/.files#62"
+
+[[coverage]]
+match = [
+  "file:~/.local/share/ha-physical-desktop",
+  "file:~/.local/share/chatgpt-native-ha",
+  "file:~/.local/share/tinyprint-bridge",
+  "file:~/.config/chatgpt-native-ha.env",
+]
+class = "untracked"
+reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv); the units are declared but not enabled until this lands"
+ticket = "alex-mextner/.files#58"
+
+# links and leftovers whose owner is declared elsewhere (packages.toml uv/npm lists) or that hold nothing to track
+[[coverage]]
+match = [
+  "file:~/.local/bin/aiw-ru",
+  "file:~/.local/bin/esp_rfc2217_server",
+  "file:~/.local/bin/esp_rfc2217_server.py",
+  "file:~/.local/bin/espefuse",
+  "file:~/.local/bin/espefuse.py",
+  "file:~/.local/bin/esphome",
+  "file:~/.local/bin/espsecure",
+  "file:~/.local/bin/espsecure.py",
+  "file:~/.local/bin/esptool",
+  "file:~/.local/bin/esptool.py",
+  "file:~/.local/bin/git-filter-repo",
+  "file:~/.local/bin/glances",
+  "file:~/.local/bin/netprint",
+  "file:~/.local/bin/py-spy",
+  "file:~/.local/bin/slop-check",
+  "file:~/.local/bin/text-lint",
+  "file:~/.local/bin/trafilatura",
+]
+class = "excluded"
+reason = "link created by `uv tool install`; the tool is declared in packages.toml `uv` (aiw-ru, esphome, esptool, git-filter-repo, glances, netprint, py-spy, hyper-text-lint, trafilatura)"
+
+[[coverage]]
+match = ["file:~/.local/bin/agent-browser", "file:~/.local/bin/codex", "file:~/.local/bin/opencode"]
+class = "excluded"
+reason = "link created by `npm install -g` (prefix ~/.local); the package is declared in packages.toml `npm` (agent-browser, @openai/codex, opencode-ai)"
+
+[[coverage]]
+match = ["file:~/.local/bin/corepack", "file:~/.local/bin/pnpm", "file:~/.local/bin/pnpx", "file:~/.local/bin/yarn", "file:~/.local/bin/yarnpkg"]
+class = "excluded"
+reason = "corepack shims that ship with the node copy under ~/.local/opt/node (declared by ticket #59); `corepack enable` recreates them"
+
+[[coverage]]
+match = [
+  "file:~/.config/gtk-4.0",
+  "file:~/.config/matplotlib",
+  "file:~/.config/nautilus",
+  "file:~/.config/procps",
+  "file:~/.config/task",
+  "file:~/.config/tasks-app-linear-sync",
+  "file:~/.config/thefuck",
+  "file:~/.config/update-notifier",
+  "file:~/.config/vale",
+  "file:~/.config/vercel-plugin",
+  "file:~/.local/share/backgrounds",
+  "file:~/.local/share/ibus-table",
+  "file:~/.local/share/nano",
+  "file:~/.local/share/sounds",
+]
+class = "excluded"
+reason = "empty directory an application created at its first start: nothing in it to track"
+
+[[coverage]]
+match = ["file:~/.config/.gsd-keyboard.settings-ported", "file:~/.config/enchant", "file:~/.config/blender", "file:~/.local/share/systemd"]
+class = "excluded"
+reason = "app markers and caches: the gnome-settings-daemon keyboard-ported marker, empty enchant dictionaries, the Blender extensions cache, systemd's persistent-timer stamp files"

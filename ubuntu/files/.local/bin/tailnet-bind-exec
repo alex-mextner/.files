@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run a service bound to this host's tailnet address, resolved at start (no IP hardcoded in units).
+# Usage: tailnet-bind-exec ENV_VAR cmd [args...]
+#   exports ENV_VAR=<tailscale IPv4> and replaces "@IP@" inside args with it, then execs cmd.
+# Fails (non-zero) until tailscaled has an address, so systemd Restart= keeps retrying.
+set -euo pipefail
+var=$1
+shift
+ip=$(tailscale ip -4 | head -n1)
+[[ -n $ip ]] || { echo "tailnet-bind-exec: no tailscale IPv4 yet" >&2; exit 1; }
+export "$var=$ip"
+args=()
+for a in "$@"; do args+=("${a//@IP@/$ip}"); done
+exec "${args[@]}"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=HSW — мастерская
+Comment=Крепления, примерка, визуализация и handoff
+Exec=/home/ultra/.local/bin/hsw-review
+Icon=applications-engineering
+Terminal=false
+Categories=Graphics;Engineering;

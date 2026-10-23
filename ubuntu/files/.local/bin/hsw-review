@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+systemctl --user start hsw-review.service
+exec /usr/bin/firefox --new-tab http://127.0.0.1:8767/refit/review.html

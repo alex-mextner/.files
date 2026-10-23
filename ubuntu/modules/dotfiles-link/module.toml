@@ -11,3 +11,26 @@ root = false
 install = "install.sh"
 check = "install.sh --check"
 preview = "install.sh --plan"
+
+# What install-ubuntu.sh and the plan's rc links create in $HOME (see the header of ~/.files/install-ubuntu.sh).
+[[coverage]]
+match = [
+  "file:~/.zprofile",
+  "file:~/.profile",
+  "file:~/.vimrc",
+  "file:~/.gitattributes",
+  "file:~/.hyper.js",
+  "file:~/.tmux",
+]
+class = "tracked"
+reason = "linked into ~/.files by this module (install-ubuntu.sh link_into_home) or by the plan's rc links (~/.profile, ~/.zprofile)"
+
+[[coverage]]
+match = ["file:~/.gitconfig"]
+class = "tracked"
+reason = "this module puts the [include] of ~/.files/.gitconfig.shared at its top; the identity and credential helpers come from the git-gh module (git config --global), hooksPath and core.excludesfile from rig; the file holds an e-mail address, so it is never copied into the profile"
+
+[[coverage]]
+match = ["file:~/.config/rig"]
+class = "tracked"
+reason = "config.yaml is merged from ~/.files/rig/config.yaml by install-ubuntu.sh (the repository wins for every key it declares); env/, tmux/, sysmon/ and MEMORY.md are written by `rig apply commit`, which this module runs"

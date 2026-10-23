@@ -19,6 +19,7 @@ ubuntu/
   settings/**/*.ini         # settings bundles: dconf keyfiles named by purpose (dev-keyboard.ini, laptop/power.ini), shared by all machines
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
   packages.toml             # apt / snap / flatpak names
+  coverage.d/*.toml         # [[coverage]] rules: what `ubuntu-tweak coverage` counts as excluded (reason), secret (where it is restored from) or untracked (with a ticket)
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)
     machine.toml            # same schema as profile.toml; wins over it (no [machine] table: hostname = dir name)
@@ -223,6 +224,13 @@ concept, that tool already reports it as unsupported off macOS (`rig status`, `r
 Never store secrets here: no tokens, passwords, private keys, keyring data, online-account
 or Wi-Fi credentials. The engine skips such keys and refuses `capture --commit` (exit 5) if
 its output scan finds anything. The repo CI also runs gitleaks over the tree.
+
+Credential entries of `$HOME` (`~/.ssh`, `~/.config/gh`, `~/.config/gcloud`, browser profiles, `.env`, ...) are listed
+one by one in `coverage.d/secrets.toml` with the command or keychain item that brings each back on a fresh machine
+(`ubuntu-tweak coverage --class secret` prints them). An entry that mixes a portable file with credentials
+(`~/.config/tasks-backup`, `~/.config/ralphex`) is tracked through the portable file under `files/`; the credential
+files inside it stay local. Files that carry a reviewed false positive of the secret scan (`guardian-connect`,
+`tg-remote-test`, `ha-host-actions.py`, `odroid-remote-log`, `omp`) are in `files/` but not in `[capture] include_files`.
 
 ## Laptop root files: verdicts
 

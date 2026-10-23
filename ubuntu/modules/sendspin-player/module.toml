@@ -23,3 +23,8 @@ description = "enable and start sendspin-ubuntu-pc.service (the unit file is in 
 after = "sendspin-tool"
 run = ["systemctl", "--user", "enable", "--now", "sendspin-ubuntu-pc.service"]
 check = ["systemctl", "--user", "is-enabled", "sendspin-ubuntu-pc.service"]
+
+[[coverage]]
+match = ["file:~/.local/bin/sendspin"]
+class = "tracked"
+reason = "link made by the `sendspin-tool` post (uv tool install sendspin)"

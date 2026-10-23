@@ -1,0 +1,7 @@
+# Machine-wide task-cli defaults. Deliberately NO `backend:` here: the built-in default is
+# GitHub Issues (and Forgejo is auto-detected for repos whose origin is on git.hyperide.ai).
+# A repo that must NOT use GitHub Issues pins its tracker in its OWN task.yaml / rig.yaml `task:`.
+# The startup tracker (tasks-ultrabricks.vercel.app, team HYP) used to live here and leaked
+# into every personal repo without a task.yaml (garage-band, chekhov, ...) — never put it back.
+# Old file: ~/.cache/hyp-cleanup/config.yaml.bak
+version: 1

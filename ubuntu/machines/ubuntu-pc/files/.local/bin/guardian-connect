@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""guardian-connect: one-command private Guardian connector setup for ChatGPT (stdlib only).
+
+Interactive mode (the default) walks the owner through: verifying the already-installed pm
+connector, collecting the non-secret tunnel id and the restricted runtime API key (getpass only),
+encrypting the key with ``systemd-creds`` into a private file, creating the tunnel-client profile
+``pm-guardian``, installing a user systemd unit, running ``tunnel-client doctor`` and only then
+starting the worker. ``--run-service`` is the unit's entry point: it reads the decrypted
+credential from ``$CREDENTIALS_DIRECTORY``, exposes it to tunnel-client as
+``CONTROL_PLANE_API_KEY`` and execs ``tunnel-client run``. ``--check`` reports state read-only.
+
+The key never appears in argv, config files, logs or output. User-facing prompts are Russian
+and stored as Unicode escapes because the repository forbids non-ASCII text.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import TextIO
+
+PROFILE = "pm-guardian"
+CREDENTIAL_NAME = "guardian-tunnel-key"
+CREDENTIAL_FILE = "tunnel-key.cred"
+UNIT_NAME = "guardian-tunnel.service"
+HEALTH_ADDR = "127.0.0.1:8793"
+HEALTH_URL = f"http://{HEALTH_ADDR}/health"
+READY_TIMEOUT_S = 90.0  # first control-plane long poll can take ~35s plus startup/jitter
+READY_POLL_S = 2.0
+HEALTH_CMD_TIMEOUT_S = 10.0
+
+STATE_UNAVAILABLE = "unavailable"
+STATE_NOT_READY = "not_ready"
+STATE_AWAITING_POLL = "awaiting_poll"
+STATE_READY = "ready"
+KEY_ENV = "CONTROL_PLANE_API_KEY"
+TUNNEL_ID_RE = re.compile(r"tunnel_(?:[a-z0-9]{4}_)?[a-z0-9]{32}")
+TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels"
+DISPLAY_LIMIT = 1500
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+EXIT_NOT_READY = 3
+
+# Russian user-facing strings (Unicode escapes; see module docstring).
+M = {
+    "welcome": "\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 \u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e\u0433\u043e \u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440\u0430 Guardian \u0434\u043b\u044f ChatGPT. \u0421\u0435\u043a\u0440\u0435\u0442\u044b \u043d\u0435 \u043f\u0435\u0447\u0430\u0442\u0430\u044e\u0442\u0441\u044f \u0438 \u043d\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u044e\u0442\u0441\u044f \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u043c \u0442\u0435\u043a\u0441\u0442\u043e\u043c.",
+    "no_tty": "\u041d\u0443\u0436\u0435\u043d \u0438\u043d\u0442\u0435\u0440\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0439 \u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b: \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 guardian-connect \u0432 \u043e\u0431\u044b\u0447\u043d\u043e\u043c \u043e\u043a\u043d\u0435 \u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b\u0430.",
+    "tunnel_intro": "\u0421\u043e\u0437\u0434\u0430\u0439\u0442\u0435 \u0442\u0443\u043d\u043d\u0435\u043b\u044c \u0432 Platform ({url}) \u0438 \u043f\u0440\u0438\u0432\u044f\u0436\u0438\u0442\u0435 \u0435\u0433\u043e \u043a \u043d\u0443\u0436\u043d\u043e\u043c\u0443 \u0440\u0430\u0431\u043e\u0447\u0435\u043c\u0443 \u043f\u0440\u043e\u0441\u0442\u0440\u0430\u043d\u0441\u0442\u0432\u0443 ChatGPT. \u041d\u0443\u0436\u0435\u043d \u043a\u043b\u044e\u0447 \u0441 \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u043d\u044b\u043c\u0438 \u043f\u0440\u0430\u0432\u0430\u043c\u0438: Tunnels \u2014 Read \u0438 Use (\u0430\u0434\u043c\u0438\u043d-\u043a\u043b\u044e\u0447 \u043d\u0435 \u043d\u0443\u0436\u0435\u043d).",
+    "tunnel_prompt": "ID \u0442\u0443\u043d\u043d\u0435\u043b\u044f (tunnel_...): ",
+    "tunnel_invalid": "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u0444\u043e\u0440\u043c\u0430\u0442 ID. \u041e\u0436\u0438\u0434\u0430\u0435\u0442\u0441\u044f tunnel_<32 \u0441\u0438\u043c\u0432\u043e\u043b\u0430 a-z0-9> \u0438\u043b\u0438 tunnel_<4 \u0441\u0438\u043c\u0432\u043e\u043b\u0430>_<32 \u0441\u0438\u043c\u0432\u043e\u043b\u0430>.",
+    "key_intro": "\u0422\u0435\u043f\u0435\u0440\u044c \u0432\u0432\u0435\u0434\u0438\u0442\u0435 runtime API-\u043a\u043b\u044e\u0447 \u0442\u0443\u043d\u043d\u0435\u043b\u044f (\u0432\u0432\u043e\u0434 \u0441\u043a\u0440\u044b\u0442, \u043a\u043b\u044e\u0447 \u043d\u0438\u0433\u0434\u0435 \u043d\u0435 \u043e\u0442\u043e\u0431\u0440\u0430\u0436\u0430\u0435\u0442\u0441\u044f).",
+    "key_prompt": "Runtime API-\u043a\u043b\u044e\u0447: ",
+    "cred_replace_confirm": "\u0417\u0430\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u043a\u043b\u044e\u0447 \u0443\u0436\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442. \u0417\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0435\u0433\u043e \u043d\u043e\u0432\u044b\u043c? [yes/\u043d\u0435\u0442]: ",
+    "cred_keep": "\u0421\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0439 \u0437\u0430\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u043a\u043b\u044e\u0447 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0431\u0435\u0437 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0439.",
+    "cred_saved": "\u041a\u043b\u044e\u0447 \u0437\u0430\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u043d \u0447\u0435\u0440\u0435\u0437 systemd-creds \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d: {path}",
+    "profile_confirm": "\u041f\u0440\u043e\u0444\u0438\u043b\u044c pm-guardian \u0443\u0436\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442, \u043d\u043e \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d \u043a\u0430\u043a \u0441\u043e\u0437\u0434\u0430\u043d\u043d\u044b\u0439 \u043f\u043e\u043c\u043e\u0449\u043d\u0438\u043a\u043e\u043c \u0434\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0442\u0443\u043d\u043d\u0435\u043b\u044f. \u0417\u0430\u043c\u0435\u043d\u0438\u0442\u044c? [yes/\u043d\u0435\u0442]: ",
+    "profile_reuse": "\u041f\u0440\u043e\u0444\u0438\u043b\u044c pm-guardian \u0443\u0436\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d \u043d\u0430 \u044d\u0442\u043e\u0442 \u0442\u0443\u043d\u043d\u0435\u043b\u044c, \u043e\u0441\u0442\u0430\u0432\u043b\u044f\u044e \u043a\u0430\u043a \u0435\u0441\u0442\u044c.",
+    "profile_ok": "\u041f\u0440\u043e\u0444\u0438\u043b\u044c {profile} \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d.",
+    "pm_recorded": "ID \u0442\u0443\u043d\u043d\u0435\u043b\u044f \u0437\u0430\u043f\u0438\u0441\u0430\u043d \u0432 pm (\u043d\u0435 \u0441\u0435\u043a\u0440\u0435\u0442).",
+    "pm_record_failed": "pm \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u043b ID \u0442\u0443\u043d\u043d\u0435\u043b\u044f, \u043f\u0440\u043e\u0444\u0438\u043b\u044c \u043f\u0440\u0438 \u044d\u0442\u043e\u043c \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d. \u041f\u043e\u0434\u0440\u043e\u0431\u043d\u043e\u0441\u0442\u0438: {detail}",
+    "unit_confirm": "\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0438\u0439 unit \u0443\u0436\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043e\u0442\u043b\u0438\u0447\u0430\u0435\u0442\u0441\u044f. \u041f\u0435\u0440\u0435\u0437\u0430\u043f\u0438\u0441\u0430\u0442\u044c? [yes/\u043d\u0435\u0442]: ",
+    "unit_reuse": "\u041f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u0441\u043a\u0438\u0439 unit \u0443\u0436\u0435 \u0430\u043a\u0442\u0443\u0430\u043b\u0435\u043d.",
+    "unit_ok": "Unit \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d, \u043f\u0440\u043e\u0432\u0435\u0440\u0435\u043d systemd-analyze \u0438 \u0432\u043a\u043b\u044e\u0447\u0451\u043d.",
+    "doctor_ok": "tunnel-client doctor \u043f\u0440\u043e\u0448\u0451\u043b. \u0417\u0430\u043f\u0443\u0441\u043a\u0430\u044e \u0441\u0435\u0440\u0432\u0438\u0441.",
+    "wait_expired": "\u0412\u0440\u0435\u043c\u044f \u043e\u0436\u0438\u0434\u0430\u043d\u0438\u044f ({seconds} \u0441) \u0438\u0441\u0442\u0435\u043a\u043b\u043e.",
+    "state_unavailable": "Health {url} \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d \u0438\u043b\u0438 \u043e\u0442\u0432\u0435\u0442\u0438\u043b \u043d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u043e: \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435 \u0442\u0443\u043d\u043d\u0435\u043b\u044f \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e. \u041a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 \u041d\u0415 \u0433\u043e\u0442\u043e\u0432; \u0441\u043c\u043e\u0442\u0440\u0438\u0442\u0435: journalctl --user -u guardian-tunnel.service",
+    "state_not_ready": "\u0421\u0435\u0440\u0432\u0438\u0441 \u0436\u0438\u0432, \u043d\u043e \u0435\u0449\u0451 \u043d\u0435 \u0433\u043e\u0442\u043e\u0432 (readyz \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d). \u041a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 \u041d\u0415 \u0433\u043e\u0442\u043e\u0432; \u0441\u043c\u043e\u0442\u0440\u0438\u0442\u0435: journalctl --user -u guardian-tunnel.service",
+    "state_awaiting_poll": "\u0421\u0435\u0440\u0432\u0438\u0441 \u0436\u0438\u0432 \u0438 \u0433\u043e\u0442\u043e\u0432, \u043d\u043e \u043f\u0435\u0440\u0432\u044b\u0439 \u0443\u0441\u043f\u0435\u0448\u043d\u044b\u0439 \u043e\u043f\u0440\u043e\u0441 control plane \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d. \u042d\u0442\u043e \u043d\u0435 \u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u043d\u043e \u043e\u0448\u0438\u0431\u043a\u0430: \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443 \u043f\u043e\u0437\u0436\u0435 \u043a\u043e\u043c\u0430\u043d\u0434\u043e\u0439 guardian-connect --check; \u043f\u0440\u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0430\u0445 \u0441\u043c\u043e\u0442\u0440\u0438\u0442\u0435: journalctl --user -u guardian-tunnel.service",
+    "state_ready": "\u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0439 \u0442\u0443\u043d\u043d\u0435\u043b\u044c \u0433\u043e\u0442\u043e\u0432 ({url}): healthz, readyz \u0438 \u043e\u043f\u0440\u043e\u0441 control plane \u0443\u0441\u043f\u0435\u0448\u043d\u044b. \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 ChatGPT \u044d\u0442\u0438\u043c \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0430\u0435\u0442\u0441\u044f: \u043e\u043d\u043e \u043f\u0440\u043e\u044f\u0432\u0438\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0432\u043e\u0433\u043e \u0432\u044b\u0437\u043e\u0432\u0430 \u0438\u043d\u0441\u0442\u0440\u0443\u043c\u0435\u043d\u0442\u0430 \u0438\u0437 ChatGPT.",
+    "next_steps": "\u0414\u0430\u043b\u044c\u0448\u0435 \u0432 ChatGPT: Plugins -> Add custom MCP server -> Connection: Tunnel -> \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044d\u0442\u043e\u0442 \u0442\u0443\u043d\u043d\u0435\u043b\u044c -> \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u0442\u0435 \u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044e, \u043f\u0440\u043e\u0447\u0438\u0442\u0430\u0439\u0442\u0435 \u043f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0435\u043d\u0438\u0435 \u043e \u0440\u0438\u0441\u043a\u0430\u0445 \u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u043a\u0430\u043a \u0432\u043b\u0430\u0434\u0435\u043b\u0435\u0446 -> Create. \u041f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u0441\u043b\u0435 \u0443\u0441\u043f\u0435\u0448\u043d\u043e\u0433\u043e \u0432\u044b\u0437\u043e\u0432\u0430 \u0438\u043d\u0441\u0442\u0440\u0443\u043c\u0435\u043d\u0442\u0430 \u0438\u0437 ChatGPT; \u0434\u043e \u044d\u0442\u043e\u0433\u043e \u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d\u043d\u044b\u043c.",
+    "aborted": "\u041f\u0440\u0435\u0440\u0432\u0430\u043d\u043e. \u041d\u0438\u0447\u0435\u0433\u043e \u0441\u0435\u043a\u0440\u0435\u0442\u043d\u043e\u0433\u043e \u043d\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 \u043e\u0442\u043a\u0440\u044b\u0442\u043e\u043c \u0432\u0438\u0434\u0435.",
+    "svc_no_creds_dir": "CREDENTIALS_DIRECTORY \u043d\u0435 \u0437\u0430\u0434\u0430\u043d: \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0439\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 systemd unit.",
+    "svc_no_cred": "\u0423\u0447\u0451\u0442\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 guardian-tunnel-key \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b \u0438\u043b\u0438 \u043f\u0443\u0441\u0442\u044b.",
+    "check_tool_ok": "\u043d\u0430\u0439\u0434\u0435\u043d\u043e: {name}",
+    "check_tool_missing": "\u041d\u0415 \u043d\u0430\u0439\u0434\u0435\u043d\u043e: {name}",
+    "check_connector_ok": "\u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 pm \u0433\u043e\u0442\u043e\u0432 (\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435: {state})",
+    "check_connector_bad": "\u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 pm \u043d\u0435 \u0433\u043e\u0442\u043e\u0432 (\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435: {state})",
+    "check_present": "\u0435\u0441\u0442\u044c: {what}",
+    "check_absent": "\u043d\u0435\u0442: {what}",
+    "err_connector_not_ready": "\u041a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440 pm \u043d\u0435 \u0433\u043e\u0442\u043e\u0432 (\u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435: {detail}). \u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u0438 \u043e\u0434\u043e\u0431\u0440\u0438\u0442\u0435 \u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440.",
+    "err_launcher_mismatch": "\u041f\u0443\u0442\u044c \u043b\u0430\u0443\u043d\u0447\u0435\u0440\u0430 \u043a\u043e\u043d\u043d\u0435\u043a\u0442\u043e\u0440\u0430 \u043d\u0435\u043e\u0436\u0438\u0434\u0430\u043d\u043d\u044b\u0439 \u0438\u043b\u0438 \u0444\u0430\u0439\u043b \u043d\u0435\u0431\u0435\u0437\u043e\u043f\u0430\u0441\u0435\u043d: {detail}",
+    "err_missing_tools": "\u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b \u043a\u043e\u043c\u0430\u043d\u0434\u044b: {detail}",
+    "err_unsafe_path": "\u041d\u0435\u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u044b\u0439 \u043f\u0443\u0442\u044c: {detail}",
+    "err_symlink": "\u0421\u0438\u043c\u0432\u043e\u043b\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u0441\u0441\u044b\u043b\u043a\u0430 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u0430: {detail}",
+    "err_tunnel_invalid_final": "ID \u0442\u0443\u043d\u043d\u0435\u043b\u044f \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u0442 \u043f\u043e\u0441\u043b\u0435 \u0442\u0440\u0451\u0445 \u043f\u043e\u043f\u044b\u0442\u043e\u043a.",
+    "err_key_missing": "\u041a\u043b\u044e\u0447 \u043d\u0435 \u0432\u0432\u0435\u0434\u0451\u043d.",
+    "err_key_rejected": "\u041a\u043b\u044e\u0447 \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d: \u043d\u0443\u0436\u0435\u043d \u043e\u0433\u0440\u0430\u043d\u0438\u0447\u0435\u043d\u043d\u044b\u0439 runtime-\u043a\u043b\u044e\u0447 (Tunnels Read+Use), \u0430 \u043d\u0435 \u0430\u0434\u043c\u0438\u043d-\u043a\u043b\u044e\u0447.",
+    "err_encrypt_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u0442\u044c \u043a\u043b\u044e\u0447: {detail}",
+    "err_encrypt_plaintext": "\u0428\u0438\u0444\u0440\u043e\u0432\u0430\u043d\u0438\u0435 \u0432\u0435\u0440\u043d\u0443\u043b\u043e \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u0439 \u043a\u043b\u044e\u0447; \u0437\u0430\u043f\u0438\u0441\u044c \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u0430.",
+    "err_cred_verify_failed": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0444\u0430\u0439\u043b\u0430 \u0441 \u0448\u0438\u0444\u0440\u0442\u0435\u043a\u0441\u0442\u043e\u043c \u043d\u0435 \u043f\u0440\u043e\u0439\u0434\u0435\u043d\u0430.",
+    "err_declined": "\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u043e: \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0430\u044f \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 \u043d\u0435 \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0430.",
+    "err_init_failed": "tunnel-client init \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b\u0441\u044f \u043e\u0448\u0438\u0431\u043a\u043e\u0439: {detail}",
+    "err_verify_failed": "systemd-analyze verify \u043d\u0435 \u043f\u0440\u043e\u0448\u0451\u043b: {detail}",
+    "err_systemctl_failed": "systemctl \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b\u0441\u044f \u043e\u0448\u0438\u0431\u043a\u043e\u0439: {detail}",
+    "err_decrypt_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0440\u0430\u0441\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0439 \u043a\u043b\u044e\u0447: {detail}",
+    "err_doctor_failed": "tunnel-client doctor \u043d\u0435 \u043f\u0440\u043e\u0448\u0451\u043b, \u0441\u0435\u0440\u0432\u0438\u0441 \u041d\u0415 \u0437\u0430\u043f\u0443\u0449\u0435\u043d: {detail}",
+    "err_start_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0441\u0435\u0440\u0432\u0438\u0441: {detail}",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class RunResult:
+    returncode: int
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+
+Runner = Callable[..., RunResult]
+
+
+def subprocess_runner(
+    argv: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 60.0,
+) -> RunResult:
+    """Run argv without a shell; never raises for missing binaries or timeouts."""
+    try:
+        done = subprocess.run(
+            argv,
+            input=input_bytes,
+            env=None if env is None else dict(env),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return RunResult(127, b"", b"command not found")
+    except subprocess.TimeoutExpired:
+        return RunResult(124, b"", b"timed out")
+    return RunResult(done.returncode, done.stdout, done.stderr)
+
+
+@dataclasses.dataclass
+class Deps:
+    """Every side-effect seam, injectable for offline tests."""
+
+    runner: Runner = subprocess_runner
+    getpass: Callable[[str], str] = getpass.getpass
+    ask: Callable[[str], str] = input
+    is_tty: Callable[[], bool] = lambda: sys.stdin.isatty() and sys.stdout.isatty()
+    which: Callable[[str], str | None] = shutil.which
+    sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic
+    execve: Callable[[str, list[str], dict[str, str]], None] = os.execve
+    home: Path = dataclasses.field(default_factory=Path.home)
+    env: Mapping[str, str] = dataclasses.field(default_factory=lambda: dict(os.environ))
+    out: TextIO = dataclasses.field(default_factory=lambda: sys.stdout)
+    err: TextIO = dataclasses.field(default_factory=lambda: sys.stderr)
+
+
+class SetupError(Exception):
+    """A fatal, already-redacted, user-presentable failure."""
+
+    def __init__(self, key: str, detail: str = "", code: int = EXIT_FAIL):
+        super().__init__(key)
+        self.key = key
+        self.detail = detail
+        self.code = code
+
+
+# --------------------------------------------------------------------------- paths
+
+
+def setup_dir(home: Path) -> Path:
+    return home / ".config" / "guardian-connect"
+
+
+def credential_path(home: Path) -> Path:
+    return setup_dir(home) / CREDENTIAL_FILE
+
+
+def profiles_dir(home: Path) -> Path:
+    return setup_dir(home) / "profiles"
+
+
+def unit_path(home: Path) -> Path:
+    return home / ".config" / "systemd" / "user" / UNIT_NAME
+
+
+def launcher_path(home: Path) -> Path:
+    return home / ".local/state/pm/chatgpt/connectors/guardian-chatgpt/launch-mcp.sh"
+
+
+def installed_helper(home: Path) -> Path:
+    return home / ".local" / "bin" / "guardian-connect"
+
+
+def validate_tunnel_id(value: str) -> bool:
+    return TUNNEL_ID_RE.fullmatch(value) is not None
+
+
+def ensure_private_dir(path: Path, home: Path) -> None:
+    """Create ``path`` (inside ``home``) as a 0700 directory, rejecting links and traversal."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise SetupError("unsafe_path", str(path))
+    try:
+        rel = path.relative_to(home)
+    except ValueError:
+        raise SetupError("unsafe_path", str(path)) from None
+    if home.is_symlink():
+        raise SetupError("unsafe_path", str(home))
+    cur = home
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise SetupError("symlink", str(cur))
+        if not cur.exists():
+            cur.mkdir(mode=0o700)
+        elif not cur.is_dir():
+            raise SetupError("unsafe_path", str(cur))
+    st = path.lstat()
+    if st.st_uid != os.getuid():
+        raise SetupError("unsafe_path", str(path))
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        path.chmod(0o700)
+
+
+def write_atomic(path: Path, data: bytes, mode: int) -> None:
+    """Write via an exclusive temp file + fsync + rename; never follow a symlink target."""
+    if path.is_symlink():
+        raise SetupError("symlink", str(path))
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+# --------------------------------------------------------------------------- redaction
+
+_TOKEN_RES = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[=:]\s*)\S+"),
+)
+
+
+def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = _TOKEN_RES[0].sub("[REDACTED]", text)
+    for rx in _TOKEN_RES[1:]:
+        text = rx.sub(r"\1[REDACTED]", text)
+    return text
+
+
+def bounded(text: str, secrets: tuple[str, ...] = ()) -> str:
+    clean = redact(text, secrets).strip()
+    if len(clean) > DISPLAY_LIMIT:
+        clean = "..." + clean[-DISPLAY_LIMIT:]
+    return clean
+
+
+def result_text(res: RunResult, secrets: tuple[str, ...] = ()) -> str:
+    raw = (res.stdout + b"\n" + res.stderr).decode("utf-8", "replace")
+    return bounded(raw, secrets)
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def say(deps: Deps, key: str, **fmt: str) -> None:
+    print(M[key].format(**fmt) if fmt else M[key], file=deps.out)
+
+
+def confirm(deps: Deps, key: str, **fmt: str) -> bool:
+    answer = deps.ask(M[key].format(**fmt) if fmt else M[key]).strip().lower()
+    return answer in ("yes", "y", "\u0434\u0430")
+
+
+def unit_text(home: Path) -> str:
+    cred = str(credential_path(home)).replace("%", "%%")
+    helper = str(installed_helper(home)).replace("%", "%%")
+    return (
+        "[Unit]\n"
+        "Description=Guardian private MCP tunnel (tunnel-client, loopback only)\n"
+        "Documentation=https://developers.openai.com/api/docs/guides/secure-mcp-tunnels\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "StartLimitIntervalSec=300\n"
+        "StartLimitBurst=5\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+        f"LoadCredentialEncrypted={CREDENTIAL_NAME}:{cred}\n"
+        f"ExecStart={helper} --run-service\n"
+        "Restart=on-failure\n"
+        "RestartSec=10\n"
+        "NoNewPrivileges=true\n"
+        "UMask=0077\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def _tools(deps: Deps) -> dict[str, str | None]:
+    return {
+        name: deps.which(name)
+        for name in ("tunnel-client", "systemd-creds", "systemd-analyze", "systemctl", "pm")
+    }
+
+
+def _connector_state(deps: Deps) -> tuple[str | None, str | None]:
+    """Return (state, launcher) of the verified pm connector, read-only."""
+    res = deps.runner(["pm", "chatgpt", "connector", "status"], timeout=30.0)
+    if res.returncode != 0:
+        return None, None
+    try:
+        payload = json.loads(res.stdout.decode("utf-8", "replace"))
+        for entry in payload["result"]["connectors"]:
+            if entry.get("connector") == "guardian" and entry.get("target") == "chatgpt":
+                return entry.get("state"), entry.get("launcher")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None, None
+    return None, None
+
+
+def verify_connector(deps: Deps) -> None:
+    state, launcher = _connector_state(deps)
+    if state not in ("local_ready", "awaiting_platform_connection"):
+        raise SetupError("connector_not_ready", str(state))
+    expected = launcher_path(deps.home)
+    if launcher != str(expected):
+        raise SetupError("launcher_mismatch", str(launcher))
+    if expected.is_symlink() or not expected.is_file() or not os.access(expected, os.X_OK):
+        raise SetupError("launcher_mismatch", str(expected))
+
+
+def verify_tools(deps: Deps) -> None:
+    missing = [name for name, path in _tools(deps).items() if not path]
+    if missing:
+        raise SetupError("missing_tools", ", ".join(missing))
+
+
+# --------------------------------------------------------------------------- run-service
+
+
+def run_service(deps: Deps) -> int:
+    cred_dir = deps.env.get("CREDENTIALS_DIRECTORY")
+    if not cred_dir:
+        print(M["svc_no_creds_dir"], file=deps.err)
+        return EXIT_USAGE
+    cred_file = Path(cred_dir) / CREDENTIAL_NAME
+    try:
+        key = cred_file.read_text("utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        print(M["svc_no_cred"], file=deps.err)
+        return EXIT_USAGE
+    if not key:
+        print(M["svc_no_cred"], file=deps.err)
+        return EXIT_USAGE
+    client = deps.which("tunnel-client") or str(deps.home / ".local" / "bin" / "tunnel-client")
+    argv = [
+        "tunnel-client",
+        "run",
+        "--profile",
+        PROFILE,
+        "--profile-dir",
+        str(profiles_dir(deps.home)),
+    ]
+    env = {k: v for k, v in deps.env.items() if k != "CREDENTIALS_DIRECTORY"}
+    env[KEY_ENV] = key
+    deps.execve(client, argv, env)
+    return EXIT_FAIL  # only reached when execve is a test double
+
+
+# --------------------------------------------------------------------------- check
+
+
+def run_check(deps: Deps) -> int:
+    """Read-only report: no prompts, no writes, no service control."""
+    ok = True
+    for name, path in _tools(deps).items():
+        found = path is not None
+        ok &= found
+        say(deps, "check_tool_ok" if found else "check_tool_missing", name=name)
+    state, launcher = _connector_state(deps)
+    connector_ok = state in ("local_ready", "awaiting_platform_connection") and launcher == str(
+        launcher_path(deps.home)
+    )
+    ok &= connector_ok
+    say(deps, "check_connector_ok" if connector_ok else "check_connector_bad", state=str(state))
+    for label, path in (
+        ("credential", credential_path(deps.home)),
+        ("profile dir", profiles_dir(deps.home)),
+        ("unit", unit_path(deps.home)),
+    ):
+        present = path.exists()
+        ok &= present
+        say(deps, "check_present" if present else "check_absent", what=label)
+    state = _health_state(deps, HEALTH_CMD_TIMEOUT_S)
+    ok &= state == STATE_READY
+    _say_state(deps, state)
+    return EXIT_OK if ok else EXIT_FAIL
+
+
+# --------------------------------------------------------------------------- setup
+
+
+def _prompt_tunnel_id(deps: Deps) -> str:
+    say(deps, "tunnel_intro", url=TUNNELS_URL)
+    for _ in range(3):
+        value = deps.ask(M["tunnel_prompt"]).strip()
+        if validate_tunnel_id(value):
+            return value
+        say(deps, "tunnel_invalid")
+    raise SetupError("tunnel_invalid_final")
+
+
+def _prompt_key(deps: Deps) -> str:
+    say(deps, "key_intro")
+    key = deps.getpass(M["key_prompt"]).strip()
+    if not key:
+        raise SetupError("key_missing")
+    if key.lower().startswith("sk-admin") or "\n" in key or " " in key:
+        raise SetupError("key_rejected")
+    return key
+
+
+def _encrypt_and_store(deps: Deps, key: str) -> None:
+    res = deps.runner(
+        ["systemd-creds", "encrypt", "--user", f"--name={CREDENTIAL_NAME}", "-", "-"],
+        input_bytes=key.encode(),
+        timeout=30.0,
+    )
+    cipher = res.stdout
+    if res.returncode != 0 or not cipher.strip():
+        raise SetupError("encrypt_failed", result_text(res, (key,)))
+    if key.encode() in cipher or key.encode() in res.stderr:
+        raise SetupError("encrypt_plaintext")
+    path = credential_path(deps.home)
+    write_atomic(path, cipher, 0o600)
+    st = path.lstat()
+    if (
+        not stat.S_ISREG(st.st_mode)
+        or stat.S_IMODE(st.st_mode) != 0o600
+        or path.read_bytes() != cipher
+    ):
+        raise SetupError("cred_verify_failed")
+
+
+def _existing_profile(deps: Deps) -> Path | None:
+    pdir = profiles_dir(deps.home)
+    if not pdir.is_dir():
+        return None
+    for cand in sorted(pdir.glob(f"{PROFILE}.*")):
+        if cand.is_file() and not cand.is_symlink():
+            return cand
+    return None
+
+
+def manifest_path(home: Path) -> Path:
+    return setup_dir(home) / "profile-manifest.json"
+
+
+def _manifest_record(profile: Path, tunnel_id: str, home: Path) -> dict[str, str]:
+    return {
+        "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        "tunnel_id": tunnel_id,
+        "command": str(launcher_path(home)),
+        "health": HEALTH_ADDR,
+    }
+
+
+def _profile_verified(deps: Deps, existing: Path, tunnel_id: str) -> bool:
+    """True only when the helper's own manifest matches the profile bytes and request exactly."""
+    path = manifest_path(deps.home)
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        recorded = json.loads(path.read_text("utf-8"))
+        return recorded == _manifest_record(existing, tunnel_id, deps.home)
+    except (OSError, ValueError):
+        return False
+
+
+def _init_profile(deps: Deps, tunnel_id: str) -> None:
+    existing = _existing_profile(deps)
+    force = False
+    if existing is not None:
+        if _profile_verified(deps, existing, tunnel_id):
+            say(deps, "profile_reuse")
+            return
+        if not confirm(deps, "profile_confirm"):
+            raise SetupError("declined")
+        force = True
+    argv = [
+        "tunnel-client",
+        "init",
+        "--sample",
+        "sample_mcp_stdio_local",
+        "--profile",
+        PROFILE,
+        "--profile-dir",
+        str(profiles_dir(deps.home)),
+        "--tunnel-id",
+        tunnel_id,
+        "--mcp-command",
+        str(launcher_path(deps.home)),
+        "--control-plane-api-key-ref",
+        f"env:{KEY_ENV}",
+        "--health-listen-addr",
+        HEALTH_ADDR,
+    ]
+    if force:
+        argv.append("--force")
+    res = deps.runner(argv, timeout=60.0)
+    if res.returncode != 0:
+        raise SetupError("init_failed", result_text(res))
+    created = _existing_profile(deps)
+    if created is None:
+        raise SetupError("init_failed", "tunnel-client init produced no profile")
+    record = _manifest_record(created, tunnel_id, deps.home)
+    write_atomic(manifest_path(deps.home), (json.dumps(record) + "\n").encode(), 0o600)
+
+
+def _install_unit(deps: Deps) -> None:
+    path = unit_path(deps.home)
+    text = unit_text(deps.home)
+    if path.is_symlink():
+        raise SetupError("symlink", str(path))
+    if path.exists():
+        if path.read_text("utf-8") == text:
+            say(deps, "unit_reuse")
+        elif not confirm(deps, "unit_confirm"):
+            raise SetupError("declined")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text("utf-8") != text:
+        write_atomic(path, text.encode(), 0o644)
+    res = deps.runner(["systemd-analyze", "--user", "verify", str(path)], timeout=30.0)
+    if res.returncode != 0:
+        raise SetupError("verify_failed", result_text(res))
+
+
+def _enable_and_start(deps: Deps) -> None:
+    for argv in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", UNIT_NAME],
+    ):
+        res = deps.runner(argv, timeout=30.0)
+        if res.returncode != 0:
+            raise SetupError("systemctl_failed", result_text(res))
+    say(deps, "unit_ok")
+    res = deps.runner(["systemctl", "--user", "start", UNIT_NAME], timeout=60.0)
+    if res.returncode != 0:
+        raise SetupError("start_failed", result_text(res))
+
+
+def _decrypt_existing(deps: Deps) -> str:
+    res = deps.runner(
+        [
+            "systemd-creds",
+            "decrypt",
+            "--user",
+            f"--name={CREDENTIAL_NAME}",
+            str(credential_path(deps.home)),
+            "-",
+        ],
+        timeout=30.0,
+    )
+    key = res.stdout.decode("utf-8", "replace").strip()
+    if res.returncode != 0 or not key:
+        raise SetupError("decrypt_failed", "systemd-creds decrypt failed")
+    return key
+
+
+def _doctor(deps: Deps, key: str) -> None:
+    env = dict(deps.env)
+    env[KEY_ENV] = key
+    res = deps.runner(
+        [
+            "tunnel-client",
+            "doctor",
+            "--profile",
+            PROFILE,
+            "--profile-dir",
+            str(profiles_dir(deps.home)),
+        ],
+        env=env,
+        timeout=60.0,
+    )
+    if res.returncode != 0:
+        raise SetupError("doctor_failed", result_text(res, (key,)))
+
+
+def _health_state(deps: Deps, timeout: float) -> str:
+    """Classify tunnel health from the fixed trusted CLI; fail closed, never echo its output."""
+    res = deps.runner(
+        ["tunnel-client", "health", "--port", "8793", "--json", "--require-control-plane-poll"],
+        timeout=timeout,
+    )
+    try:
+        data = json.loads(res.stdout.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return STATE_UNAVAILABLE
+    if not isinstance(data, dict):
+        return STATE_UNAVAILABLE
+    ok = {}
+    for field in ("healthz", "readyz", "control_plane_poll"):
+        section = data.get(field)
+        ok[field] = isinstance(section, dict) and section.get("ok") is True
+    if not ok["healthz"]:
+        return STATE_UNAVAILABLE
+    if not ok["readyz"]:
+        return STATE_NOT_READY
+    if not ok["control_plane_poll"] or res.returncode != 0:
+        return STATE_AWAITING_POLL
+    return STATE_READY
+
+
+def _wait_ready(deps: Deps) -> str:
+    """Poll until ready or READY_TIMEOUT_S elapses; return the last observed state."""
+    start = deps.monotonic()
+    while True:
+        remaining = READY_TIMEOUT_S - (deps.monotonic() - start)
+        state = _health_state(deps, min(HEALTH_CMD_TIMEOUT_S, max(remaining, 1.0)))
+        remaining = READY_TIMEOUT_S - (deps.monotonic() - start)
+        if state == STATE_READY or remaining <= 0:
+            return state
+        deps.sleep(min(READY_POLL_S, remaining))
+
+
+def _say_state(deps: Deps, state: str) -> None:
+    say(deps, "state_" + state, url=HEALTH_URL)
+
+
+def run_setup(deps: Deps) -> int:
+    if not deps.is_tty():
+        print(M["no_tty"], file=deps.err)
+        return EXIT_USAGE
+    say(deps, "welcome")
+    verify_tools(deps)
+    verify_connector(deps)
+    home = deps.home
+    ensure_private_dir(setup_dir(home), home)
+    ensure_private_dir(profiles_dir(home), home)
+
+    tunnel_id = _prompt_tunnel_id(deps)
+    key: str | None = None
+    if credential_path(home).exists():
+        if confirm(deps, "cred_replace_confirm"):
+            key = _prompt_key(deps)
+        else:
+            say(deps, "cred_keep")
+    else:
+        key = _prompt_key(deps)
+    if key is not None:
+        _encrypt_and_store(deps, key)
+        say(deps, "cred_saved", path=str(credential_path(home)))
+
+    _init_profile(deps, tunnel_id)
+    say(deps, "profile_ok", profile=PROFILE)
+
+    res = deps.runner(["pm", "chatgpt", "connector", "tunnel-id", tunnel_id], timeout=30.0)
+    if res.returncode == 0:
+        say(deps, "pm_recorded")
+    else:
+        say(deps, "pm_record_failed", detail=result_text(res))
+
+    _install_unit(deps)
+
+    secret = key if key is not None else _decrypt_existing(deps)
+    try:
+        _doctor(deps, secret)
+    finally:
+        del secret
+    say(deps, "doctor_ok")
+
+    _enable_and_start(deps)
+    state = _wait_ready(deps)
+    if state != STATE_READY:
+        say(deps, "wait_expired", seconds=str(int(READY_TIMEOUT_S)))
+    _say_state(deps, state)
+    say(deps, "next_steps", unit=UNIT_NAME)
+    return EXIT_OK if state == STATE_READY else EXIT_NOT_READY
+
+
+# --------------------------------------------------------------------------- entry
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="guardian-connect",
+        description=(
+            "Set up the private Guardian MCP tunnel for ChatGPT. Interactive: asks for the "
+            "tunnel id and the restricted runtime API key (never via flags). Secrets are never "
+            "printed or stored in plaintext."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check", action="store_true", help="read-only status report; no prompts, no changes"
+    )
+    mode.add_argument(
+        "--run-service",
+        action="store_true",
+        help="systemd entry point: exec tunnel-client with the credential from the unit",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None, deps: Deps | None = None) -> int:
+    deps = deps or Deps()
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    if args.run_service:
+        return run_service(deps)
+    if args.check:
+        return run_check(deps)
+    try:
+        return run_setup(deps)
+    except SetupError as exc:
+        text = M[f"err_{exc.key}"]
+        print(text.format(detail=exc.detail) if "{detail}" in text else text, file=deps.err)
+        return exc.code
+    except (EOFError, KeyboardInterrupt):
+        print(M["aborted"], file=deps.err)
+        return EXIT_FAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,58 @@
+#!/bin/sh
+# fj-login [HOST] [OWNER/REPO]: one-command Forgejo login for fj AND git over https.
+# Runs the rig-managed `fj auth login` (OAuth, browser redirect to 127.0.0.1:26218) in a way that
+# works from SSH/agent shells too: aims the browser launch at the desktop session, frees the fixed
+# callback port first (a leftover login makes fj panic at src/auth.rs:225), prints the authorize
+# URL as a fallback, and verifies with `fj whoami` + `git ls-remote`.
+host=${1:-git.hyperide.ai}
+repo=${2:-hyperide/glide-infra}
+cd / || exit 1
+
+if timeout 20 fj --host "$host" whoami >/dev/null 2>&1; then
+  echo "fj-login: already logged in to $host"
+else
+  # A previous fj login still holds the fixed callback port; fj panics when the port is busy.
+  for p in $(pgrep -u "$(id -u)" -f 'fj.* auth login' 2>/dev/null); do
+    [ "$p" = "$$" ] || kill "$p" 2>/dev/null
+  done
+  sleep 1
+
+  # Browser launch: the desktop session is the only place a browser can be opened.
+  uid=$(id -u)
+  [ -n "${XDG_RUNTIME_DIR-}" ] || XDG_RUNTIME_DIR=/run/user/$uid
+  [ -n "${WAYLAND_DISPLAY-}${DISPLAY-}" ] || { WAYLAND_DISPLAY=wayland-0; DISPLAY=:0; }
+  [ -n "${DBUS_SESSION_BUS_ADDRESS-}" ] || DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS
+
+  shim=$(mktemp -d) || exit 1
+  trap 'rm -rf "$shim"' EXIT INT TERM
+  real=$(command -v xdg-open || echo /usr/bin/xdg-open)
+  cat >"$shim/xdg-open" <<EOF
+#!/bin/sh
+printf '%s\n' "\$1" >"$shim/url"
+exec "$real" "\$@"
+EOF
+  chmod +x "$shim/xdg-open"
+
+  echo "fj-login: Firefox opens $host; press Authorize (waits up to 10 min)"
+  PATH=$shim:$PATH timeout "${FJ_LOGIN_TIMEOUT:-600}" fj --host "$host" auth login </dev/null &
+  pid=$!
+  trap 'kill "$pid" 2>/dev/null; rm -rf "$shim"' EXIT INT TERM
+  n=0
+  while [ ! -s "$shim/url" ] && [ "$n" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.5; n=$((n + 1)); done
+  [ -s "$shim/url" ] && printf 'fj-login: if no tab opened, open this URL in Firefox ON THIS MACHINE:\n%s\n' "$(cat "$shim/url")"
+  wait "$pid"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "fj-login: fj auth login failed or timed out (rc=$rc)" >&2
+    exit "$rc"
+  fi
+fi
+
+timeout 20 fj --host "$host" whoami || { echo "fj-login: whoami failed" >&2; exit 1; }
+if timeout 60 git ls-remote "https://$host/$repo.git" HEAD; then
+  echo "fj-login: OK, git over https works for $host/$repo"
+else
+  echo "fj-login: git ls-remote failed for $host/$repo" >&2
+  exit 1
+fi
