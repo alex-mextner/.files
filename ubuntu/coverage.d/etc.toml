@@ -1,0 +1,25 @@
+# /etc findings of the ubuntu-pc scan that no engine module claims. Apt sources are the business of the apt-sources
+# module (machines/ubuntu-pc/coverage.toml); /etc/default/{keyboard,locale} are tracked through system.toml.
+
+[[coverage]]
+match = ["etc:/etc/default/grub"]
+class = "excluded"
+reason = """\
+stock Ubuntu file, nothing tuned by hand (GRUB_TIMEOUT_STYLE=hidden, GRUB_TIMEOUT=0, GRUB_CMDLINE_LINUX_DEFAULT=\
+"quiet splash"); the one extra kernel argument, crashkernel=, comes from the kdump-tools package's \
+/etc/default/grub.d/kdump-tools.cfg. Remove this rule and declare the file when a boot option is ever tuned here"""
+
+# Two areas this user cannot read. The scan reports each as one synthetic item (`etc:/etc/<conffiles>` is the id the
+# adapter gives to "conffiles that differ from their package", not a path) and cannot classify what is inside until
+# the adapter reads them with the root session.
+[[coverage]]
+match = ["etc:/etc/<conffiles>"]
+class = "untracked"
+ticket = "alex-mextner/ubuntu-tweaks#100"
+reason = "dpkg conffiles changed on this machine: `sudo dpkg --verify` names them; the etc adapter cannot read them without root and has no root-scan result yet"
+
+[[coverage]]
+match = ["etc:/etc/polkit-1/rules.d"]
+class = "untracked"
+ticket = "alex-mextner/ubuntu-tweaks#100"
+reason = "polkit rules: the memguard and passwords-app-polkit modules install their own rule files here; the directory is root-only, so those cannot be told apart from a hand-written rule until the adapter scans with root"

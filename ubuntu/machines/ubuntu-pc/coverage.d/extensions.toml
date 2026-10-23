@@ -1,0 +1,9 @@
+# The gsconnect module (engine, builtin source: the Ubuntu package ships the extension) is enabled for this PC in
+# ../machine.toml and its [extension] enable list switches the extension on at `apply`. The extensions adapter only
+# claims extensions that a module ships as source, so the module's own extension is claimed here, on the one machine
+# where the module is on. Remove this file once https://github.com/alex-mextner/ubuntu-tweaks/issues/101 is fixed.
+
+[[coverage]]
+match = ["extension:gsconnect@andyholmes.github.io"]
+class = "tracked"
+reason = "enabled by the gsconnect module's [extension] enable list"
