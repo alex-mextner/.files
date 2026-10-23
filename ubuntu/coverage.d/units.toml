@@ -16,12 +16,12 @@ reason = "written and enabled by the engine module passwords-app (its PC drop-in
 
 [[coverage]]
 match = [
-  "unit:passkey-qr-health.service", "unit:passkey-qr-health.timer", "unit:passkey-qr-prefs.service", "unit:passkey-qr-prefs.path",
+  "unit:passkey-qr-health.service", "unit:passkey-qr-health.timer", "unit:passkey-qr-prefs.service", "unit:passkey-qr-prefs.path", "unit:passkey-qr-watch.service",
   "unit:ha-ble-vhci.service",
   "unit:xyz.iinuwa.credentialsd.Credentials.service", "unit:xyz.iinuwa.credentialsd.UiControl.service",
 ]
 class = "tracked"
-reason = "written by `passkey-qr install` (engine module firefox-passkey-qr, enabled in machines/ubuntu-pc): the self-heal timer and prefs watcher, the HA Bluetooth bridge, and the self-heal drop-ins of the credentialsd services"
+reason = "written by `passkey-qr install` (engine module firefox-passkey-qr, enabled in machines/ubuntu-pc): the self-heal timer, prefs watcher and request watcher, the HA Bluetooth bridge, and the self-heal drop-ins of the credentialsd services"
 
 # rig (profile.toml [modules.rig], `rig apply commit` from rig/config.yaml) writes these.
 [[coverage]]
