@@ -1,0 +1,71 @@
+#!/bin/sh
+# finish-setup: everything on this machine that only the owner can do, in one command (the profile's launcher of
+# `ubuntu-tweak finish`). It lists what is still open, in the order it can be done, and runs the machine parts of each
+# step itself; run it again whenever it says something is left, done steps are only listed.
+#
+#   finish-setup              walk the pending steps
+#   finish-setup --dry-run    only show the list
+#   finish-setup --step ID    one step
+#   finish-setup --pause      (this launcher's own word, used by the desktop entry; it must come first) wait for Enter
+#                             at the end so a terminal opened for it stays readable; every other word goes to
+#                             `ubuntu-tweak finish`
+#
+# A desktop launch has a poor PATH: the engine is looked for on PATH, in ~/.local/bin and in the stable checkout of
+# ubuntu-tweaks ($UBUNTU_TWEAKS_DIR, ~/ubuntu-tweaks, ~/xp/ubuntu-tweaks), and ~/.local/bin is put on PATH for it (its
+# steps call gh, passwords-app and friends from there).
+pause=0
+if [ "${1:-}" = --pause ]; then
+  pause=1
+  shift
+fi
+
+# The engine is looked for before ~/.local/bin is put first on PATH: an engine the caller put earlier wins. PATH is
+# walked by hand, taking the first executable regular file: `command -v` (dash) would stop at a stale non-executable
+# copy, and an empty PATH entry means the current directory.
+engine=
+walk=$PATH
+case $walk in *:) walk=$walk. ;; esac # field splitting drops a trailing empty entry
+old_ifs=$IFS
+IFS=:
+set -f # an entry with a glob character is a literal name
+for dir in $walk; do
+  [ -n "$dir" ] || dir=.
+  if [ -f "$dir/ubuntu-tweak" ] && [ -x "$dir/ubuntu-tweak" ]; then
+    engine=$dir/ubuntu-tweak
+    break
+  fi
+done
+set +f
+IFS=$old_ifs
+if [ -z "$engine" ]; then
+  for candidate in "$HOME/.local/bin/ubuntu-tweak" "${UBUNTU_TWEAKS_DIR:-$HOME/ubuntu-tweaks}/bin/ubuntu-tweak" "$HOME/xp/ubuntu-tweaks/bin/ubuntu-tweak"; do
+    if [ -x "$candidate" ]; then
+      engine=$candidate
+      break
+    fi
+  done
+fi
+
+PATH="$HOME/.local/bin${PATH:+:$PATH}"
+export PATH
+export UBUNTU_TWEAK_FINISH_COMMAND=finish-setup
+
+if [ -z "$engine" ]; then
+  echo "finish-setup: не нашёл ubuntu-tweak (ни в PATH, ни в ~/.local/bin, ни в ${UBUNTU_TWEAKS_DIR:-$HOME/ubuntu-tweaks}/bin)." >&2
+  echo "Поставь его: curl -fsSL https://raw.githubusercontent.com/alex-mextner/ubuntu-tweaks/main/scripts/bootstrap.sh | sh -s -- --yes" >&2
+  status=127
+elif [ "$pause" = 1 ]; then
+  # The window must outlive a Ctrl+C: a caught (not ignored) SIGINT keeps this shell alive, the engine still gets it
+  # (a handler is reset to default in the child) and the summary it prints stays readable.
+  trap : INT
+  "$engine" finish --lang ru "$@"
+  status=$?
+else
+  exec "$engine" finish --lang ru "$@" # no shell in between: its exit status and its Ctrl+C handling are the engine's own
+fi
+
+if [ "$pause" = 1 ]; then
+  printf '\nГотово (код %s). Нажми Enter, чтобы закрыть окно... ' "$status"
+  read -r _
+fi
+exit "$status"
