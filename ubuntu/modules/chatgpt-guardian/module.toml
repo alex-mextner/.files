@@ -1,0 +1,25 @@
+description = "ChatGPT guardian (agent-tools): venv + chatgpt-guardian CLI, user-level Chrome when asked, two dedicated browsers (home account, glide.vc account), guardian + observer services, enrolled chats; no OpenAI API key"
+enabled = false   # a machine opts in: [modules.chatgpt-guardian] enabled = true in machines/<host>/machine.toml
+order = 130       # after rig (100) and tg-cli (120)
+manual = "log in to ChatGPT once in each guardian browser profile (home account on its debug port, glide.vc account on its private display; the profile keeps the login, the output names which one is signed out), then run apply again; the guardian tunnel (ChatGPT -> local MCP) needs an OpenAI platform API key and is NOT part of this module"
+
+# User level: writes $HOME and talks to the user's systemd, so it never runs as root. Options
+# ([modules.chatgpt-guardian] in profile.toml / machine.toml): repo, dir, package, chrome, home_port, glide_port,
+# xvfb, chats_home, chats_glide (see install.sh).
+#
+# Personal module: the two accounts (workspaces `home` and `glide.vc`), their control ports 8790/8791 and the private
+# display :111 are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
+# chrome = "user" installs a rootless Chrome from the HTTPS download of dl.google.com (Google publishes no checksum for the
+# `current` package) under ~/.local/opt and runs it with --no-sandbox (unprivileged user namespaces are AppArmor-restricted
+# and there is no setuid helper without root), through the dedicated wrapper ~/.local/bin/chatgpt-guardian-chrome that only
+# the two guardian profiles use. With root, install google-chrome-stable and keep the default instead.
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
+
+# The glide.vc browser runs on a private X display (Xvfb); mcookie and xauth come with util-linux / xauth.
+[deps]
+apt = ["xvfb", "xauth"]

@@ -1,0 +1,28 @@
+[Unit]
+Description=Read-only ChatGPT Guardian session evidence (glide.vc)
+After=chatgpt-guardian-glide-browser.service
+ConditionPathExists=%h/.config/agent-tools/chatgpt-guardian/glide.vc.json
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=PYTHONUNBUFFERED=1
+Environment=TMPDIR=%h/.cache/chatgpt-guardian-monitor
+# Playwright makes its temp dirs under TMPDIR; systemd creates the folder (a fresh machine has no ~/.cache/<it>), else connect_over_cdp fails with ENOENT.
+CacheDirectory=chatgpt-guardian-monitor
+CacheDirectoryMode=0700
+ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace glide.vc observer --cdp http://127.0.0.1:@GLIDE_PORT@ --interval 60
+Restart=on-failure
+RestartSec=60
+Nice=10
+CPUQuota=15%
+MemoryHigh=192M
+MemoryMax=384M
+TasksMax=32
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

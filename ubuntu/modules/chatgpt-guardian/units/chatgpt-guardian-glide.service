@@ -1,0 +1,26 @@
+[Unit]
+Description=ChatGPT Guardian for glide.vc - bounded confirmed continuation
+Requires=chatgpt-guardian-glide-browser.service
+After=chatgpt-guardian-glide-browser.service
+BindsTo=chatgpt-guardian-glide-browser.service
+ConditionPathExists=%h/.config/agent-tools/chatgpt-guardian/glide.vc.json
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:@GLIDE_PORT@ --poll-interval 60 --max-pages 6 --min-available-mib 2048 --control-port 8791 --private-display --apply
+Restart=on-failure
+RestartSec=60
+CPUQuota=25%
+MemoryHigh=256M
+MemoryMax=768M
+TasksMax=64
+TimeoutStopSec=45
+SendSIGKILL=no
+LogRateLimitIntervalSec=60s
+LogRateLimitBurst=30
+
+[Install]
+WantedBy=default.target
