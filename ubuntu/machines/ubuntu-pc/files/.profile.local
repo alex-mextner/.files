@@ -1,0 +1,3 @@
+# ~/.profile.local of the machine ubuntu-pc: sourced by the dotfiles ~/.profile (linked here by ubuntu-tweak).
+# Forgejo fallback host for the `fj` CLI on this PC (what the migrated ~/.profile carried as its tail).
+export FJ_FALLBACK_HOST=https://git.hyperide.ai
