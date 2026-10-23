@@ -212,10 +212,11 @@ else
     zplug_tmp=$(mktemp -d "$HOME/.zplug.XXXXXX")
     if git clone --quiet https://github.com/zplug/zplug "$zplug_tmp/zplug" \
         && git -C "$zplug_tmp/zplug" checkout --quiet "$zplug_pin" && mv "$zplug_tmp/zplug" "$HOME/.zplug"; then
-      rmdir "$zplug_tmp"
+      :
     else
-      manual "zplug did not clone at the pinned commit (network?), then re-run; leftover: $zplug_tmp"
+      manual "zplug did not clone at the pinned commit (network?), then re-run"
     fi
+    rm -rf "$zplug_tmp"
   fi
 fi
 zplug_ok() { zsh -c 'source "$HOME/.files/.zprofile" >/dev/null 2>&1; zplug check' </dev/null >/dev/null 2>&1; }
