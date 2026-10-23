@@ -9,7 +9,14 @@
 #export PATH="$HOME/.cargo/bin:$PATH"
 #source /Users/mxtnr/emsdk-portable/emsdk_env.sh
 
-export PATH="/opt/homebrew/bin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+# Homebrew: Apple Silicon, Linuxbrew, Intel; whichever exists first (nothing breaks when there is none)
+for _brew_prefix in /opt/homebrew /home/linuxbrew/.linuxbrew /usr/local; do
+  if [ -x "$_brew_prefix/bin/brew" ]; then
+    export PATH="$_brew_prefix/bin:$PATH"
+    export HOMEBREW_PREFIX="$_brew_prefix"
+    [ -d "$_brew_prefix/opt/gnu-sed/libexec/gnubin" ] && export PATH="$_brew_prefix/opt/gnu-sed/libexec/gnubin:$PATH"
+    break
+  fi
+done
+unset _brew_prefix
 export PATH="./node_modules/.bin:$PATH"
-export HOMEBREW_PREFIX=$(brew --prefix)
