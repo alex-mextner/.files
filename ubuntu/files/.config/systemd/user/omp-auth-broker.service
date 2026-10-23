@@ -1,0 +1,16 @@
+# omp auth-broker for the clvm build box (Alex tg#23281/#23282, 2026-10-21).
+# Serves this workstation's ~/.omp/agent/agent.db credentials over 127.0.0.1 only;
+# OAuth refresh tokens never leave this host (the broker hands out access tokens).
+# The box reaches it through clvm-auth-broker-tunnel.service (ssh -R).
+[Unit]
+Description=omp auth-broker (credential vault for the clvm build box)
+After=network-online.target
+
+[Service]
+ExecStart=/home/ultra/.local/bin/omp auth-broker serve --bind=127.0.0.1:18765
+Restart=always
+RestartSec=10
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Inhibit screen blanking during media playback
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/media-inhibit.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

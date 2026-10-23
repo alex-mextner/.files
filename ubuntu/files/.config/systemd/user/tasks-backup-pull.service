@@ -1,0 +1,11 @@
+# Template: scripts/tasks-backup-puller-install.sh substitutes /usr/bin/python3 and /home/ultra/.local/bin:/usr/bin:/usr/local/bin:/bin.
+[Unit]
+Description=Pull and verify the encrypted Tasks backups from bread
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=%h/.local/lib/tasks-backup
+Environment=PATH=/home/ultra/.local/bin:/usr/bin:/usr/local/bin:/bin
+ExecStart=/usr/bin/python3 -m tasks_backup.pull
+TimeoutStartSec=1h
+Nice=10

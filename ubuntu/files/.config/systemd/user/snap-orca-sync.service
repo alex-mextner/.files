@@ -1,0 +1,11 @@
+[Unit]
+Description=Merge new Snapmaker Orca releases into the Linux fork and publish them
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# omp, gh and docker are resolved from the PATH of the user who installed the timer.
+Environment=PATH=/home/ultra/.bun/bin:/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin
+ExecStart=/home/ultra/xp/snap-orca/scripts/fork-sync/check-upstream.sh
+Nice=10

@@ -1,0 +1,14 @@
+[Unit]
+Description=Moshi hook daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ultra/.local/bin/moshi serve
+Restart=always
+RestartSec=5
+Environment=PATH=/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=/tmp
+
+[Install]
+WantedBy=default.target

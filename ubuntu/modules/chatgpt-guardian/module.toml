@@ -50,3 +50,14 @@ action = "A Chrome window opens on the glide.vc profile: sign in to ChatGPT with
 action_ru = "Откроется окно Chrome с профилем glide.vc: войди в ChatGPT аккаунтом glide.vc и закрой окно; юниты стража перезапустятся и проверятся сами"
 check = ["./relogin", "check"]
 run = ["./relogin", "run"]
+
+# The seven units install.sh renders from units/ and enables. guardian-tunnel.service is not here: it is the user's own unit
+# (files/.config/systemd/user), the module only gates it off with a drop-in until a platform API key exists.
+[[coverage]]
+match = [
+  "unit:chatgpt-guardian-home.service", "unit:chatgpt-guardian-home-browser.service", "unit:chatgpt-guardian-home-observer.service",
+  "unit:chatgpt-guardian-glide.service", "unit:chatgpt-guardian-glide-browser.service", "unit:chatgpt-guardian-glide-observer.service",
+  "unit:chatgpt-guardian-glide-display.service",
+]
+class = "tracked"
+reason = "rendered from units/ and enabled by the chatgpt-guardian module"

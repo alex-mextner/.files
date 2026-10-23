@@ -23,3 +23,8 @@ reason = "the tg-cli checkout and its links: install.sh links tg and tg-ctl; tg-
 match = ["file:~/.config/tg-cli"]
 class = "tracked"
 reason = "install.sh sets control.enabled: false in config.yaml and keeps every other key; .env (TG_BOT_TOKEN, TG_CHAT_ID: restore with tg auth login or the module's manual step), the tg-ctl.* state files and the .pre-move backups are runtime state of the daemon"
+
+[[coverage]]
+match = ["unit:agenttools-tg-ctl-tg-ctl.service"]
+class = "tracked"
+reason = "the tg-ctl bot daemon unit written and enabled by the tg-cli module (its PATH drop-in path.conf too)"

@@ -1,0 +1,15 @@
+[Unit]
+Description=3D printer vision %i on ubuntu-pc (live monitoring, delivery held)
+Documentation=https://github.com/alex-mextner/3d-cli/blob/main/docs/commands/printer-vision.md
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=/home/ultra/xp/3d-cli/.venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ultra/xp/3d-cli/.venv/bin/python /home/ultra/xp/3d-cli/bin/3d printer vision %i --dry-run --verbose
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
