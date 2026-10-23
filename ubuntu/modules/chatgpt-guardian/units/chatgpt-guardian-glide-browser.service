@@ -1,0 +1,31 @@
+[Unit]
+Description=ChatGPT glide.vc browser on private display (same persistent login)
+Requires=chatgpt-guardian-glide-display.service
+# The private display (Xvfb) does not need the desktop session: this stack is wanted by default.target so a logout or a
+# linger-only boot keeps it running.
+After=chatgpt-guardian-glide-display.service
+BindsTo=chatgpt-guardian-glide-display.service
+StartLimitIntervalSec=300
+StartLimitBurst=2
+
+[Service]
+Type=simple
+UMask=0077
+WorkingDirectory=%h
+Environment=DISPLAY=:111
+Environment=XAUTHORITY=%t/chatgpt-guardian-glide-display/Xauthority
+UnsetEnvironment=WAYLAND_DISPLAY
+# Xvfb is Type=simple (no readiness signal): wait for its socket so the first start does not race it.
+ExecStartPre=/usr/bin/bash -c 'for i in $(seq 100); do [ -S /tmp/.X11-unix/X111 ] && exit 0; sleep 0.2; done; exit 1'
+ExecStart=@CHROME@ --user-data-dir=%h/.local/share/agent-tools/chatgpt-guardian/profiles/glide.vc --remote-debugging-address=127.0.0.1 --remote-debugging-port=@GLIDE_PORT@ --ozone-platform=x11 --no-first-run --restore-last-session --start-maximized --window-size=1280,1000
+Restart=on-failure
+RestartSec=60
+CPUQuota=200%
+MemoryHigh=3G
+MemoryMax=4G
+TasksMax=512
+TimeoutStopSec=45
+SendSIGKILL=no
+
+[Install]
+WantedBy=default.target
