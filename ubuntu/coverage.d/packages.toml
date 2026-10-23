@@ -1,0 +1,33 @@
+# Coverage rules for packages (`ubuntu-tweak coverage`, adapter `packages`). What packages.toml names is tracked by itself;
+# these are the packages another declared tool installs, and the ones that are not configuration. The apt/snap baseline the
+# installer put on the machine is excluded by the engine (it runs capture's own scan).
+
+[[coverage]]
+match = ["apt:openssh-server"]
+class = "tracked"
+reason = "installed by the ssh-server module (`ssh-server install`), which also configures and starts it"
+
+[[coverage]]
+match = ["apt:tailscale-archive-keyring"]
+class = "excluded"
+reason = "the vendor's keyring package, pulled in with tailscale; the repository key itself is the apt-sources module's (profile.toml [modules.apt-sources.sources.tailscale])"
+
+[[coverage]]
+match = ["uv:sendspin"]
+class = "tracked"
+reason = "installed by the sendspin-player module's `sendspin-tool` post (`uv tool install sendspin`), enabled in machines/ubuntu-pc"
+
+[[coverage]]
+match = ["uv:hyper-rig"]
+class = "tracked"
+reason = "the rig CLI: the rig module clones rig-cli and links ~/.local/bin/rig; this uv tool is an editable install of the same checkout (~/dev/rig-cli)"
+
+[[coverage]]
+match = ["brew:vale"]
+class = "tracked"
+reason = "installed by rig for the text-lint tool (rig/config.yaml tools.items.text-lint.brew)"
+
+[[coverage]]
+match = ["brew:gh"]
+class = "excluded"
+reason = "a second copy: git and its credential helper use ~/.local/bin/gh (the rootless ~/.local/opt/gh), and the git-gh module installs gh from apt where root exists"

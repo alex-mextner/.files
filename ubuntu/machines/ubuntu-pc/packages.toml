@@ -1,5 +1,50 @@
+# Packages only this PC gets, on top of ../../packages.toml (lists union). Reasons are the trailing comments.
+
 apt = [
+  # --- the machine ---
   # The docker nvidia runtime for the RTX 4060. Repository: apt-sources `nvidia-container-toolkit`; docker-daemon adds
   # runtimes.nvidia once the binary exists (the same apply: apt-sources runs first, then this batch, then docker-daemon).
   "nvidia-container-toolkit",
+  "nvidia-driver-595-open",   # the RTX 4060's driver (open kernel modules, 595 branch); Whisper STT and the docker nvidia runtime need it
+  "efibootmgr",               # UEFI boot entries of this PC; installed deliberately
+  "apt-file",                 # `apt-file search` to find which package ships a file; installed deliberately
+
+  # --- docker: this PC runs Ubuntu's docker.io (the laptop had docker-ce from the docker repository; the apt-sources module
+  # --- declares that repository, switched off here) ---
+  "docker.io",                # docker engine 29.1.3; /etc/docker/daemon.json is the docker-daemon module's
+  "docker-compose-v2",        # `docker compose`
+
+  # --- build dependencies of the checkouts in ~/xp: credentialsd (passkey QR, BUILDING.md), libdex and blueprint-compiler.
+  # --- The firefox-passkey-qr installer also installs missing build dependencies itself while it builds them; they are listed
+  # --- here too so a manual rebuild in ~/xp works on a fresh machine without it ---
+  "meson",                    # credentialsd, libdex and blueprint-compiler build with Meson
+  "ninja-build",              # Meson's backend
+  "gettext",                  # credentialsd (BUILDING.md)
+  "systemd-dev",              # build dependency of the ~/xp credentialsd checkout (systemd pkg-config files)
+  "python3-dbus-next",        # credentialsd's web-extension dependency (BUILDING.md)
+  "blueprint-compiler",       # build tool of the ~/xp checkouts (its own checkout ~/xp/blueprint-compiler is a sibling)
+  "libclang-dev",             # build dependency of the ~/xp Rust checkouts (bindgen)
+  "libssl-dev",               # credentialsd (BUILDING.md)
+  "libdbus-1-dev",            # credentialsd (BUILDING.md)
+  "libnfc-dev",               # credentialsd (BUILDING.md)
+  "libpcsclite-dev",          # credentialsd (BUILDING.md)
+  "libudev-dev",              # credentialsd (BUILDING.md)
+  "libgtk-4-dev",             # credentialsd (BUILDING.md)
+  "libadwaita-1-dev",         # build dependency of the ~/xp libdex / blueprint-compiler / credentialsd UI work
+  "libdex-dev",               # build dependency of the ~/xp checkouts (libdex has its own checkout ~/xp/libdex)
+  "libflatpak-dev",           # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libfuse3-dev",             # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libgeoclue-2-dev",         # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libgstreamer-plugins-base1.0-dev",  # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libgudev-1.0-dev",         # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libjson-glib-dev",         # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libpipewire-0.3-dev",      # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libwireplumber-0.5-dev",   # build dependency of the ~/xp libdex / credentialsd checkouts
+  "libxml2-utils",            # build dependency of the same ~/xp checkouts (xmllint)
+]
+
+# Snaps on this PC: 1Password is the snap here (the laptop had the deb from 1password's repository, which is switched off in machine.toml).
+snap = [
+  "1password",          # password manager (8.11.14 snap)
+  "telegram-desktop",   # Telegram desktop; tg:// links open in it (mimeapps.list)
 ]
