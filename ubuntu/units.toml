@@ -1,0 +1,17 @@
+# systemd USER units the profile turns on (engine: planners/units.py; spec docs/specs/ubuntu-tweak-cli.md, `units.toml`).
+# The unit files and drop-ins are leaves of files/.config/systemd/user (shared) and of
+# machines/<host>/files/.config/systemd/user; apply links them and then enables/starts what is listed here
+# (machines/<host>/units.toml adds to this list).
+#
+# Only a unit whose executable apply can provide is enabled: a package of packages.toml, a script of files/.local/bin, a
+# system program. The user's other services are linked but stay off until their code has a declared source
+# (https://github.com/alex-mextner/.files/issues/58, which lists them); they keep running where they run, apply never
+# removes. Units a module or rig writes and enables are claimed in coverage.d/units.toml and the modules' own module.toml.
+# Credentials the units read stay in local files (EnvironmentFile= targets, credential blobs), never in this repository.
+
+enable = [
+  "media-inhibit.service",   # keeps the screen awake while a player plays; script files/.local/bin/media-inhibit.sh, playerctl in packages.toml
+]
+
+# Global, not per machine: user units start at boot and survive logout (tg-ctl, the tmux server of tmux-boot, the guardian).
+linger = true

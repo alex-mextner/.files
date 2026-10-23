@@ -1,0 +1,22 @@
+[Unit]
+Description=HSW editor WIP preview (daemon on loopback, proxy on tailnet IP)
+After=network-online.target tailscaled.service
+
+[Service]
+WorkingDirectory=%h/.cache/hsw-editor/preview/current/src
+ExecStart=%h/.local/bin/bun apps/server/src/preview.ts
+Restart=always
+RestartSec=2
+Environment=PATH=/home/ultra/.local/bin:/home/ultra/.local/bin:/home/ultra/.bun/bin:/home/ultra/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.nvm/versions/node/v24.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+Environment=HSW_EDITOR_HOME=%h/.cache/hsw-editor/preview/home
+Environment=HSW_EDITOR_DATA_DIR=%h/.cache/hsw-editor/preview/home/data
+Environment=HSW_EDITOR_CACHE_DIR=%h/.cache/hsw-editor/preview/home/cache
+Environment=HSW_BANK_DIR=%h/.cache/hsw-editor/preview/home/data/bank
+Environment=HSW_EDITOR_PORT=8944
+Environment=HSW_EDITOR_HOST=127.0.0.1
+Environment=HSW_EDITOR_WEB_DIST=%h/.cache/hsw-editor/preview/current/src/apps/web/dist
+Environment=HSW_PREVIEW_PUBLIC_HOST=100.75.131.84
+Environment=HSW_PREVIEW_PUBLIC_PORT=8943
+
+[Install]
+WantedBy=default.target

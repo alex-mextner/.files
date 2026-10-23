@@ -1,0 +1,10 @@
+[Unit]
+Description=Stream ODROID kernel log, warnings and health metrics to ~/odroid-logs
+
+[Service]
+ExecStart=%h/.local/bin/odroid-remote-log
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

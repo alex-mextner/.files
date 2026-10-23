@@ -23,3 +23,14 @@ preview = "install.sh --plan"
 # The glide.vc browser runs on a private X display (Xvfb); mcookie and xauth come with util-linux / xauth.
 [deps]
 apt = ["xvfb", "xauth"]
+
+# The seven units install.sh renders from units/ and enables. guardian-tunnel.service is not here: it is the user's own unit
+# (files/.config/systemd/user), the module only gates it off with a drop-in until a platform API key exists.
+[[coverage]]
+match = [
+  "unit:chatgpt-guardian-home.service", "unit:chatgpt-guardian-home-browser.service", "unit:chatgpt-guardian-home-observer.service",
+  "unit:chatgpt-guardian-glide.service", "unit:chatgpt-guardian-glide-browser.service", "unit:chatgpt-guardian-glide-observer.service",
+  "unit:chatgpt-guardian-glide-display.service",
+]
+class = "tracked"
+reason = "rendered from units/ and enabled by the chatgpt-guardian module"

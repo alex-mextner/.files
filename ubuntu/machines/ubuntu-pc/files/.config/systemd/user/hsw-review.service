@@ -1,0 +1,10 @@
+[Unit]
+Description=HSW local review page on ubuntu-pc
+[Service]
+Type=simple
+WorkingDirectory=/home/ultra/dev/garage-band/projects/HSW
+ExecStart=/usr/bin/python3 -u -m http.server 8767 --bind 127.0.0.1 --directory /home/ultra/dev/garage-band/projects/HSW
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=default.target

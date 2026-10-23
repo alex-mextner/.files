@@ -1,0 +1,13 @@
+[Unit]
+Description=HSW local no-tools reflection on ubuntu-pc
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ultra/xp/garage-band/projects/HSW
+Environment=PATH=/home/ultra/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -B /home/ultra/xp/garage-band/projects/HSW/operations/heartbeat.py --config /home/ultra/xp/garage-band/projects/HSW/operations/heartbeat-live-config.json
+TimeoutStartSec=210
+KillMode=control-group
+UMask=0077
+Nice=10

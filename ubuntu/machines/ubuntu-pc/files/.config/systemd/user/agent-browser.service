@@ -1,0 +1,17 @@
+[Unit]
+Description=agent-browser daemon (browser automation CLI backend)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/linuxbrew/.linuxbrew/lib/node_modules/agent-browser/bin/agent-browser-linux-x64
+Environment=AGENT_BROWSER_ARGS=--no-sandbox
+Environment=AGENT_BROWSER_DAEMON=1
+Environment=AGENT_BROWSER_SESSION=default
+Environment=AGENT_BROWSER_SESSION_NAME=ha-rutracker
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

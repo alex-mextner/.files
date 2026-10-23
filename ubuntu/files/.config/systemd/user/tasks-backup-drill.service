@@ -1,0 +1,13 @@
+# Template: scripts/tasks-backup-puller-install.sh fills in the ssh path.
+# The user manager keeps the groups it started with, so a docker group granted later never reaches
+# its units. A loopback login re-reads the group database; the key's forced command (set by the
+# installer in authorized_keys) runs tasks_backup.drill (niced, bounded to 2h) with the new groups
+# and returns its exit status. `systemctl stop` ends only the ssh client: the drill finishes on its
+# own, at the latest when the forced command's 2h bound TERMs it.
+[Unit]
+Description=Restore drill of the newest pulled Tasks backup into a throwaway postgres
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh -T -F none -i %h/.config/tasks-backup/drill_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%h/.config/tasks-backup/loopback.known_hosts -o HostKeyAlgorithms=ssh-ed25519 %u@127.0.0.1
+TimeoutStartSec=2h10min

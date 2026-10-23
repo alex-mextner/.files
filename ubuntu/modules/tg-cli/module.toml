@@ -12,3 +12,8 @@ root = false
 install = "install.sh"
 check = "install.sh --check"
 preview = "install.sh --plan"
+
+[[coverage]]
+match = ["unit:agenttools-tg-ctl-tg-ctl.service"]
+class = "tracked"
+reason = "the tg-ctl bot daemon unit written and enabled by the tg-cli module (its PATH drop-in path.conf too)"

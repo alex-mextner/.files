@@ -1,0 +1,46 @@
+# Coverage rules for systemd USER units (`ubuntu-tweak coverage`, adapter `units`). The user's own services are tracked by
+# files/ (their unit files are adopted) and units.toml; what is below is what another tool writes or what is not
+# configuration. Units of the PROFILE's modules are claimed in those modules' own module.toml (chatgpt-guardian, tg-cli,
+# sendspin-player, tmux-boot).
+
+# Engine modules: each writes and enables its own units; the engine modules carry no coverage rule of their own yet.
+[[coverage]]
+match = ["unit:autoheal.service", "unit:autoheal.timer"]
+class = "tracked"
+reason = "written and enabled by the engine module autoheal"
+
+[[coverage]]
+match = ["unit:passwords-appd.service"]
+class = "tracked"
+reason = "written and enabled by the engine module passwords-app (its PC drop-in 90-pc.conf is in machines/ubuntu-pc/files)"
+
+[[coverage]]
+match = [
+  "unit:passkey-qr-health.service", "unit:passkey-qr-health.timer", "unit:passkey-qr-prefs.service", "unit:passkey-qr-prefs.path",
+  "unit:ha-ble-vhci.service",
+  "unit:xyz.iinuwa.credentialsd.Credentials.service", "unit:xyz.iinuwa.credentialsd.UiControl.service",
+]
+class = "tracked"
+reason = "written by `passkey-qr install` (engine module firefox-passkey-qr, enabled in machines/ubuntu-pc): the self-heal timer and prefs watcher, the HA Bluetooth bridge, and the self-heal drop-ins of the credentialsd services"
+
+# rig (profile.toml [modules.rig], `rig apply commit` from rig/config.yaml) writes these.
+[[coverage]]
+match = ["unit:ai.hyperide.sysmon.service"]
+class = "tracked"
+reason = "rig-managed (rig/config.yaml `sysmon:`, header of the unit file); the PC's python path override is machines/ubuntu-pc/files/.config/systemd/user/ai.hyperide.sysmon.service.d/90-pc.conf"
+
+[[coverage]]
+match = ["unit:ai.hyperide.model-freshness.service", "unit:ai.hyperide.model-freshness.timer"]
+class = "tracked"
+reason = "written by rig for the agent-tools model-freshness check (`rig apply commit`; rig leaves *.rig-bak-* copies when it rewrites them)"
+
+# Not configuration.
+[[coverage]]
+match = ["unit:hsw-heartbeat-20261021.service", "unit:hsw-heartbeat-20261021.timer"]
+class = "excluded"
+reason = "a one-off finite timer whose last OnCalendar was 2026-10-22 06:00 UTC; it is disabled and can never fire again (the recurring one is hsw-heartbeat.timer)"
+
+[[coverage]]
+match = ["unit:remotemouse.service"]
+class = "excluded"
+reason = "disabled on both machines and the RemoteMouse app (~/.local/share/RemoteMouse) was never part of the profile; install the app first, then adopt the unit"
