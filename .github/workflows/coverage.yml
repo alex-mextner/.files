@@ -1,0 +1,79 @@
+# Coverage gate for the ubuntu/ profile (GitHub Actions). The rule semantics are in ubuntu/README.md, "Coverage".
+#
+# WHAT IT RUNS: `ubuntu-tweak coverage --check-profile --online` of the engine (alex-mextner/ubuntu-tweaks) against
+# ubuntu/. It is STATIC: it scans no machine and writes nothing; it fails with exit 2 and lists every problem of the
+# rule files (missing reason or ticket, a glob that matches nothing, a duplicate pattern, a missing or closed ticket).
+#
+# WHAT IT CANNOT CHECK: the live scan. `ubuntu-tweak coverage` needs the real machine (its dconf, $HOME, packages,
+# systemd units, /etc), so a runner cannot run it. The live gate is `ubuntu-tweak coverage` exiting 0 on the machine;
+# `ubuntu-tweak status` prints the same summary and the autoheal timer re-runs `apply`.
+#
+# WHEN: on PRs and pushes to master that touch ubuntu/ or this file, and once a week. `--online` makes the result
+# depend on the tickets, not only on the files: closing a ticket that an `untracked` rule names turns the check red
+# even though no file changed, so the weekly run shows that on its own instead of in an unrelated PR.
+#
+# PINNED: the engine is checked out at the commit below (the one the rules were written against), so a new engine
+# default cannot turn this gate red on its own. Bump it together with the profile when an engine change is wanted.
+# The actions are pinned to full commit SHAs as in secret-scan.yml.
+#
+# PERMISSIONS: contents: read for the checkouts; issues: read only so that `--online` can ask `gh issue view` about a
+# ticket written `#N`, which is a ticket of this (private) repository. The workflow token reaches no other private
+# repository: a ticket `owner/repo#N` must be in a public one (the engine's is).
+
+name: coverage
+
+on:
+  pull_request:
+    paths:
+      - "ubuntu/**"
+      - ".github/workflows/coverage.yml"
+  push:
+    branches: [master]
+    paths:
+      - "ubuntu/**"
+      - ".github/workflows/coverage.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions: {}
+
+env:
+  ENGINE_REPOSITORY: alex-mextner/ubuntu-tweaks
+  # ubuntu-tweaks main at #111 (coverage.d, ticketed untracked rules, `coverage --check-profile --online`, adapter classification)
+  ENGINE_REF: "07adc5dc953dbd9ee71597377ddf6a54924d21f8"
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-profile:
+    name: coverage rules (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout the profile
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the engine
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ env.ENGINE_REF }}
+          path: engine
+          persist-credentials: false
+
+      - name: Install PyGObject (as the engine's own CI does)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-gi
+
+      - name: ubuntu-tweak coverage --check-profile --online
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: engine/bin/ubuntu-tweak coverage --check-profile --online --profile ubuntu --plain
