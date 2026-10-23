@@ -171,9 +171,18 @@ module beats engine defaults, and a declared item is tracked whatever a rule say
 `coverage.d/dconf.toml` (dock keys that the hyperdock module migrates), `coverage.d/etc.toml` (stock grub; the two
 root-only `/etc` areas, ticketed), `machines/ubuntu-pc/coverage.d/extensions.toml` (the gsconnect claim).
 
-The gate on the machine: `ubuntu-tweak coverage` exits 0 when no untracked finding lacks a ticket;
-`ubuntu-tweak status` ends with the same summary line, and the autoheal timer re-runs `apply`, which
-reconciles everything tracked. The scan needs the live machine, so it cannot run in CI.
+Two gates:
+
+- **On the machine (the live gate).** `ubuntu-tweak coverage` exits 0 when no untracked finding lacks a ticket;
+  `ubuntu-tweak status` ends with the same summary line, and the autoheal timer re-runs `apply`, which
+  reconciles everything tracked. The scan needs the live machine (its dconf, `$HOME`, packages, units, `/etc`), so
+  it cannot run on a CI runner.
+- **In CI (the static gate).** `.github/workflows/coverage.yml` runs
+  `ubuntu-tweak coverage --check-profile --online --profile ubuntu` of the engine (checked out at a pinned commit)
+  on every PR and push that touches `ubuntu/`. It scans no machine; it fails (exit 2, every problem listed) when a
+  rule file does not parse, an `excluded` or `secret` rule has no reason, an `untracked` rule has no ticket or no
+  reason, a glob cannot match any item id, a pattern is listed twice, or a ticket is missing or closed. Bump the
+  engine commit in the workflow together with the profile when an engine change is wanted.
 
 Open engine gaps the profile waits on: root-only `/etc` areas cannot be classified
 (alex-mextner/ubuntu-tweaks#100), and the extensions adapter does not claim an extension a builtin module enables
