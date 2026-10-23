@@ -140,6 +140,14 @@ class GhosttyUser(unittest.TestCase):
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn("sudo apt update", res.stderr)
 
+    def test_progress_lines_with_404_in_them_do_not_hide_a_network_failure(self):
+        res = self.run_script(APT_FAIL="Get:1 http://archive.ubuntu.com ghostty amd64 1.3.0 [3,404 kB]\nE: Failed to fetch http://x  Temporary failure resolving 'archive.ubuntu.com'")
+        self.assertEqual(res.returncode, 75, res.stdout + res.stderr)
+
+    def test_an_unreachable_mirror_is_transient(self):
+        res = self.run_script(APT_FAIL="E: Failed to fetch http://x  Could not connect to archive.ubuntu.com:80 - connect (101: Network is unreachable)")
+        self.assertEqual(res.returncode, 75, res.stdout + res.stderr)
+
     def test_a_downloaded_ghostty_that_does_not_start_replaces_nothing(self):
         self.run_script()
         with open(self.user_files()["wrapper"], "w") as fh:

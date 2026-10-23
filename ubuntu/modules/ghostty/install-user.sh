@@ -96,13 +96,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 if ! ( cd "$tmp" && apt-get download ghostty libgtk4-layer-shell0 ) >"$tmp/apt.log" 2>&1; then
     cat "$tmp/apt.log" >&2
-    # exit 75 (EX_TEMPFAIL) = the engine retries with backoff, for resolver / connection causes only. A 404 (the lists name a
-    # version the mirror dropped: only `apt update`, i.e. root, fixes that), no universe, an unknown package: final.
-    if grep -qiE '404|not found' "$tmp/apt.log"; then
-        echo "install-user.sh: the package lists are stale (404): run \`sudo apt update\`" >&2
+    # exit 75 (EX_TEMPFAIL) = the engine retries with backoff, for resolver / connection causes only (checked first: the log also
+    # holds apt's progress lines). A "404 Not Found" (the lists name a version the mirror dropped: only `apt update`, i.e. root,
+    # fixes that), no universe, an unknown package: final.
+    if grep -qiE 'could not resolve|temporary failure|connection failed|could not connect|network is unreachable|no route to host|timed out|connection (reset|refused)|could not get lock' "$tmp/apt.log"; then exit 75; fi
+    if grep -qE '404[[:space:]]+Not Found' "$tmp/apt.log"; then
+        echo "install-user.sh: the package lists are stale (404 Not Found): run \`sudo apt update\`" >&2
         exit 1
     fi
-    if grep -qiE 'could not resolve|temporary failure|connection failed|timed out|connection (reset|refused)|could not get lock' "$tmp/apt.log"; then exit 75; fi
     echo "install-user.sh: apt-get download failed (package lists without universe?)" >&2
     exit 1
 fi
@@ -117,17 +118,28 @@ version=$(LD_LIBRARY_PATH="$stage_lib" "$stage/usr/bin/ghostty" --version 2>&1) 
     echo "install-user.sh: the downloaded Ghostty does not start on this host, nothing was replaced: $version" >&2
     exit 1
 }
-# Swap the tree in as one step so a failed run never leaves a half-extracted prefix.
+# Swap the tree in; the old copy (and wrapper) stay until the new launcher has started once, so a launcher that does not
+# work at its final location rolls back instead of leaving a broken ghostty.
 mkdir -p "$(dirname "$PREFIX")" "$BIN" "$APPS"
 rm -rf "$PREFIX.new" "$PREFIX.old"
 mv "$stage" "$PREFIX.new"
 [ -e "$PREFIX" ] && mv "$PREFIX" "$PREFIX.old"
 mv "$PREFIX.new" "$PREFIX"
-rm -rf "$PREFIX.old"
+rm -f "$WRAPPER.old"
+[ -f "$WRAPPER" ] && cp -p "$WRAPPER" "$WRAPPER.old"
 wrapper_text > "$WRAPPER.tmp"
 chmod 755 "$WRAPPER.tmp"
 mv "$WRAPPER.tmp" "$WRAPPER"
+if ! launched=$("$WRAPPER" --version 2>&1); then
+    echo "install-user.sh: the new launcher does not start, rolling back: $launched" >&2
+    rm -rf "$PREFIX"
+    if [ -e "$PREFIX.old" ]; then mv "$PREFIX.old" "$PREFIX"; fi
+    if [ -f "$WRAPPER.old" ]; then mv "$WRAPPER.old" "$WRAPPER"; else rm -f "$WRAPPER"; fi
+    exit 1
+fi
+rm -rf "$PREFIX.old"
+rm -f "$WRAPPER.old"
 entry_text > "$ENTRY.tmp"
 mv "$ENTRY.tmp" "$ENTRY"
-echo "installed: $(printf '%s\n' "$version" | sed -n 1p)"
+echo "installed: $(printf '%s\n' "$launched" | sed -n 1p)"
 check

@@ -74,7 +74,7 @@ if ! has_checkout; then
     # 75 = retry with backoff, for resolver / connection causes only. "unable to access" alone is every HTTP failure,
     # so an HTTP 4xx (forbidden, not found) and anything else (bad URL, no access) is final.
     if ! grep -qiE 'returned error: 4[0-9][0-9]|authentication failed|could not read (username|password)' "$log" \
-       && grep -qiE 'could not resolve|timed out|connection (reset|refused|timed out)|temporary failure|failed to connect' "$log"; then exit 75; fi
+       && grep -qiE 'could not resolve|timed out|connection (reset|refused|timed out)|temporary failure|failed to connect|returned error: 5[0-9][0-9]|early eof|rpc failed|ssl_error_syscall|gnutls_handshake|network is unreachable|no route to host' "$log"; then exit 75; fi
     exit 1
   fi
 fi
