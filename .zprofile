@@ -3,8 +3,13 @@
 # __zplug::utils::ansi::remove:17: maximum nested function level reached; increase FUNCNEST?
 FUNCNEST=1500
 #export ZPLUG_HOME=/usr/local/opt/zplug
-export ZPLUG_HOME=/opt/homebrew/opt/zplug
-source $ZPLUG_HOME/init.zsh
+export ZPLUG_HOME="${HOMEBREW_PREFIX:-/opt/homebrew}/opt/zplug"
+# zplug is optional (brew install zplug): without it the zplug lines below are no-ops, nothing errors
+if [ -r "$ZPLUG_HOME/init.zsh" ]; then
+  source "$ZPLUG_HOME/init.zsh"
+else
+  zplug() { :; }
+fi
 
 # zplug load # --verbose
 # see bottom

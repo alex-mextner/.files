@@ -55,8 +55,18 @@ alias %=' '
 
 
 
-eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
-# eval "$(/opt/homebrew/bin/brew shellenv)"
+[ -n "${HOMEBREW_PREFIX:-}" ] && [ -x "$HOMEBREW_PREFIX/bin/brew" ] && eval "$("$HOMEBREW_PREFIX/bin/brew" shellenv)"
 
-. "$HOME/.cargo/env"
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 export LANG=en_US.UTF-8
+
+#
+# Linux login shells (the Ubuntu default ~/.profile did these; a bash login reads only this file)
+#
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+[ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
+[ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
+
+# Machine-local settings (not in this repository: ubuntu-tweaks links ~/.profile.local from the profile's
+# machines/<host>/files/, or write it by hand)
+[ -f "$HOME/.profile.local" ] && . "$HOME/.profile.local"
