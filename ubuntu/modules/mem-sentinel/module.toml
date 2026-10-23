@@ -1,0 +1,51 @@
+description = "mem-sentinel (agent-tools): per-omp-session memory watchdog, the first line of defence before earlyoom; installed from an agent-tools checkout, tuned per machine, rootless copy as failover"
+enabled = true
+order = 150   # after the other profile modules; it needs only a checkout of agent-tools and python3
+
+# Root module: /usr/local/sbin/mem-sentinel, /etc/systemd/system/mem-sentinel.service (both copied from the checkout's
+# ops/mem-sentinel/), a unit drop-in that names the desktop user and carries the machine's tunables, the log rotation,
+# the service. The code is NOT kept in this repository: the source of truth is agent-tools
+# (https://git.hyperide.ai/ultrabricks/agent-tools, ops/mem-sentinel/). Run through the engine's RootSession by
+# `ubuntu-tweak apply --commit`; `check` and `plan` need no root and no network.
+#
+# Options ([modules.mem-sentinel] in profile.toml / machine.toml), all optional; see the header of `mem-sentinel`:
+#   dir            the agent-tools checkout            (default ~/dev/agent-tools)
+#   ref            git ref installed from              (default origin/main: a WIP branch of the checkout never reaches root)
+#   repo           clone URL when `dir` is missing     (default https://git.hyperide.ai/ultrabricks/agent-tools.git)
+#   repo_fallback  a second clone URL                  (default none: the GitHub copy lags behind and has no ops/mem-sentinel)
+#   source_dir     a directory with mem_sentinel.py and mem-sentinel.service (last resort when no checkout is reachable)
+#   env            table of MEM_SENTINEL_<NAME> tunables for this machine, each validated against the sentinel's own CONFIG
+#
+# The laptop installed the same files by hand (ops/mem-sentinel/install.sh) and compared byte for byte with agent-tools
+# main on 23 Oct 2026: identical (31379 bytes). What it hardcoded and this module does not: the desktop user. The
+# sentinel's default user is the literal `ultra` (agent-tools ticket 986); here MEM_SENTINEL_USER and MEM_SENTINEL_UID
+# are rendered from the account that ran `apply` (SUDO_USER / PKEXEC_UID).
+[source]
+kind = "system"
+root = true
+install = "mem-sentinel install"
+check = "mem-sentinel check"
+preview = "mem-sentinel plan"
+
+# No root: the same script as a user unit (~/.config/systemd/user/mem-sentinel.service). Every omp session lives in the
+# desktop user's own cgroup tree, which is all the sentinel watches; what the user copy lacks is only the real-time
+# priority and memory lock of the system unit. It does not start once /usr/local/sbin/mem-sentinel exists.
+[[fallback]]
+install = "mem-sentinel install-user"
+root = false
+description = "mem-sentinel as a user unit (no root): ~/.local/lib/mem-sentinel and ~/.config/systemd/user"
+
+[[coverage]]
+match = [
+  "etc:/usr/local/sbin/mem-sentinel",
+  "etc:/etc/systemd/system/mem-sentinel.service*",
+  "etc:/etc/logrotate.d/mem-sentinel",
+  "etc:/etc/mem-sentinel*",
+]
+class = "tracked"
+reason = "installed from agent-tools by the mem-sentinel module"
+
+[[coverage]]
+match = ["file:~/.local/lib/mem-sentinel*", "file:~/.config/systemd/user/mem-sentinel.service"]
+class = "tracked"
+reason = "the rootless copy of the mem-sentinel module"
