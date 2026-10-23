@@ -300,3 +300,62 @@ match = [
 class = "untracked"
 reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv); the units are declared but not enabled until this lands"
 ticket = "alex-mextner/.files#58"
+
+# links and leftovers whose owner is declared elsewhere (packages.toml uv/npm lists) or that hold nothing to track
+[[coverage]]
+match = [
+  "file:~/.local/bin/aiw-ru",
+  "file:~/.local/bin/esp_rfc2217_server",
+  "file:~/.local/bin/esp_rfc2217_server.py",
+  "file:~/.local/bin/espefuse",
+  "file:~/.local/bin/espefuse.py",
+  "file:~/.local/bin/esphome",
+  "file:~/.local/bin/espsecure",
+  "file:~/.local/bin/espsecure.py",
+  "file:~/.local/bin/esptool",
+  "file:~/.local/bin/esptool.py",
+  "file:~/.local/bin/git-filter-repo",
+  "file:~/.local/bin/glances",
+  "file:~/.local/bin/netprint",
+  "file:~/.local/bin/py-spy",
+  "file:~/.local/bin/slop-check",
+  "file:~/.local/bin/text-lint",
+  "file:~/.local/bin/trafilatura",
+]
+class = "excluded"
+reason = "link created by `uv tool install`; the tool is declared in packages.toml `uv` (aiw-ru, esphome, esptool, git-filter-repo, glances, netprint, py-spy, hyper-text-lint, trafilatura)"
+
+[[coverage]]
+match = ["file:~/.local/bin/agent-browser", "file:~/.local/bin/codex", "file:~/.local/bin/opencode"]
+class = "excluded"
+reason = "link created by `npm install -g` (prefix ~/.local); the package is declared in packages.toml `npm` (agent-browser, @openai/codex, opencode-ai)"
+
+[[coverage]]
+match = ["file:~/.local/bin/corepack", "file:~/.local/bin/pnpm", "file:~/.local/bin/pnpx", "file:~/.local/bin/yarn", "file:~/.local/bin/yarnpkg"]
+class = "excluded"
+reason = "corepack shims that ship with the node copy under ~/.local/opt/node (declared by ticket #59); `corepack enable` recreates them"
+
+[[coverage]]
+match = [
+  "file:~/.config/gtk-4.0",
+  "file:~/.config/matplotlib",
+  "file:~/.config/nautilus",
+  "file:~/.config/procps",
+  "file:~/.config/task",
+  "file:~/.config/tasks-app-linear-sync",
+  "file:~/.config/thefuck",
+  "file:~/.config/update-notifier",
+  "file:~/.config/vale",
+  "file:~/.config/vercel-plugin",
+  "file:~/.local/share/backgrounds",
+  "file:~/.local/share/ibus-table",
+  "file:~/.local/share/nano",
+  "file:~/.local/share/sounds",
+]
+class = "excluded"
+reason = "empty directory an application created at its first start: nothing in it to track"
+
+[[coverage]]
+match = ["file:~/.config/.gsd-keyboard.settings-ported", "file:~/.config/enchant", "file:~/.config/blender", "file:~/.local/share/systemd"]
+class = "excluded"
+reason = "app markers and caches: the gnome-settings-daemon keyboard-ported marker, empty enchant dictionaries, the Blender extensions cache, systemd's persistent-timer stamp files"
