@@ -219,6 +219,17 @@ concept, that tool already reports it as unsupported off macOS (`rig status`, `r
 | macOS Dock, Finder and system preference plists (`com.apple.*.plist`) | not on the Mac disk at all (only LaunchAgents are there) | GNOME settings bundles (`settings/`), `hyperdock` |
 | `org.virtualbox.vboxwebsrv`, `homebrew.mxcl.redis` (present on the Mac, not loaded at backup time) | Mac-side services nothing on Linux depends on | none; `redis-server` is not installed on this PC |
 
+## Apt repositories and docker
+
+`profile.toml` declares every extra apt repository once (`[modules.apt-sources.sources.<name>]`: URIs, suites, the key URL
+and the **pinned primary-key fingerprint**; a key whose fingerprint differs is refused, `apt-key` is never used). Each
+machine switches off the ones it must not get with `enabled = false` and a reason, in its `machine.toml` (the table form
+merges key by key, so that is all it has to say). `ubuntu-tweak apply` previews the exact files and diffs;
+`machines/ubuntu-pc/coverage.toml` lists the source files the module owns for that machine. Docker's `daemon.json` and the
+memory cap of all containers (`[modules.docker-daemon]`) are per machine because the cap depends on its RAM.
+Both are engine modules that are disabled by default in the engine;
+`profile.toml` enables `apt-sources` and `machine.toml` enables `docker-daemon`.
+
 ## Secrets
 
 Never store secrets here: no tokens, passwords, private keys, keyring data, online-account

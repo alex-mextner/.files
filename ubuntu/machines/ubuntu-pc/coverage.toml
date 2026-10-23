@@ -1,0 +1,14 @@
+# The files the engine modules apt-sources and docker-daemon write for this machine (machine.toml, profile.toml). The
+# modules already claim the keyring directory and daemon.json themselves; the names below depend on this machine's
+# choices (which repositories are enabled, the slice name), so they are listed here and must follow machine.toml: enable
+# another repository there and add its `.sources` file (and pin file) here. A hand-written source nobody declared stays
+# an untracked finding.
+[[coverage]]
+match = [
+  "etc:/etc/apt/sources.list.d/mozilla.sources",
+  "etc:/etc/apt/sources.list.d/tailscale.sources",
+  "etc:/etc/apt/sources.list.d/nvidia-container-toolkit.sources",
+  "etc:/etc/apt/preferences.d/mozilla",
+  "etc:/etc/systemd/system/docker-limited.slice",
+]
+class = "tracked"

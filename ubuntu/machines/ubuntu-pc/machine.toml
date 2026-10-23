@@ -114,3 +114,66 @@ FALL_GB_PER_MIN = 8
 # the same share of 62 GB is 20 GB, rounded up to 24 for the local 3D/vision jobs this PC runs. It counts only while the
 # machine is short of RAM, and a session here (largest omp process seen: 1.2 GB RSS) is nowhere near it.
 SESSION_MAX_GB = 24
+
+# Unattended self-heal: a user timer re-runs `ubuntu-tweak apply --commit --no-sudo` at login and daily
+# (never asks for root; the root remainder waits for an interactive `ubuntu-tweak apply --commit`).
+[modules.autoheal]
+enabled = true
+
+# ---------------------------------------------------------------------------------------------------------------
+# apt repositories (engine module apt-sources; the catalogue of all nine repositories of the laptop, with their key
+# fingerprints, is in ../../profile.toml and every source is off there). This PC opts in to three and states why it
+# declines the other six.
+[modules.apt-sources.sources.mozilla]
+# The Firefox deb installed here comes from this repository; it replaces the hand-written mozilla.list and its
+# `Package: *` pin.
+enabled = true
+
+[modules.apt-sources.sources.tailscale]
+# Tailscale is installed here; replaces the hand-written tailscale.list.
+enabled = true
+
+[modules.apt-sources.sources.nvidia-container-toolkit]
+# RTX 4060 + the docker daemon below; the package itself is in packages.toml next to this file.
+enabled = true
+
+[modules.apt-sources.sources.docker]
+# This PC runs Ubuntu's docker.io (active). Moving to docker-ce is replacing the engine, not toggling a
+# repository: set enabled = true and install docker-ce yourself if you want that; the laptop's docker-ce stays its own.
+enabled = false
+
+[modules.apt-sources.sources.1password]
+# 1Password is the snap here; the deb from this repository would install a second copy.
+enabled = false
+
+[modules.apt-sources.sources.google-chrome]
+# Chrome is the rootless copy under ~/.local/opt (dpkg -x, see modules.chatgpt-guardian above): the apt repository
+# would only add a root-installed Chrome next to it.
+enabled = false
+
+[modules.apt-sources.sources.claude-desktop]
+# Claude Desktop is a laptop app, not installed here.
+enabled = false
+
+[modules.apt-sources.sources.chatgpt]
+# The ChatGPT desktop app is a laptop app; the guardian here works through the web login in Chrome.
+enabled = false
+
+[modules.apt-sources.sources.protonvpn-stable]
+# ProtonVPN is a laptop app, not installed here.
+enabled = false
+
+# Docker (engine module docker-daemon; spec docs/specs/docker-daemon.md in ubuntu-tweaks). Taken from the laptop
+# (/etc/systemd/system/docker-limited.slice written by its mem-guard script, /etc/docker/daemon.json): every container
+# in one memory-capped slice, `cgroup-parent: docker-limited.slice`, runtimes.nvidia. CHANGED for this PC: the
+# laptop's MemoryHigh=6G MemoryMax=8G MemorySwapMax=1G are for a memory-starved machine; with 60 GB here 8 GB would
+# kill ordinary builds, so containers may use about half the RAM (throttled from 24G, hard cap 32G, 4G of swap) and
+# the desktop keeps at least 28 GB. The nvidia runtime stays "auto": it is written once `nvidia-container-runtime`
+# exists on the machine (packages.toml installs nvidia-container-toolkit), never as a dead entry. A changed
+# cgroup-parent only affects containers created afterwards; docker is reloaded, never restarted, by apply.
+[modules.docker-daemon]
+enabled = true
+nvidia_runtime = "auto"
+memory_high = "24G"
+memory_max = "32G"
+memory_swap_max = "4G"
