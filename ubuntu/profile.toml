@@ -150,3 +150,289 @@ machine_files = [
   ".local/share/applications/hsw-review.desktop",
   ".local/share/applications/snapmaker-orca.desktop",
 ]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Extra apt repositories (engine module `apt-sources`; spec docs/specs/apt-sources.md in ubuntu-tweaks).
+#
+# Every repository the laptop `home` used is DECLARED here once, with the primary-key fingerprint it is pinned to:
+# a key is installed only if its fingerprint equals this one (checked with `gpg --show-keys`), never `apt-key`.
+# Each fingerprint was computed from the laptop's keyring (`gpg --show-keys --with-colons`) and compared with the key the
+# source's `key_url` serves: they were equal when this was written. `key_format` is how the key is STORED (asc:
+# armored, gpg: binary); any channel may serve either form. Failover when a key URL is down: `key_urls` mirrors, then
+# `key_cached`, a copy of the same key kept right here (public key; it must still match `fingerprint`); copies exist
+# for the repositories a machine of this profile enables and for chatgpt, which has no vendor key URL.
+#
+# This file is the catalogue: every source is OFF here, and a machine opts in to the ones it needs with
+# `[modules.apt-sources.sources.<name>] enabled = true` in machines/<host>/machine.toml, with the reason. A machine that
+# says nothing gets no third-party repository.
+[modules.apt-sources]
+enabled = true
+
+# Mozilla's own Firefox deb. Ubuntu's `firefox` is a transitional package that installs the snap; the pin makes the
+# Mozilla deb win and hides Ubuntu's shim. Taken from the laptop (/etc/apt/preferences.d/mozilla). CHANGED against
+# this PC's hand-written pin, which was `Package: *` from Mozilla at 1000: that would also pull any other Mozilla
+# package; `firefox*` is all this repository carries. The module backs the old file up and replaces it. The key URL
+# ends in `.gpg` but serves an armored key.
+[modules.apt-sources.sources.mozilla]
+enabled = false
+uris = ["https://packages.mozilla.org/apt"]
+suites = ["mozilla"]
+components = ["main"]
+key_url = "https://packages.mozilla.org/apt/repo-signing-key.gpg"
+key_cached = '''
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+xsBNBGCRt7MBCADkYJHHQQoL6tKrW/LbmfR9ljz7ib2aWno4JO3VKQvLwjyUMPpq
+/SXXMOnx8jXwgWizpPxQYDRJ0SQXS9ULJ1hXRL/OgMnZAYvYDeV2jBnKsAIEdiG/
+e1qm8P4W9qpWJc+hNq7FOT13RzGWRx57SdLWSXo0KeY38r9lvjjOmT/cuOcmjwlD
+T9XYf/RSO+yJ/AsyMdAr+ZbDeQUd9HYJiPdI04lGaGM02MjDMnx+monc+y54t+Z+
+ry1WtQdzoQt9dHlIPlV1tR+xV5DHHsejCZxu9TWzzSlL5wfBBeEz7R/OIzivGJpW
+QdJzd+2QDXSRg9q2XYWP5ZVtSgjVVJjNlb6ZABEBAAHNVEFydGlmYWN0IFJlZ2lz
+dHJ5IFJlcG9zaXRvcnkgU2lnbmVyIDxhcnRpZmFjdC1yZWdpc3RyeS1yZXBvc2l0
+b3J5LXNpZ25lckBnb29nbGUuY29tPsLAjgQTAQoAOBYhBDW6oLM+nrOW9ZyoOMC6
+XObcYxWjBQJgkbezAhsDBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJEMC6XObc
+YxWj+igIAMFh6DrAYMeq9sbZ1ZG6oAMrinUheGQbEqe76nIDQNsZnhDwZ2wWqgVC
+7DgOMqlhQmOmzm7M6Nzmq2dvPwq3xC2OeI9fQyzjT72deBTzLP7PJok9PJFOMdLf
+ILSsUnmMsheQt4DUO0jYAX2KUuWOIXXJaZ319QyoRNBPYa5qz7qXS7wHLOY89IDq
+fHt6Aud8ER5zhyOyhytcYMeaGC1g1IKWmgewnhEq02FantMJGlmmFi2eA0EPD02G
+C3742QGqRxLwjWsm5/TpyuU24EYKRGCRm7QdVIo3ugFSetKrn0byOxWGBvtu4fH8
+XWvZkRT+u+yzH1s5yFYBqc2JTrrJvRU=
+=QnvN
+-----END PGP PUBLIC KEY BLOCK-----
+'''
+fingerprint = "35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
+pin = """
+Package: firefox*
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+
+Package: firefox*
+Pin: release o=Ubuntu
+Pin-Priority: -1
+"""
+
+# Tailscale (suite `resolute`: Ubuntu 26.04's codename; the laptop and this PC both run it). The vendor serves the key
+# binary (noarmor.gpg) and armored (.asc): each is the other's mirror; the stored file is binary, as the vendor's own
+# tailscale-archive-keyring package ships it.
+[modules.apt-sources.sources.tailscale]
+enabled = false
+uris = ["https://pkgs.tailscale.com/stable/ubuntu"]
+suites = ["resolute"]
+components = ["main"]
+key_url = "https://pkgs.tailscale.com/stable/ubuntu/resolute.noarmor.gpg"
+key_urls = ["https://pkgs.tailscale.com/stable/ubuntu/resolute.asc"]
+key_cached = '''
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+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
+=AIVM
+-----END PGP PUBLIC KEY BLOCK-----
+'''
+key_format = "gpg"
+fingerprint = "2596A99EAAB33821893C0A79458CA832957F5868"
+
+# NVIDIA container toolkit (`nvidia-container-runtime`, the docker nvidia runtime). A flat repository: the laptop's
+# `$(ARCH)` placeholder is written as amd64, the only architecture of both machines (apt would substitute the same).
+# The experimental repository the laptop had commented out is not declared.
+[modules.apt-sources.sources.nvidia-container-toolkit]
+enabled = false
+uris = ["https://nvidia.github.io/libnvidia-container/stable/deb/amd64"]
+suites = ["/"]
+architectures = ["amd64"]
+key_url = "https://nvidia.github.io/libnvidia-container/gpgkey"
+key_cached = '''
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+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
+X7sqI6cXUDG4BjpS70ZRWF2x51ZTiq7DLTV/gGw2okfVjoWjzQY0ebrLd4IoNs80
+lIHmXxa+JdwB6WupCUzKCKLcPsX/yPAmswPNGAuIMAv+PWhUUSMVtzOZldnlogGM
+hbJ9UD2txFGGh9WoYc2vgX9KAaKryXcC6QMabv7JJU24HEJJDgbJEvtFM5PS8QMF
+bXIZsYgICWpQXVChBbduXo9sD2TUDWYAniNaaw4LKxPRG+Ix4HAqkh1oNOLojO30
+DO3r1/62FKE5/ykg3iSMTDR0iOES/leXCCIO9fRJT8+eucxyOQoY5ti7tjt1wm3H
+nTB+Rz3E/E2qeLs2PN82aseccm1G06pmsMCUiWtmSV6HjdO2XufYprrGLSu0RrT3
+sz5WHGUOY2iO40xHhSiXg3TcLZRpv30DQzxoUrx9Ff//rXLFznh+MksuvVD2roUR
+BGz/en31FxAcBoex9nNraeOekbFen5b7Xrq9wnzM5xZvJN2QYB3vS0khz/ZgFyy5
+444ALa9gwb29FZCfA4m59S2QoB8uPQGM+8gnusE6J8y4fvI59ugafidIkt86dZ3m
+FsEME5XNmBGdNEo2flRVFfpG1IWds2Ba3IsdbYd9nzmbBW7/n0InVRDrIg==
+=9QWY
+-----END PGP PUBLIC KEY BLOCK-----
+'''
+fingerprint = "C95B321B61E88C1809C4F759DDCAE044F796ECB0"
+
+# Docker CE from docker.com. Suite `resolute`, not `stable`: docker publishes one
+# suite per Ubuntu codename.
+[modules.apt-sources.sources.docker]
+enabled = false
+uris = ["https://download.docker.com/linux/ubuntu"]
+suites = ["resolute"]
+components = ["stable"]
+architectures = ["amd64"]
+key_url = "https://download.docker.com/linux/ubuntu/gpg"
+fingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+
+# 1Password's deb repository (the 1password package on the laptop re-creates its own copy of this file on update:
+# the module backs it up and takes it over).
+[modules.apt-sources.sources.1password]
+enabled = false
+uris = ["https://downloads.1password.com/linux/debian/amd64"]
+suites = ["stable"]
+components = ["main"]
+architectures = ["amd64"]
+key_url = "https://downloads.1password.com/linux/keys/1password.asc"
+fingerprint = "3FEF9748469ADBE15DA7CA80AC2D62742012EA22"
+
+# Google Chrome. The key file is 19 KB armored (many signatures and subkeys, one primary key), so it has no cached copy here.
+[modules.apt-sources.sources.google-chrome]
+enabled = false
+uris = ["https://dl.google.com/linux/chrome-stable/deb/"]
+suites = ["stable"]
+components = ["main"]
+architectures = ["amd64"]
+key_url = "https://dl.google.com/linux/linux_signing_key.pub"
+fingerprint = "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796"
+
+# Claude Desktop. Its key is Anthropic's release signing key (the same one as Claude Code's, served from
+# downloads.claude.ai/keys); the laptop's file listed amd64 and arm64.
+[modules.apt-sources.sources.claude-desktop]
+enabled = false
+uris = ["https://downloads.claude.ai/claude-desktop/apt/stable"]
+suites = ["stable"]
+components = ["main"]
+architectures = ["amd64", "arm64"]
+key_url = "https://downloads.claude.ai/keys/claude-code.asc"
+fingerprint = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+
+# ChatGPT / Codex desktop app. OpenAI publishes no key URL: the key is embedded in the chatgpt .deb (its postinst
+# writes it). The cached copy below is that key, exported from the laptop's /usr/share/keyrings/chatgpt-archive-keyring.gpg,
+# and is therefore the only source of the key.
+[modules.apt-sources.sources.chatgpt]
+enabled = false
+uris = ["https://persistent.oaistatic.com/codex-app-prod/linux/deb"]
+suites = ["stable"]
+components = ["main"]
+architectures = ["amd64"]
+key_cached = '''
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBGpypFUBEACi1Vvzq9pIpA6lj7chbqELuxJtVuzUzxrasa6ZU0yF4yhq7jf8
+3YkJRHwbezBKeQyzJ5lkX0EhXS8aXxUhMAm3PFpAlwcInfKzmV7atJwvaxIw6Rmd
+GYe9fBWKjTN/SmPIjtyxrTznZY97+TfD1AeGZpLaJ8fsnhrC+HkiN2TACiTocgpe
+hFiP0OWK7mWZeTWnY2scpIYXP1Ro7nQv4KacmY4JacTQ7m/HM0Qej/3olhuEv2Cw
+lMVWw57/oHhmTllfLDQOogFQyIVqaaR98y/Eu6cAabSfcsqAAZ2A8vfHYD27z28J
+vLO2PZEJd5ThlnX4Zqv0eIpZdBj//8Sl/MSqTshFZ1NDsRoqwdqw284X5MpnOJ4k
+4Sc2Se8tJxt/nCeibH3dJ504Fb1X/mnOqhCAQ6pVJz4RB5HRlFPSkxVPyag1v1m/
+7T4vie+OR4eqFQNz6mudrOoMmeVIfyL5fbe4cOr4fk/FyvEE2xMgkFatPqXn7vM9
+og+zremPCfwRAFpBPyX74VowFY7llcdaj/w8K5T8PzM14Hb3E4ZKizMluKmTvTq9
+WE1/eSQJLLQqXD5VmtmdUaC/VyE/1ZlIxcA1LWqvEQ327UXREvX/nHsrkKrl956W
+jzkiHFUTsD1NJ0dMfs+csOt8Furb5jZj+HsMmCm9jLdfz5b/4WKLPbvxIwARAQAB
+tBZDb2RleCBMaW51eCBSZXBvc2l0b3J5iQJRBBMBCgA7FiEEO/oOSui4zBai2bpo
+SjtKVmxGYOQFAmpypFUCGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AACgkQ
+SjtKVmxGYORlCQ/9FyikZo8HQcJBP9E/oXVPds/fQnIFB2qJR2z3DrfYEonNt/ev
+SAySkPPq4/mEOjaI0pFlDDGSaps+FTcJFgoVRTasBIF7JJivvjW9ap8iWEbhhVLe
+IrFLbMLpUcTRntUx7R4fVMJ/1/cGn+NWZmNwS9ORorzSyCH0IAgCw1Xc3ZrjuMbF
+VjdToMC1TiXXCEmlYpQakmQ3Ay1cH0FHC2BBNn1MNVkJdPhpZIZCdhaMPHfYFpyo
+pg8wFvZ5iIcvlbMgyuy8CPJVRWUcYy2dOhEOGnYJnXRPkE3E1hf8YOHNzRlduH89
+6lT9qcEK2+fpLfrVGoc4zscLZ+Ey+Ko6iQRdVE1j67+wNR3hX8ukue574v1N/xxu
+i575jumSE19lEj1sH4+P4gFHOtTbF0JhKKzLctbga0IAwTPKhnt3qzj1U5Yj/MZS
+uEVjrLhdRauOuFBXUclgyVf2w/lE85UUOdlcollsYA6Huq7xDamqf8SslZQGre3E
+I+lhpqJR1cOwDMUzzcl40uTyhrxXXd/bk4QSlhZbwHR25Pnt+ZMtWavlQWS0eDEV
+8djuXAURCmx5WOqAFB/TJe1mn5EvyWg4VFzrY/NVNOpzgY5+Xp7J28z7f637r712
+Eu9j4imVcdPigwS+jf/0f81i2o9b82Y26TN8+EtDLCY841MJ1lrjDrX/dno=
+=Y+3h
+-----END PGP PUBLIC KEY BLOCK-----
+'''
+fingerprint = "3BFA0E4AE8B8CC16A2D9BA684A3B4A566C4660E4"
+
+# ProtonVPN (the repository behind protonvpn-stable-release on the laptop).
+[modules.apt-sources.sources.protonvpn-stable]
+enabled = false
+uris = ["https://repo.protonvpn.com/debian"]
+suites = ["stable"]
+components = ["main"]
+key_url = "https://repo.protonvpn.com/debian/public_key.asc"
+fingerprint = "84B0D3492C76C9C6F5873C18EDA3E22630349F1C"

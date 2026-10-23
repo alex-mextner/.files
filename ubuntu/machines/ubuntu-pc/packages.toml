@@ -1,0 +1,5 @@
+apt = [
+  # The docker nvidia runtime for the RTX 4060. Repository: apt-sources `nvidia-container-toolkit`; docker-daemon adds
+  # runtimes.nvidia once the binary exists (the same apply: apt-sources runs first, then this batch, then docker-daemon).
+  "nvidia-container-toolkit",
+]
