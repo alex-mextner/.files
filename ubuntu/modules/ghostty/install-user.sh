@@ -96,8 +96,13 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 if ! ( cd "$tmp" && apt-get download ghostty libgtk4-layer-shell0 ) >"$tmp/apt.log" 2>&1; then
     cat "$tmp/apt.log" >&2
-    # exit 75 (EX_TEMPFAIL) = the engine retries with backoff; anything else (no universe in the lists, unknown package) is final
-    if grep -qiE 'could not resolve|temporary failure|failed to fetch|timed out|connection (reset|refused)|could not get lock' "$tmp/apt.log"; then exit 75; fi
+    # exit 75 (EX_TEMPFAIL) = the engine retries with backoff, for resolver / connection causes only. A 404 (the lists name a
+    # version the mirror dropped: only `apt update`, i.e. root, fixes that), no universe, an unknown package: final.
+    if grep -qiE '404|not found' "$tmp/apt.log"; then
+        echo "install-user.sh: the package lists are stale (404): run \`sudo apt update\`" >&2
+        exit 1
+    fi
+    if grep -qiE 'could not resolve|temporary failure|connection failed|timed out|connection (reset|refused)|could not get lock' "$tmp/apt.log"; then exit 75; fi
     echo "install-user.sh: apt-get download failed (package lists without universe?)" >&2
     exit 1
 fi
@@ -105,6 +110,13 @@ stage=$tmp/stage
 mkdir -p "$stage"
 for deb in "$tmp"/*.deb; do dpkg-deb -x "$deb" "$stage"; done
 [ -x "$stage/usr/bin/ghostty" ] || { echo "install-user.sh: the deb has no usr/bin/ghostty" >&2; exit 1; }
+# Start the NEW binary before it replaces anything: a deb that does not run on this host must not destroy a working copy.
+stage_lib=""
+for d in "$stage"/usr/lib/*-linux-gnu; do [ -e "$d/libgtk4-layer-shell.so.0" ] && stage_lib=$d; done
+version=$(LD_LIBRARY_PATH="$stage_lib" "$stage/usr/bin/ghostty" --version 2>&1) || {
+    echo "install-user.sh: the downloaded Ghostty does not start on this host, nothing was replaced: $version" >&2
+    exit 1
+}
 # Swap the tree in as one step so a failed run never leaves a half-extracted prefix.
 mkdir -p "$(dirname "$PREFIX")" "$BIN" "$APPS"
 rm -rf "$PREFIX.new" "$PREFIX.old"
@@ -117,6 +129,5 @@ chmod 755 "$WRAPPER.tmp"
 mv "$WRAPPER.tmp" "$WRAPPER"
 entry_text > "$ENTRY.tmp"
 mv "$ENTRY.tmp" "$ENTRY"
-version=$("$WRAPPER" --version 2>&1) || { echo "install-user.sh: the extracted Ghostty does not start: $version" >&2; exit 1; }
 echo "installed: $(printf '%s\n' "$version" | sed -n 1p)"
 check

@@ -25,7 +25,7 @@ DPKG_DEB = """#!/bin/sh
 # dpkg-deb -x FILE DEST
 echo "dpkg-deb $*" >> "$STUB_LOG"
 case "$(basename "$2")" in
-  ghostty_*) mkdir -p "$3/usr/bin"; printf '#!/bin/sh\\necho "Ghostty 1.3.0 stub"\\n' > "$3/usr/bin/ghostty"; chmod +x "$3/usr/bin/ghostty" ;;
+  ghostty_*) mkdir -p "$3/usr/bin"; printf '#!/bin/sh\\n[ -z "$STUB_BROKEN_BIN" ] || { echo "error while loading shared libraries" >&2; exit 127; }\\necho "Ghostty 1.3.0 stub"\\n' > "$3/usr/bin/ghostty"; chmod +x "$3/usr/bin/ghostty" ;;
   libgtk4-layer-shell0_*) mkdir -p "$3/usr/lib/x86_64-linux-gnu"; : > "$3/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0" ;;
 esac
 """
@@ -134,6 +134,21 @@ class GhosttyUser(unittest.TestCase):
         res = self.run_script(APT_FAIL="E: Unable to locate package ghostty")
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
+
+    def test_stale_package_lists_are_final_not_transient(self):
+        res = self.run_script(APT_FAIL="E: Failed to fetch http://archive.ubuntu.com/ubuntu/pool/universe/g/ghostty/ghostty_1.deb  404  Not Found [IP: 1.2.3.4 80]")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("sudo apt update", res.stderr)
+
+    def test_a_downloaded_ghostty_that_does_not_start_replaces_nothing(self):
+        self.run_script()
+        with open(self.user_files()["wrapper"], "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")  # drift, so install runs again
+        res = self.run_script(STUB_BROKEN_BIN="1")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("does not start on this host", res.stderr)
+        launched = subprocess.run([self.user_files()["binary"], "--version"], capture_output=True, text=True, check=False)
+        self.assertIn("Ghostty 1.3.0", launched.stdout, "the working copy was replaced by one that does not start")
 
     def test_a_failed_reinstall_keeps_the_previous_copy(self):
         self.run_script()

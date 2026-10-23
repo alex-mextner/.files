@@ -123,6 +123,11 @@ class CtmuxInstall(unittest.TestCase):
             self.assertEqual(res.returncode, 10, args)
         self.assertEqual(self.calls(), [])
 
+    def test_a_missing_repository_is_final_and_never_prompts(self):
+        res = self.run_script(config={"repo": os.path.join(self.tmp, "does-not-exist.git")})
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "install.sh")))
+
     def test_a_network_failure_while_cloning_is_the_transient_exit(self):
         res = self.run_script(config={"repo": "https://nonexistent.invalid/x/ctmux-cli.git"})
         self.assertEqual(res.returncode, 75, res.stderr)

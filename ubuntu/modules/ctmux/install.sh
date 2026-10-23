@@ -68,10 +68,13 @@ if ! has_checkout; then
   mkdir -p "$(dirname "$dir")"
   log=$(mktemp)
   trap 'rm -f "$log"' EXIT
-  if ! git clone --quiet "$repo" "$dir" 2>"$log"; then
+  # never stop for a username/password on a mistyped or private URL (the engine may run with a terminal)
+  if ! GIT_TERMINAL_PROMPT=0 git clone --quiet "$repo" "$dir" 2>"$log"; then
     cat "$log" >&2
-    # 75 = retry with backoff: a network cause; anything else (bad URL, no access) is final
-    if grep -qiE 'could not resolve|unable to access|timed out|connection (reset|refused)|temporary failure' "$log"; then exit 75; fi
+    # 75 = retry with backoff, for resolver / connection causes only. "unable to access" alone is every HTTP failure,
+    # so an HTTP 4xx (forbidden, not found) and anything else (bad URL, no access) is final.
+    if ! grep -qiE 'returned error: 4[0-9][0-9]|authentication failed|could not read (username|password)' "$log" \
+       && grep -qiE 'could not resolve|timed out|connection (reset|refused|timed out)|temporary failure|failed to connect' "$log"; then exit 75; fi
     exit 1
   fi
 fi
