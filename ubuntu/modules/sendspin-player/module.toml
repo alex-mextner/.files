@@ -1,7 +1,8 @@
 description = "This PC's speakers as a Music Assistant player: PortAudio, the sendspin client and its user service (unit shipped in the machine overlay)"
 enabled = false   # only machines/ubuntu-pc opts in: the unit file sendspin-ubuntu-pc.service lives in that overlay, another machine needs its own
 order = 140       # after rig (100) and the other profile modules
-requires = ["base-tools", "brew"]   # apt must have succeeded; uv comes from brew
+# the engine has no `requires` key yet (restore requires = ["base-tools", "brew"] when it does): order 140 only runs this
+# module after base-tools (apt) and brew (uv); it does not skip it when one of them failed
 
 [source]
 kind = "builtin"
