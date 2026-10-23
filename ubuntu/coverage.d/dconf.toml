@@ -1,0 +1,13 @@
+# dconf findings of the ubuntu-pc scan that need a profile-level reason (rules of the engine and the dconf adapter
+# already cover the volatile and per-app keys: window geometry, app-grid folders, notification app ids, Ptyxis uuids,
+# prompt-check and the other timestamps, mru-sources). Everything the user set on purpose is a key in settings/*.ini.
+
+# The engine already files these under "extension settings belong to modules"; this rule only says which module. A
+# module's [[migrations]] from_path is not claimed by the engine itself, so the claim is written here.
+[[coverage]]
+match = ["dconf:/org/gnome/shell/extensions/dash2dock-lite/*"]
+class = "excluded"
+reason = """\
+the retired dash2dock-lite dock. Its tweaks (icon size, glass, indicators, stacks) are modules/hyperdock/dock.ini in \
+the engine: `apply` migrates them from this path ([[migrations]] from_path) and enforces them under the hyperdock \
+schema; folder-stacks is a seed of the same module"""
