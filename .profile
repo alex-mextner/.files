@@ -22,7 +22,8 @@ export NVM_DIR="$HOME/.nvm"
 export EMAIL=invntrm@gmail.com
 #export EDITOR='mvim -v'
 #export EDITOR='vim'
-export EDITOR='code'
+# code on machines that have it, else vim (EDITOR=code with no `code` binary breaks `git commit`, crontab -e, ...).
+if command -v code >/dev/null 2>&1; then export EDITOR='code'; else export EDITOR='vim'; fi
 export REACT_EDITOR=code
 export LANG=en_US.UTF-8
 export BASH_SILENCE_DEPRECATION_WARNING=1
@@ -55,8 +56,8 @@ alias %=' '
 
 
 
-eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
+[ -n "$HOMEBREW_PREFIX" ] && [ -x "$HOMEBREW_PREFIX/bin/brew" ] && eval "$("$HOMEBREW_PREFIX/bin/brew" shellenv)"
 # eval "$(/opt/homebrew/bin/brew shellenv)"
 
-. "$HOME/.cargo/env"
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 export LANG=en_US.UTF-8

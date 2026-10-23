@@ -131,12 +131,17 @@ function gdd() {
   eval git diff --relative origin/master --ignore-space-change $* -- . $(get_diff_exclude)
 }
 
-alias git-init="git init && echo '# MacOS #' > .gitignore && curl https://raw.githubusercontent.com/github/gitignore/master/Global/macOS.gitignore >> .gitignore && gsed -i '/Icon/d' .gitignore && echo '# Node #' >> .gitignore && curl https://raw.githubusercontent.com/github/gitignore/master/Node.gitignore >> .gitignore"
+# gsed on macOS (GNU sed from brew), plain sed on Linux where it already is GNU sed.
+_git_init_sed=${commands[gsed]:+gsed}
+alias git-init="git init && echo '# MacOS #' > .gitignore && curl https://raw.githubusercontent.com/github/gitignore/master/Global/macOS.gitignore >> .gitignore && ${_git_init_sed:-sed} -i '/Icon/d' .gitignore && echo '# Node #' >> .gitignore && curl https://raw.githubusercontent.com/github/gitignore/master/Node.gitignore >> .gitignore"
 
 # /git
 
 # misc
-alias copy=pbcopy
+if (( $+commands[pbcopy] )); then alias copy=pbcopy
+elif (( $+commands[wl-copy] )); then alias copy=wl-copy
+elif (( $+commands[xclip] )); then alias copy='xclip -selection clipboard -in'
+fi
 #alias vim='mvim -v'
 
 function take() {

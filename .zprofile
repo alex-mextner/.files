@@ -3,8 +3,19 @@
 # __zplug::utils::ansi::remove:17: maximum nested function level reached; increase FUNCNEST?
 FUNCNEST=1500
 #export ZPLUG_HOME=/usr/local/opt/zplug
-export ZPLUG_HOME=/opt/homebrew/opt/zplug
-source $ZPLUG_HOME/init.zsh
+# zplug lives under Homebrew (macOS: /opt/homebrew, Linux: /home/linuxbrew/.linuxbrew) or in ~/.zplug
+# (install-ubuntu.sh clones it there); without it the zplug calls below degrade to no-ops instead of
+# erroring on every shell start.
+export ZPLUG_HOME="$HOME/.zplug"
+for _zplug_dir in /opt/homebrew/opt/zplug /home/linuxbrew/.linuxbrew/opt/zplug; do
+  [[ -r $_zplug_dir/init.zsh ]] && { export ZPLUG_HOME=$_zplug_dir; break }
+done
+unset _zplug_dir
+if [[ -r $ZPLUG_HOME/init.zsh ]]; then
+  source $ZPLUG_HOME/init.zsh
+else
+  zplug() { :; }
+fi
 
 # zplug load # --verbose
 # see bottom
@@ -40,19 +51,23 @@ zmodload -i zsh/complist
 # prompt
 #
 
-#setopt PROMPT_SUBST
-#export PS1='%S%B %2~ ❯ %s%b '
-export PS1='%2~ ❯ %s'
+# An installed oh-my-posh owns the prompt (ubuntu-pc); the spaceship/PS1 setup is for machines without it.
+typeset -i _files_has_omp=$+commands[oh-my-posh]
+if (( ! _files_has_omp )); then
+  #setopt PROMPT_SUBST
+  #export PS1='%S%B %2~ ❯ %s%b '
+  export PS1='%2~ ❯ %s'
 
-setopt PROMPT_SUBST
-# export RPROMPT='$(~/.cabal/bin/git-prompt green)'
-export RPROMPT='$(git-get-branch 2>/dev/null)'
+  setopt PROMPT_SUBST
+  # export RPROMPT='$(~/.cabal/bin/git-prompt green)'
+  export RPROMPT='$(git-get-branch 2>/dev/null)'
+fi
 
 #
 # Plugins
 #
 
-zplug "denysdovhan/spaceship-prompt", use:spaceship.zsh, from:github, as:theme
+(( _files_has_omp )) || zplug "denysdovhan/spaceship-prompt", use:spaceship.zsh, from:github, as:theme
 SPACESHIP_PROMPT_SEPARATE_LINE=false
 SPACESHIP_CHAR_SYMBOL='❯'
 SPACESHIP_CHAR_SUFFIX=' '
@@ -220,10 +235,10 @@ fi
 
 export GOPATH=$HOME/go
 #golang
-export PATH=/Users/ultra/.bun/bin:$PATH:$GOPATH/bin
+export PATH=$HOME/.bun/bin:$PATH:$GOPATH/bin
 #dart
 
-eval $(thefuck --alias)
+(( $+commands[thefuck] )) && eval $(thefuck --alias)
 
 if [[ $RANDOM > 8191 ]]; then
   echo

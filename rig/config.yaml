@@ -1,0 +1,141 @@
+# The GLOBAL rig config for this user's Ubuntu machines: every rig feature a dev machine can run,
+# switched on. install-ubuntu.sh merges it into ~/.config/rig/config.yaml (keys declared here win,
+# machine-local extras stay), then `rig apply commit` converges the machine. The macOS bootstrap
+# (installer.sh) does not apply it. Per-repo settings of this dotfiles repo live in ../rig.yaml;
+# schema: rig-cli docs/config-schema.md.
+#
+# Decisions that are NOT here on purpose (switch on with `rig config set ... --global --commit`):
+#   mode: autonomous        its review quorum needs 3 distinct models; no single-model fallback
+#   harness_wrappers        needs abduco (apt) and a PATH order only the user can choose
+#   tracked_files           background PRs from every worktree with the user's credentials
+#   git / profile           ~/.files/.gitconfig.shared is the git source of truth; rig profile needs
+#                           a private profile repo
+# tmux.boot / tmux.autosave are launchd agents (macOS only): off here so continuum keeps saving
+# sessions on Linux; tmux.pane_titles is off so the machine's own status-right/pane titles stay.
+version: 1
+agent_tools_source: ~/dev/agent-tools
+harness:
+  enabled: true
+  kind: omp
+  kinds:
+  - claude-code
+  - codex
+  auto_mode: true
+agent_hooks:
+  enabled: true
+  all: true
+sysmon:
+  enabled: true
+  auto_remediate: false
+  sample_interval_seconds: 10
+  census_interval_seconds: 60
+  thresholds:
+    load_per_cpu:
+      warn: 1.5
+      critical: 2.5
+    data_used_pct:
+      warn: 85
+      critical: 92
+  heal:
+    enabled: true
+    notify_agent: true
+    throttle: true
+    kill_orphans: false
+    kill_owned: false
+    grace_seconds: 180
+  alert:
+    min_severity: warning
+    cooldown_minutes: 30
+    max_per_hour: 6
+    resolved: true
+    route: subscriber
+  remediation:
+    agent: omp
+    cooldown_minutes: 60
+  reclaim:
+    worktree_roots:
+    - ~/xp
+    - ~/work
+    - ~/dev
+    worktree_age_days: 7
+    max_candidates: 10
+  handler:
+    tmux_session: '0'
+tools:
+  enabled: true
+  items:
+    task:
+      repo: ~/dev/task-cli
+    review:
+      repo: ~/work/review-cli
+    qa:
+      repo: ~/xp/qa-cli
+    text-lint:
+      repo: ~/dev/text-lint
+      brew:
+      - vale
+    tg:
+      repo: ~/xp/tg-cli
+    dev:
+      repo: ~/xp/dev-cli
+    keychain:
+      repo: ~/xp/keychain-cli
+    router:
+      repo: ~/xp/router-cli
+ci:
+  items:
+    ship:
+      external_review_owners:
+      - alex-mextner
+      require_external_review: false
+      external_review_evidence_owners:
+      - o-maan
+fj:
+  host: git.hyperide.ai
+models:
+  enabled: true
+git_hooks:
+  dispatcher:
+    enabled: true
+mcp:
+  enabled: true
+bun:
+  enabled: true
+tmux:
+  enabled: true
+  apply: import
+  resurrect:
+    processes:
+    - ssh
+    - psql
+    - mysql
+    - sqlite3
+    capture_pane_contents: true
+  continuum:
+    restore: true
+    save_interval: 15
+  moshi:
+    enabled: true
+  cc_restore:
+    enabled: true
+  omp_restore:
+    enabled: true
+  codex_restore:
+    enabled: true
+  anti_sprawl:
+    enabled: true
+    session: main
+  boot:
+    enabled: false
+  autosave:
+    enabled: false
+  login_shell:
+    enabled: true
+  pane_titles:
+    enabled: false
+  focus_events:
+    enabled: true
+  clipboard:
+    enabled: true
+  copy_mode:
+    mode_keys: vi

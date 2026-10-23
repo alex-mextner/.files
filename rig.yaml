@@ -1,5 +1,6 @@
 # rig.yaml — declarative setup for this repo, applied by `rig apply`.
-# Global defaults live at ~/.config/rig/config.yaml; this file overrides them.
+# Machine-wide rig settings (skills, agent hooks, harness, tmux, bun, tools, sysmon, ...) are NOT here:
+# they live in rig/config.yaml, which install-ubuntu.sh merges into ~/.config/rig/config.yaml.
 # Schema: rig-cli docs/config-schema.md
 #
 # CI for the dotfiles: a secret scan on every push and PR (gitleaks over the tree). This is
@@ -15,3 +16,28 @@ ci:
     secret-scan:
       enabled: true
       tier: block
+
+# Issues of this repo are bare #NNN on GitHub; gh ship's review gate needs a code to key them on
+# (written into .ship-config as SHIP_TASK_CODE_PREFIX, next to the committed local test command).
+task:
+  code_prefix: DOT
+
+# Serena's project config is committed (.serena/). The name is pinned because rig otherwise takes it
+# from the checkout directory, which differs per worktree. Haft and Sverklo are not installed on any
+# of the user's machines and add nothing to a dotfiles repo, so their carriers are not written.
+project_tools:
+  enabled: true
+  serena:
+    enabled: true
+    project_name: .files
+    languages: [bash]
+  haft:
+    enabled: false
+  sverklo:
+    enabled: false
+
+# GitHub rulesets are a paid feature on a private repository (HTTP 403 "Upgrade to GitHub Pro or make
+# this repository public"), so rig cannot own one here; merge policy and Actions settings below it stay on.
+github:
+  ruleset:
+    enabled: false

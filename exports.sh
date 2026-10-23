@@ -9,7 +9,15 @@
 #export PATH="$HOME/.cargo/bin:$PATH"
 #source /Users/mxtnr/emsdk-portable/emsdk_env.sh
 
-export PATH="/opt/homebrew/bin:$PATH"
-export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+# Homebrew prefixes differ per OS (macOS arm: /opt/homebrew, Linux: /home/linuxbrew/.linuxbrew); use the one that exists.
+if [ -d /opt/homebrew/bin ]; then
+  export HOMEBREW_PREFIX=/opt/homebrew
+  export PATH="/opt/homebrew/bin:$PATH"
+  [ -d /opt/homebrew/opt/gnu-sed/libexec/gnubin ] && export PATH="/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+elif [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+  export HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
+  export PATH="$HOMEBREW_PREFIX/bin:$PATH"
+elif command -v brew >/dev/null 2>&1; then
+  export HOMEBREW_PREFIX="$(brew --prefix)"
+fi
 export PATH="./node_modules/.bin:$PATH"
-export HOMEBREW_PREFIX=$(brew --prefix)

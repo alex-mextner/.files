@@ -5,3 +5,4 @@
 # and runs its local fallback gate. The local "test" for a dotfiles repo is the same check the
 # CI workflow runs: gitleaks over the tree, failing on a leak.
 SHIP_LOCAL_TEST_CMD=gitleaks dir . --redact --no-banner --exit-code 1
+SHIP_TASK_CODE_PREFIX=DOT
