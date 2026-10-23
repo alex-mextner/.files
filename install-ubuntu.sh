@@ -10,11 +10,14 @@
 #   linked        .zprofile .vimrc .gitattributes .hyper.js  and the .tmux plugin dir
 #                 (an existing different file is moved to <name>.pre-dotfiles-<timestamp> first)
 #   merged        ~/.profile ~/.bashrc ~/.zshrc (one marked block each), ~/.gitconfig (an [include] of
-#                 .gitconfig.shared at the top, so the machine's own keys win) and the rig global config
-#                 (rig/config.yaml, see rig/merge-config.py), so the machine's own identity, credential
-#                 helper and hooksPath stay as they are
+#                 .gitconfig.shared at the top: keys in ~/.gitconfig win over it, keys in
+#                 ~/.config/git/config, which git reads earlier, do not) and the rig global config
+#                 (rig/config.yaml, see rig/merge-config.py: the repository wins for every key it
+#                 declares, so change a setting there, not with `rig config set`), so the machine's own
+#                 identity, credential helper and hooksPath stay as they are
 #   not touched   ~/.tmux.conf — tmux is provisioned by rig (`tmux:` block of the rig config)
-# Exit codes: 0 done / nothing pending, 1 pending (--check), 2 usage, 10 a manual step remains.
+# Exit codes: 0 done / nothing pending, 1 pending (--check), 2 usage, 10 a manual step remains
+# (--check included: the first run on a fresh machine ends with 10 until bun is installed).
 set -u
 
 mode=apply
@@ -34,7 +37,7 @@ if [ ! -d "$files" ] || [ "$(cd "$files" && pwd -P)" != "$here" ]; then
 fi
 
 pending=0
-manual=0
+manuals=0
 stamp=$(date +%Y%m%d-%H%M%S)
 
 applying() { [ "$mode" = apply ]; }
@@ -45,14 +48,16 @@ todo() {
   if applying; then echo "apply: $*"; else echo "pending: $*"; fi
 }
 ok() { echo "ok: $*"; }
-manual() { manual=$((manual + 1)); echo "manual: $*"; }
+manual() { manuals=$((manuals + 1)); echo "manual: $*"; }
 
 # replace_file <dest>: replace the contents of <dest> (kept in place, so a symlink stays a symlink)
 # with stdin, but only once all of stdin has been read.
 replace_file() {
-  local dest="$1" tmp
+  local dest="$1" tmp rc=0
   tmp=$(mktemp "$dest.XXXXXX") || return 1
-  if cat > "$tmp" && cat "$tmp" > "$dest"; then rm -f "$tmp"; else rm -f "$tmp"; return 1; fi
+  cat > "$tmp" && cat "$tmp" > "$dest" || rc=1
+  rm -f "$tmp"
+  return $rc
 }
 
 # link_into_home <repo-relative path>: ~/<name> becomes a symlink to ~/.files/<path>
@@ -80,8 +85,9 @@ merge_block() {
   end="# <<< .files:$id <<<"
   expected=$(printf '%s\n%s\n%s' "$begin" "$body" "$end")
   if [ -f "$file" ] && grep -qxF "$begin" "$file"; then
-    if ! grep -qxF "$end" "$file"; then
-      manual "$file has the .files:$id start marker but no end marker (hand-edited?); fix or remove the block, then re-run"
+    # Every start marker needs its own end marker, or the rewrite below would drop the rest of the file.
+    if [ "$(grep -cxF "$begin" "$file")" != "$(grep -cxF "$end" "$file")" ]; then
+      manual "$file has unpaired .files:$id markers (hand-edited?); fix or remove the block, then re-run"
       return 0
     fi
     # The block exactly once, and as expected; a duplicate or a stale block is rewritten to one fresh block.
@@ -102,11 +108,12 @@ merge_block() {
 }
 
 # -- submodules (tmux plugins, git-worktree-runner, tg-cli, vscode-configs) -----------------------------
-# .gitmodules uses ssh URLs for private repos. When this machine authenticates to GitHub through gh
-# (https credential helper), those are cloned over https instead, and the submodule's own URL in
-# .git/config is set to the https form so a later plain `git submodule update` keeps working.
+# .gitmodules uses ssh URLs for private repos. When git on this machine authenticates to GitHub
+# through the gh credential helper (the usual Ubuntu setup), those are cloned over https instead and
+# the https URL is recorded for the submodule and its origin, so a later plain `git submodule update`
+# keeps working. Nested submodules keep whatever URL their own .gitmodules has.
 gh_https=false
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then gh_https=true; fi
+if git config --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then gh_https=true; fi
 gitm() {
   if $gh_https; then git -C "$files" -c url."https://github.com/".insteadOf=git@github.com: "$@"
   else git -C "$files" "$@"; fi
@@ -125,15 +132,18 @@ while IFS= read -r line; do
   fi
 done < <(gitm submodule status 2>/dev/null)
 if $gh_https && applying; then
-  while read -r key url; do
-    name=${key#submodule.}; name=${name%.url}
+  while read -r key path; do
+    name=${key#submodule.}; name=${name%.path}
+    url=$(git -C "$files" config -f .gitmodules --get "submodule.$name.url")
     case "$url" in
       git@github.com:*)
+        https="https://github.com/${url#git@github.com:}"
         if git -C "$files" config --get "submodule.$name.url" >/dev/null 2>&1; then
-          git -C "$files" config "submodule.$name.url" "https://github.com/${url#git@github.com:}"
-        fi ;;
+          git -C "$files" config "submodule.$name.url" "$https"
+        fi
+        if [ -e "$files/$path/.git" ]; then git -C "$files/$path" remote set-url origin "$https"; fi ;;
     esac
-  done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.url$')
+  done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
 fi
 
 # -- links ----------------------------------------------------------------------------------------------
@@ -174,7 +184,10 @@ if [ -r "$HOME/.zplug/init.zsh" ]; then
 else
   todo "clone zplug into ~/.zplug"
   if applying; then
-    git clone --quiet https://github.com/zplug/zplug "$HOME/.zplug" || manual "zplug did not clone (network?), then re-run"
+    # pinned to the 2.4.2 release commit (supply chain: no moving master)
+    { git clone --quiet https://github.com/zplug/zplug "$HOME/.zplug" \
+        && git -C "$HOME/.zplug" checkout --quiet 8f14b4850d8e410f00db92afcd87b88c0c90f771; } \
+      || manual "zplug did not clone (network?), then re-run"
   fi
 fi
 zplug_ok() { zsh -c 'source "$HOME/.files/.zprofile" >/dev/null 2>&1; zplug check' </dev/null >/dev/null 2>&1; }
@@ -198,7 +211,8 @@ if [ -r "$plug" ]; then
 else
   todo "download vim-plug to ~/.vim/autoload/plug.vim"
   if applying; then
-    curl -fsSLo "$plug" --create-dirs https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim \
+    # pinned to the 0.14.0 release commit
+    curl -fsSLo "$plug" --create-dirs https://raw.githubusercontent.com/junegunn/vim-plug/d80f495fabff8446972b8695ba251ca636a047b0/plug.vim \
       || manual "vim-plug did not download (network?), then re-run"
   fi
 fi
@@ -250,5 +264,5 @@ else
 fi
 
 if [ "$mode" = check ] && [ "$pending" -gt 0 ]; then exit 1; fi
-[ "$manual" -gt 0 ] && exit 10
+[ "$manuals" -gt 0 ] && exit 10
 exit 0
