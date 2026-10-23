@@ -103,3 +103,7 @@ typings/
 .serverless
 
 .tmux/resurrect/
+
+# written by rig (hook bridge, machine-specific paths) and by `bun install` in ts-import-trace
+.claude/settings.json
+ts-import-trace/bun.lock
