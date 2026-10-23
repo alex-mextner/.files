@@ -11,3 +11,14 @@ reason = """\
 the retired dash2dock-lite dock. Its tweaks (icon size, glass, indicators, stacks) are modules/hyperdock/dock.ini in \
 the engine: `apply` migrates them from this path ([[migrations]] from_path) and enforces them under the hyperdock \
 schema; folder-stacks is a seed of the same module"""
+
+# Paths only (the engine never reads values of credential keys). Whether the pair exists is checked on the machine:
+# on 2026-10-23 ~/.local/share/gnome-remote-desktop/certificates was empty although both keys point into it.
+[[coverage]]
+match = ["dconf:/org/gnome/desktop/remote-desktop/rdp/tls-cert", "dconf:/org/gnome/desktop/remote-desktop/rdp/tls-key"]
+class = "secret"
+reason = """\
+paths of the RDP TLS certificate and private key, written by `grdctl rdp set-tls-cert` / `set-tls-key`. Restore on a \
+new machine: create a self-signed pair under ~/.local/share/gnome-remote-desktop/certificates with openssl, point \
+grdctl at both files, then set the RDP login with `grdctl rdp set-credentials` (the login lives in the keyring, \
+never in this repository)"""

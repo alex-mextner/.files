@@ -168,7 +168,7 @@ Rules are `[[coverage]]` tables (`match` = globs of item ids such as `dconf:/org
 `coverage.toml` and `coverage.d/*.toml` (one file per topic, so authors do not conflict), and in
 `machines/<hostname>/coverage.toml` and `machines/<hostname>/coverage.d/*.toml`; machine beats profile beats
 module beats engine defaults, and a declared item is tracked whatever a rule says. Current files:
-`coverage.d/dconf.toml` (dock keys that the hyperdock module migrates), `coverage.d/etc.toml` (stock grub; the two
+`coverage.d/dconf.toml` (dock keys that the hyperdock module migrates; the RDP TLS paths as secret, with the restore steps), `coverage.d/etc.toml` (stock grub; the two
 root-only `/etc` areas, ticketed), `machines/ubuntu-pc/coverage.d/extensions.toml` (the gsconnect claim).
 
 Two gates:
