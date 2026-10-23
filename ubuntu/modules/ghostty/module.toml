@@ -1,0 +1,32 @@
+description = "Ghostty terminal (the laptop's fast terminal, same config): the Ubuntu package, or a root-free copy when there is no root"
+enabled = true
+order = 85   # init step 8 neighbourhood; the ctmux module (90) opens ctmux in it
+
+# Primary: `apt-get install -y ghostty` as root. When root is unavailable or apt fails for good, the engine runs
+# install-user.sh (the archive's debs extracted under ~/.local/opt/ghostty, no root). `check` accepts either, so a
+# machine that ended up with the user-level copy is converged and is not asked for root again.
+[source]
+kind = "system"
+root = true
+install = "install.sh"
+check = "install-user.sh --check"
+preview = "install-user.sh --plan"
+
+[[fallback]]
+install = "install-user.sh"
+root = false
+description = "Ghostty extracted from the Ubuntu archive deb under ~/.local/opt/ghostty (no root)"
+
+# the font the Ghostty config names (the laptop's Fira Code 13); apt, so it needs root like any package
+[deps]
+apt = ["fonts-firacode"]
+
+[[coverage]]
+match = ["file:~/.config/ghostty*"]
+class = "tracked"
+reason = "ghostty/config is linked from the profile (files/.config/ghostty/config)"
+
+[[coverage]]
+match = ["file:~/.local/opt/ghostty*", "file:~/.local/bin/ghostty", "file:~/.local/share/applications/com.mitchellh.ghostty.desktop"]
+class = "tracked"
+reason = "the root-free Ghostty copy (install-user.sh) owns these"

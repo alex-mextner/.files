@@ -1,0 +1,6 @@
+# Which terminal "Open terminal" / Ctrl+Alt+T / xdg-terminal-exec starts, first usable entry wins.
+# ctmux is the primary terminal environment (a Ghostty window running ctmux, tmux windows on Ctrl+Tab);
+# the built-in Terminal and Ghostty stay as fallbacks.
+ctmux.desktop
+com.mitchellh.ghostty.desktop
+org.gnome.Ptyxis.desktop
