@@ -3,19 +3,8 @@
 # __zplug::utils::ansi::remove:17: maximum nested function level reached; increase FUNCNEST?
 FUNCNEST=1500
 #export ZPLUG_HOME=/usr/local/opt/zplug
-# zplug lives under Homebrew (macOS: /opt/homebrew, Linux: /home/linuxbrew/.linuxbrew) or in ~/.zplug
-# (install-ubuntu.sh clones it there); without it the zplug calls below degrade to no-ops instead of
-# erroring on every shell start.
-export ZPLUG_HOME="$HOME/.zplug"
-for _zplug_dir in /opt/homebrew/opt/zplug /home/linuxbrew/.linuxbrew/opt/zplug; do
-  [[ -r $_zplug_dir/init.zsh ]] && { export ZPLUG_HOME=$_zplug_dir; break }
-done
-unset _zplug_dir
-if [[ -r $ZPLUG_HOME/init.zsh ]]; then
-  source $ZPLUG_HOME/init.zsh
-else
-  zplug() { :; }
-fi
+export ZPLUG_HOME=/opt/homebrew/opt/zplug
+source $ZPLUG_HOME/init.zsh
 
 # zplug load # --verbose
 # see bottom

@@ -56,8 +56,8 @@ alias %=' '
 
 
 
-[ -n "$HOMEBREW_PREFIX" ] && [ -x "$HOMEBREW_PREFIX/bin/brew" ] && eval "$("$HOMEBREW_PREFIX/bin/brew" shellenv)"
+eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
 # eval "$(/opt/homebrew/bin/brew shellenv)"
 
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+. "$HOME/.cargo/env"
 export LANG=en_US.UTF-8

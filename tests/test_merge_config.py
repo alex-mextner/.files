@@ -75,3 +75,13 @@ def test_invalid_target_yaml_fails_loudly(tmp_path):
                           capture_output=True, text=True, check=False)
     assert proc.returncode != 0
     assert "merge-config" in proc.stderr
+
+
+def test_merge_replaces_lists_of_mappings_and_mapping_over_scalar():
+    merge = merge_config.merge
+    assert merge({"items": [{"a": 1}]}, {"items": [{"b": 2}]}) == {"items": [{"b": 2}]}
+    assert merge({"tmux": "off"}, {"tmux": {"enabled": True}}) == {"tmux": {"enabled": True}}
+
+
+def test_merge_treats_an_empty_yaml_key_as_missing():
+    assert merge_config.merge({"tools": None}, {"tools": {"enabled": True}}) == {"tools": {"enabled": True}}

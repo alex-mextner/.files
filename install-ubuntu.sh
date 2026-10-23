@@ -16,8 +16,8 @@
 #                 declares, so change a setting there, not with `rig config set`), so the machine's own
 #                 identity, credential helper and hooksPath stay as they are
 #   not touched   ~/.tmux.conf — tmux is provisioned by rig (`tmux:` block of the rig config)
-# Exit codes: 0 done / nothing pending, 1 pending (--check), 2 usage, 10 a manual step remains
-# (--check included: the first run on a fresh machine ends with 10 until bun is installed).
+# Exit codes: 0 done / nothing pending, 1 pending (--check), 2 usage, 10 a manual step remains and
+# nothing is pending (the first run on a fresh machine can end with 10 until bun is installed).
 set -u
 
 mode=apply
@@ -81,12 +81,22 @@ link_into_home() {
 # merge_block <file> <id> <body>: keep exactly one marked block in <file>, created when the file is absent.
 merge_block() {
   local file="$1" id="$2" body="$3" begin end current expected
+  # A file that is a symlink into this repository (the ubuntu-tweak engine links ~/.profile to
+  # ~/.files/.profile) is the repository's own file: never write a block into it.
+  if [ -L "$file" ] && [[ $(readlink -f "$file") == "$here"/* ]]; then
+    ok "$file is linked into ~/.files; no block needed"
+    return 0
+  fi
   begin="# >>> .files:$id (managed by ~/.files/install-ubuntu.sh; edit there) >>>"
   end="# <<< .files:$id <<<"
   expected=$(printf '%s\n%s\n%s' "$begin" "$body" "$end")
   if [ -f "$file" ] && grep -qxF "$begin" "$file"; then
-    # Every start marker needs its own end marker, or the rewrite below would drop the rest of the file.
-    if [ "$(grep -cxF "$begin" "$file")" != "$(grep -cxF "$end" "$file")" ]; then
+    # Start and end markers must alternate (start first, none left open), or the rewrite below would
+    # drop the rest of the file.
+    if ! awk -v b="$begin" -v e="$end" '
+        $0 == b { if (open) bad = 1; open = 1 }
+        $0 == e { if (!open) bad = 1; open = 0 }
+        END { exit (bad || open) ? 1 : 0 }' "$file"; then
       manual "$file has unpaired .files:$id markers (hand-edited?); fix or remove the block, then re-run"
       return 0
     fi
@@ -113,7 +123,7 @@ merge_block() {
 # the https URL is recorded for the submodule and its origin, so a later plain `git submodule update`
 # keeps working. Nested submodules keep whatever URL their own .gitmodules has.
 gh_https=false
-if git config --get-all credential.https://github.com.helper 2>/dev/null | grep -q 'gh auth git-credential'; then gh_https=true; fi
+if git config --get-urlmatch credential.helper https://github.com 2>/dev/null | grep -q 'gh auth git-credential'; then gh_https=true; fi
 gitm() {
   if $gh_https; then git -C "$files" -c url."https://github.com/".insteadOf=git@github.com: "$@"
   else git -C "$files" "$@"; fi
@@ -131,18 +141,22 @@ while IFS= read -r line; do
     ok "submodule $path"
   fi
 done < <(gitm submodule status 2>/dev/null)
-if $gh_https && applying; then
+if $gh_https; then
   while read -r key path; do
     name=${key#submodule.}; name=${name%.path}
     url=$(git -C "$files" config -f .gitmodules --get "submodule.$name.url")
-    case "$url" in
-      git@github.com:*)
-        https="https://github.com/${url#git@github.com:}"
-        if git -C "$files" config --get "submodule.$name.url" >/dev/null 2>&1; then
-          git -C "$files" config "submodule.$name.url" "$https"
-        fi
-        if [ -e "$files/$path/.git" ]; then git -C "$files/$path" remote set-url origin "$https"; fi ;;
-    esac
+    [[ $url == git@github.com:* ]] || continue
+    https="https://github.com/${url#git@github.com:}"
+    # only a submodule that is already initialised has a recorded URL and an origin to correct
+    recorded=$(git -C "$files" config --get "submodule.$name.url" 2>/dev/null)
+    origin=
+    [ -e "$files/$path/.git" ] && origin=$(git -C "$files/$path" remote get-url origin 2>/dev/null)
+    if { [ -n "$recorded" ] && [ "$recorded" != "$https" ]; } || { [ -n "$origin" ] && [ "$origin" != "$https" ]; }; then
+      todo "record the https URL for submodule $path"
+      applying || continue
+      [ -n "$recorded" ] && git -C "$files" config "submodule.$name.url" "$https"
+      [ -n "$origin" ] && git -C "$files/$path" remote set-url origin "$https"
+    fi
   done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
 fi
 
@@ -179,15 +193,29 @@ else
 fi
 
 # -- zplug (zsh plugin manager; Homebrew's on macOS, ~/.zplug here) -------------------------------------
-if [ -r "$HOME/.zplug/init.zsh" ]; then
-  ok "zplug at ~/.zplug"
-else
-  todo "clone zplug into ~/.zplug"
+# pinned to the 2.4.2 release commit (supply chain: no moving master); cloned aside and moved into
+# place only once the pinned commit is checked out, so a half-done clone never looks installed.
+zplug_pin=8f14b4850d8e410f00db92afcd87b88c0c90f771
+if [ -d "$HOME/.zplug/.git" ] && [ "$(git -C "$HOME/.zplug" rev-parse HEAD 2>/dev/null)" = "$zplug_pin" ]; then
+  ok "zplug 2.4.2 at ~/.zplug"
+elif [ -d "$HOME/.zplug/.git" ]; then
+  todo "move zplug in ~/.zplug to the pinned 2.4.2 release commit"
   if applying; then
-    # pinned to the 2.4.2 release commit (supply chain: no moving master)
-    { git clone --quiet https://github.com/zplug/zplug "$HOME/.zplug" \
-        && git -C "$HOME/.zplug" checkout --quiet 8f14b4850d8e410f00db92afcd87b88c0c90f771; } \
-      || manual "zplug did not clone (network?), then re-run"
+    { git -C "$HOME/.zplug" fetch --quiet --tags origin && git -C "$HOME/.zplug" checkout --quiet "$zplug_pin"; } \
+      || manual "could not move ~/.zplug to $zplug_pin (network? local changes?), then re-run"
+  fi
+elif [ -e "$HOME/.zplug" ]; then
+  manual "~/.zplug exists but is not a git checkout; move it aside, then re-run"
+else
+  todo "clone zplug 2.4.2 into ~/.zplug"
+  if applying; then
+    zplug_tmp=$(mktemp -d "$HOME/.zplug.XXXXXX")
+    if git clone --quiet https://github.com/zplug/zplug "$zplug_tmp/zplug" \
+        && git -C "$zplug_tmp/zplug" checkout --quiet "$zplug_pin" && mv "$zplug_tmp/zplug" "$HOME/.zplug"; then
+      rmdir "$zplug_tmp"
+    else
+      manual "zplug did not clone at the pinned commit (network?), then re-run; leftover: $zplug_tmp"
+    fi
   fi
 fi
 zplug_ok() { zsh -c 'source "$HOME/.files/.zprofile" >/dev/null 2>&1; zplug check' </dev/null >/dev/null 2>&1; }
@@ -205,15 +233,23 @@ if [ -r "$HOME/.zplug/init.zsh" ] && command -v zsh >/dev/null 2>&1; then
 fi
 
 # -- vim-plug and the plugins of .vimrc -----------------------------------------------------------------
+# pinned to the 0.14.0 release (commit d80f495), verified by checksum
 plug="$HOME/.vim/autoload/plug.vim"
-if [ -r "$plug" ]; then
-  ok "vim-plug"
+plug_url=https://raw.githubusercontent.com/junegunn/vim-plug/d80f495fabff8446972b8695ba251ca636a047b0/plug.vim
+plug_sha=20b4c895f98d13848204698068c4dd031730d4e7c9c4b630d6273b9b9afcdcdb
+if [ -r "$plug" ] && [ "$(sha256sum "$plug" | cut -d' ' -f1)" = "$plug_sha" ]; then
+  ok "vim-plug 0.14.0"
 else
-  todo "download vim-plug to ~/.vim/autoload/plug.vim"
+  todo "download vim-plug 0.14.0 to ~/.vim/autoload/plug.vim"
   if applying; then
-    # pinned to the 0.14.0 release commit
-    curl -fsSLo "$plug" --create-dirs https://raw.githubusercontent.com/junegunn/vim-plug/d80f495fabff8446972b8695ba251ca636a047b0/plug.vim \
-      || manual "vim-plug did not download (network?), then re-run"
+    mkdir -p "$(dirname "$plug")"
+    plug_tmp=$(mktemp "$plug.XXXXXX")
+    if curl -fsSLo "$plug_tmp" "$plug_url" && [ "$(sha256sum "$plug_tmp" | cut -d' ' -f1)" = "$plug_sha" ]; then
+      mv "$plug_tmp" "$plug"
+    else
+      rm -f "$plug_tmp"
+      manual "vim-plug did not download or failed its checksum (network?), then re-run"
+    fi
   fi
 fi
 if [ -r "$plug" ] && command -v vim >/dev/null 2>&1; then
