@@ -15,6 +15,7 @@ Files under `files/` are the symlink targets of the live config, so editing
 ubuntu/
   README.md
   profile.toml              # shared config: modules, capture rules
+  coverage.toml  coverage.d/*.toml   # [[coverage]] rules: what is tracked, excluded, secret or ticketed (see Coverage)
   settings/**/*.ini         # settings bundles: dconf keyfiles named by purpose (dev-keyboard.ini, laptop/power.ini), shared by all machines
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
   packages.toml             # apt / snap / flatpak names
@@ -147,6 +148,35 @@ sleep-inactive-ac-type='nothing'
 Shared keys in `settings/power.ini` (if any) are overridden key by key; keys absent from the
 overlay keep the shared value. The same applies to `files/` (same relative path wins) and
 to modules (`[modules.memguard] enabled = false` in a machine's `machine.toml`).
+
+## Coverage
+
+`ubuntu-tweak coverage` scans everything on the machine that holds configuration (dconf keys, files under
+`$HOME`, apt/snap/flatpak and tool packages, systemd user units, `/etc`, GNOME extensions) and puts every finding
+in one of four classes. The profile's goal is that nothing stays unaccounted for:
+
+| Class | Meaning | How a finding gets there |
+|---|---|---|
+| `tracked` | declared here and reconciled by `apply` | a key in `settings/**/*.ini`, a file under `files/`, a name in `packages.toml`, an item of a module, or a `[[coverage]] class = "tracked"` rule |
+| `excluded` | not configuration, with a written reason (cache, state, generated, machine-bound) | a `[[coverage]]` rule with `reason`, or an engine default |
+| `secret` | a credential; the reason says where it lives and how it is restored, never its content | a `[[coverage]]` rule with `reason` |
+| `untracked` | cannot be declared yet; allowed only with a `ticket` (counted as `N untracked (M ticketed)`) | a `[[coverage]] class = "untracked"` rule with `ticket` and `reason` |
+
+Rules are `[[coverage]]` tables (`match` = globs of item ids such as `dconf:/org/...`, `file:~/.config/x`,
+`etc:/etc/...`, `unit:x.service`, `apt:name`, `extension:uuid`). They live in modules' `module.toml`,
+`coverage.toml` and `coverage.d/*.toml` (one file per topic, so authors do not conflict), and in
+`machines/<hostname>/coverage.toml` and `machines/<hostname>/coverage.d/*.toml`; machine beats profile beats
+module beats engine defaults, and a declared item is tracked whatever a rule says. Current files:
+`coverage.d/dconf.toml` (dock keys that the hyperdock module migrates), `coverage.d/etc.toml` (stock grub; the two
+root-only `/etc` areas, ticketed), `machines/ubuntu-pc/coverage.d/extensions.toml` (the gsconnect claim).
+
+The gate on the machine: `ubuntu-tweak coverage` exits 0 when no untracked finding lacks a ticket;
+`ubuntu-tweak status` ends with the same summary line, and the autoheal timer re-runs `apply`, which
+reconciles everything tracked. The scan needs the live machine, so it cannot run in CI.
+
+Open engine gaps the profile waits on: root-only `/etc` areas cannot be classified
+(alex-mextner/ubuntu-tweaks#100), and the extensions adapter does not claim an extension a builtin module enables
+(alex-mextner/ubuntu-tweaks#101; remove the gsconnect rule when it lands).
 
 ## Manual steps
 
