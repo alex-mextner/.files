@@ -41,7 +41,8 @@ and the shadowed / duplicated / conflicting keys.
 
 ```ini
 # settings/dev-keyboard.ini
-[ubuntu-tweak]                  # optional header, not a dconf section
+# optional header, not a dconf section:
+[ubuntu-tweak]
 description = "Keys for working on the dev keyboard"
 machines = ["home"]             # apply only on these hostnames (also: requires-module = "hyperdock")
 
