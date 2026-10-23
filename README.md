@@ -3,6 +3,8 @@ dotfiles (mac, webdev, frontend, iterm)
 
 #### installation
 
+Ubuntu settings profile (managed by `ubuntu-tweak`): see [ubuntu/README.md](ubuntu/README.md).
+
 
 #### Fancy Gallery
 

@@ -1,0 +1,17 @@
+# Shared configuration for the ubuntu-tweak engine; machines/<hostname>/machine.toml wins over it.
+[profile]
+description = "alex personal Ubuntu settings"
+
+# Capture rules, evaluated by `ubuntu-tweak capture` together with the engine defaults. Uncomment and adjust.
+# [capture]
+# exclude = ["/org/gnome/shell/app-picker-layout"]            # never captured
+# machine = ["/org/gnome/settings-daemon/plugins/power/**"]   # captured into machines/<host>/settings/
+# include = ["/org/gnome/desktop/input-sources/mru-sources"]  # lifts the `state` / `auto` skips for these keys
+# include_files = [".config/mimeapps.list", ".config/gtk-3.0/bookmarks"]  # file allow-list
+# machine_files = [".config/monitors.xml"]                    # adopted into machines/<host>/files/
+#
+# Where NEW keys go: the first matching entry wins; a key a bundle already holds stays there,
+# and with no match a key goes to its panel's own bundle (settings/<panel>.ini).
+# [capture.bundles]
+# "dev-keyboard" = ["org/gnome/desktop/wm/keybindings/**", "org/gnome/shell/extensions/tiling-assistant/**"]
+# "laptop/power" = ["org/gnome/settings-daemon/plugins/power/**"]
