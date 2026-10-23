@@ -1,0 +1,829 @@
+#!/usr/bin/python3 -B
+"""mem-sentinel profile module (root): installs agent-tools' per-session memory watchdog and tunes it for this machine.
+
+    mem-sentinel check     exit 0 = installed and matching, 3 = drift (one line per unmet fact), 1 = broke (read-only)
+    mem-sentinel status    the same facts, all of them, one line each (read-only)
+    mem-sentinel plan      what `install` is going to do, with diffs (read-only, no network)
+    mem-sentinel install   as root (sudo, run by `ubuntu-tweak apply --commit`): make the facts true
+
+The sentinel's code is NOT in this repository: its source of truth is `ops/mem-sentinel/` of agent-tools. This module
+copies `mem_sentinel.py` to /usr/local/sbin/mem-sentinel and `mem-sentinel.service` to /etc/systemd/system/, exactly
+what `ops/mem-sentinel/install.sh` does (it cannot be staged for tests, so its few steps are repeated here and a test
+compares the paths with the installer when a checkout exists), and adds what is per machine: a unit drop-in that names
+the desktop user (SUDO_USER / PKEXEC_UID, never a literal) and carries the tunables, and the log rotation.
+
+Where the code comes from, first that works (the failover):
+  1. the checkout `dir` (default ~/dev/agent-tools), read from the git ref `ref` (default origin/main, fetched first,
+     best effort): a work-in-progress branch or an uncommitted edit of that checkout is never installed as root;
+  2. a fresh clone of `repo` into `dir` (only when `dir` does not exist);
+  3. a fresh clone of `repo_fallback` (a second URL, empty by default);
+  4. the directory `source_dir` (files `ops/mem-sentinel/...` or the two files directly in it);
+  5. the copy already installed, when its install stamp still vouches for it (only the machine part is re-rendered).
+Nothing found: exit 1 with every attempt named (a network cause is worded so the engine retries it).
+
+Options ([modules.mem-sentinel] of profile.toml / machine.toml, JSON in UBUNTU_TWEAK_MODULE_CONFIG):
+  dir, repo, repo_fallback, source_dir, ref   as above
+  env    table of MEM_SENTINEL_<NAME> tunables (numbers, true/false or simple strings): rendered into the drop-in;
+         NAME must be one `CONFIG` of the sentinel reads (checked against its source), USER and UID are set by the module
+
+MEMSENTINEL_MODULE_ROOT=DIR stages the install (tests, `plan` by hand): every destination is prefixed with DIR, no
+root, no systemd, no runuser; the desktop user is the current one.
+"""
+
+from __future__ import annotations
+
+import ast
+import difflib
+import hashlib
+import json
+import math
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+NAME = "mem-sentinel"
+SERVICE = "mem-sentinel.service"
+BIN = "usr/local/sbin/mem-sentinel"
+UNIT = "etc/systemd/system/mem-sentinel.service"
+DROPIN = "etc/systemd/system/mem-sentinel.service.d/10-ubuntu-tweaks.conf"
+LOGROTATE = "etc/logrotate.d/mem-sentinel"
+STAMP = "etc/mem-sentinel/installed.sha256"
+USER_SCRIPT = ".local/lib/mem-sentinel/mem_sentinel.py"
+USER_UNIT = ".config/systemd/user/mem-sentinel.service"
+USER_STAMP = ".local/state/mem-sentinel/installed.sha256"
+USER_LOG = "~/.local/state/mem-sentinel/sentinel.log"
+SOURCE_SCRIPT = "ops/mem-sentinel/mem_sentinel.py"
+SOURCE_UNIT = "ops/mem-sentinel/mem-sentinel.service"
+SENTINEL_LOG = "/var/log/hang-probe/sentinel.log"
+ROOT_ENV = "MEMSENTINEL_MODULE_ROOT"
+CONFIG_ENV = "UBUNTU_TWEAK_MODULE_CONFIG"
+
+DEFAULT_DIR = "~/dev/agent-tools"
+DEFAULT_REPO = "https://git.hyperide.ai/ultrabricks/agent-tools.git"
+DEFAULT_REF = "origin/main"
+OPTION_NAMES = ("dir", "repo", "repo_fallback", "source_dir", "ref", "env")
+RESERVED_ENV = ("USER", "UID")  # the module sets them from the desktop user
+MAX_SOURCE_BYTES = 1024 * 1024
+_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
+_ENV_VALUE = re.compile(r"[A-Za-z0-9_.:/+-]+")  # no space, quote, `%` (a systemd specifier) or `$`
+_REF = re.compile(r"[A-Za-z0-9_./-]+")
+_URL = re.compile(r"(https?://|ssh://|git@)\S+|/\S+")
+_KNOWN_ENV = re.compile(r'_env\(\s*"([A-Z0-9_]+)"')
+_TRANSIENT = re.compile(r"could not resolve|temporary failure|timed out|connection (reset|refused)|try again", re.I)
+
+
+_LOGROTATE_TABOO = (
+    ".rpmorig",
+    ".rpmsave",
+    ",v",
+    ".swp",
+    ".rpmnew",
+    "~",
+    ".cfsaved",
+    ".dpkg-dist",
+    ".dpkg-old",
+    ".dpkg-new",
+    ".dpkg-bak",
+    ".disabled",
+)  # what logrotate itself skips in a directory
+_LOG_TOKENS = ("hang-probe/*.log", "hang-probe/sentinel.log")
+
+
+class ModuleError(Exception):
+    """The module cannot do its job (exit 1); the message is shown as is."""
+
+
+@dataclass(frozen=True)
+class Account:
+    name: str
+    home: Path
+    uid: int
+
+
+@dataclass(frozen=True)
+class Finding:
+    ok: bool
+    subject: str
+    detail: str = ""
+
+    def line(self) -> str:
+        return f"{'ok     ' if self.ok else 'missing'} {self.subject}" + (f": {self.detail}" if self.detail else "")
+
+
+@dataclass(frozen=True)
+class Options:
+    dir: str = DEFAULT_DIR
+    repo: str = DEFAULT_REPO
+    repo_fallback: str = ""
+    source_dir: str = ""
+    ref: str = DEFAULT_REF
+    env: tuple[tuple[str, str], ...] = ()
+
+
+def _text(name: str, value: object, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise ModuleError(f"[modules.mem-sentinel] {name} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _env_value(name: str, value: object) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return repr(value)  # round-trip exact, never an exponent for the values a knob takes
+    if isinstance(value, str) and _ENV_VALUE.fullmatch(value):
+        return value
+    raise ModuleError(
+        f"[modules.mem-sentinel.env] {name} = {value!r}: a number, true/false or a string of letters, digits and _.:/+-"
+    )
+
+
+def parse_options(raw: Mapping[str, object]) -> Options:
+    unknown = sorted(set(raw) - set(OPTION_NAMES))
+    if unknown:
+        raise ModuleError(
+            f"[modules.mem-sentinel] unknown option(s): {', '.join(unknown)} (known: {', '.join(OPTION_NAMES)})"
+        )
+    defaults = Options()
+    values = {
+        "dir": _text("dir", raw.get("dir", defaults.dir)),
+        "repo": _text("repo", raw.get("repo", defaults.repo)),
+        "repo_fallback": _text("repo_fallback", raw.get("repo_fallback", ""), allow_empty=True),
+        "source_dir": _text("source_dir", raw.get("source_dir", ""), allow_empty=True),
+        "ref": _text("ref", raw.get("ref", defaults.ref), allow_empty=True),
+    }
+    for key in ("dir", "source_dir"):
+        if values[key] and not (values[key].startswith("/") or values[key].startswith("~/")):
+            raise ModuleError(f"[modules.mem-sentinel] {key} must be absolute or start with ~/, got {values[key]!r}")
+    for key in ("repo", "repo_fallback"):
+        if values[key] and (values[key].startswith("-") or not _URL.fullmatch(values[key])):
+            raise ModuleError(
+                f"[modules.mem-sentinel] {key} must be an https://, ssh://, git@ URL or an absolute path, got {values[key]!r}"
+            )
+    if values["ref"] and (values["ref"].startswith("-") or not _REF.fullmatch(values["ref"])):
+        raise ModuleError(
+            f"[modules.mem-sentinel] ref must be a git ref like origin/main (or empty for the working tree), got {values['ref']!r}"
+        )
+    env = raw.get("env", {})
+    if not isinstance(env, Mapping):
+        raise ModuleError("[modules.mem-sentinel] env must be a table of MEM_SENTINEL_<NAME> tunables")
+    rendered: dict[str, str] = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not _ENV_NAME.fullmatch(key):
+            raise ModuleError(f"[modules.mem-sentinel.env] {key!r}: names are upper case letters, digits and _")
+        if key in RESERVED_ENV:
+            raise ModuleError(f"[modules.mem-sentinel.env] {key} is set by the module from the desktop user")
+        rendered[key] = _env_value(key, value)
+    return Options(env=tuple(sorted(rendered.items())), **values)
+
+
+def known_env_names(script: bytes) -> set[str]:
+    """The ``MEM_SENTINEL_<NAME>`` knobs the sentinel reads: its ``_env("NAME", ...)`` calls."""
+    return set(_KNOWN_ENV.findall(script.decode("utf-8", errors="replace")))
+
+
+def render_dropin(account: Account, options: Options) -> str:
+    lines = [f"MEM_SENTINEL_USER={account.name}", f"MEM_SENTINEL_UID={account.uid}"]
+    lines += [f"MEM_SENTINEL_{key}={value}" for key, value in options.env]
+    body = "".join(f"Environment={line}\n" for line in lines)
+    return (
+        "# Managed by ubuntu-tweaks (profile module mem-sentinel): edit [modules.mem-sentinel] in the profile, not this file.\n"
+        "# The user is the desktop user that ran apply; the other values are this machine's tunables (see the profile).\n"
+        f"[Service]\n{body}"
+    )
+
+
+def render_logrotate() -> str:
+    return (
+        "# Managed by ubuntu-tweaks (profile module mem-sentinel)\n"
+        f"{SENTINEL_LOG} {{\n  daily\n  rotate 7\n  copytruncate\n  compress\n  missingok\n  notifempty\n}}\n"
+    )
+
+
+def validate_source(script: bytes, unit: bytes) -> None:
+    try:
+        ast.parse(script.decode("utf-8"), "mem_sentinel.py")
+    except (SyntaxError, UnicodeDecodeError, ValueError) as error:
+        raise ModuleError(f"mem_sentinel.py does not parse: {error}") from error
+    text = unit.decode("utf-8", errors="replace")
+    if f"/{BIN}" not in text or "[Service]" not in text:
+        raise ModuleError(f"mem-sentinel.service does not start /{BIN}: this module installs the script there")
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def write_file(path: Path, data: bytes, mode: int) -> None:
+    """Atomic write, final mode set before the rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+        os.replace(temp, path)
+    except BaseException:
+        Path(temp).unlink(missing_ok=True)
+        raise
+
+
+@dataclass(frozen=True)
+class Result:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    raw: bytes = b""  # stdout as the bytes it was: a blob of code must not go through a lossy decode
+
+
+class Runner:
+    """The one seam for external commands: tests replace it."""
+
+    def query(self, argv: Sequence[str], *, timeout: float = 60.0) -> Result:
+        try:
+            done = subprocess.run(list(argv), capture_output=True, timeout=timeout, check=False)
+        except FileNotFoundError:
+            return Result(127, "", f"{argv[0]}: not found")
+        except subprocess.TimeoutExpired:
+            return Result(124, "", f"{shlex.join(argv)}: timed out")
+        return Result(
+            done.returncode, done.stdout.decode(errors="replace"), done.stderr.decode(errors="replace"), done.stdout
+        )
+
+    def run(self, argv: Sequence[str], *, timeout: float = 300.0) -> None:
+        result = self.query(argv, timeout=timeout)
+        if result.returncode != 0:
+            raise ModuleError(
+                f"{shlex.join(argv)}: exited with status {result.returncode}: {(result.stderr or result.stdout).strip()}"
+            )
+
+
+@dataclass(frozen=True)
+class Source:
+    script: bytes
+    unit: bytes
+    origin: str
+
+
+@dataclass(frozen=True)
+class Planned:
+    """One file the module owns: ``wanted`` is None when there is nothing to install (code with no source and no
+    installed copy) or, for the log rotation, when another file already covers the log."""
+
+    relative: str
+    wanted: bytes | None
+    mode: int
+    code: bool = False
+
+
+def invoking_account(env: Mapping[str, str]) -> Account:
+    """The desktop user: SUDO_USER, else PKEXEC_UID (when root), else the caller itself. Never `$HOME`."""
+    try:
+        if os.geteuid() == 0 and env.get("SUDO_USER") and env["SUDO_USER"] != "root":
+            entry = pwd.getpwnam(env["SUDO_USER"])
+        elif os.geteuid() == 0 and env.get("PKEXEC_UID", "").isdigit() and int(env["PKEXEC_UID"]) != 0:
+            entry = pwd.getpwuid(int(env["PKEXEC_UID"]))
+        else:
+            entry = pwd.getpwuid(os.geteuid())
+    except KeyError as error:
+        raise ModuleError(f"cannot find the desktop user: {error}") from error
+    return Account(entry.pw_name, Path(entry.pw_dir), entry.pw_uid)
+
+
+class MemSentinel:
+    _ctl: tuple[str, ...] = ("systemctl",)
+    _stamp_relative = STAMP
+    _restart_on = (BIN, UNIT, DROPIN)
+    _reload_on = (UNIT, DROPIN)
+
+    def __init__(
+        self,
+        runner: Runner,
+        root: Path,
+        account: Account,
+        options: Options,
+        *,
+        staged: bool,
+        is_root: bool,
+        settle: float = 1.0,
+    ) -> None:
+        self._runner = runner
+        self._root = root
+        self._account = account
+        self._options = options
+        self._staged = staged
+        self._is_root = is_root
+        self._settle = settle
+
+    # -- paths and the desktop user's own tools ---------------------------------------------------
+    def _path(self, relative: str) -> Path:
+        return self._root / relative
+
+    def _expand(self, path: str) -> Path:
+        return self._account.home / path[2:] if path.startswith("~/") else Path(path)
+
+    def _as_user(self, argv: Sequence[str]) -> list[str]:
+        """git runs as the desktop user: the checkout is theirs, and root's git refuses it (dubious ownership). `sudo`
+        leaves HOME=/root, which the user could not read, so the user's own HOME (git config, credentials) is set."""
+        if self._staged or not self._is_root:
+            return list(argv)
+        return ["runuser", "-u", self._account.name, "--", "env", f"HOME={self._account.home}", *argv]
+
+    # -- where the sentinel's code comes from -----------------------------------------------------
+    def _from_git(self, checkout: Path) -> Source | None:
+        ref = self._options.ref
+        blobs: list[bytes] = []
+        for relative in (SOURCE_SCRIPT, SOURCE_UNIT):
+            shown = self._runner.query(
+                self._as_user(["git", "-C", str(checkout), "show", f"{ref}:{relative}"]), timeout=30
+            )
+            if shown.returncode != 0:
+                return None
+            if len(shown.raw) > MAX_SOURCE_BYTES:
+                raise ModuleError(f"{checkout}: {relative} at {ref} is larger than {MAX_SOURCE_BYTES} bytes")
+            blobs.append(shown.raw)
+        revision = self._runner.query(
+            self._as_user(["git", "-C", str(checkout), "rev-parse", "--short", ref]), timeout=30
+        )
+        return Source(blobs[0], blobs[1], f"{checkout} {ref} {revision.stdout.strip()}".strip())
+
+    def _from_files(self, base: Path) -> Source | None:
+        for script, unit in (
+            (base / SOURCE_SCRIPT, base / SOURCE_UNIT),
+            (base / "mem_sentinel.py", base / "mem-sentinel.service"),
+        ):
+            try:
+                if script.stat().st_size > MAX_SOURCE_BYTES or unit.stat().st_size > MAX_SOURCE_BYTES:
+                    raise ModuleError(f"{base}: a source file is larger than {MAX_SOURCE_BYTES} bytes")
+                return Source(script.read_bytes(), unit.read_bytes(), str(base))
+            except FileNotFoundError:
+                continue
+        return None
+
+    def _checkout_source(self, checkout: Path) -> Source | None:
+        if (checkout / ".git").exists() and self._options.ref:
+            return self._from_git(checkout)
+        return self._from_files(checkout)
+
+    def local_source(self) -> Source | None:
+        """What can be read without the network: the checkout, else `source_dir` (used by check, status and plan)."""
+        checkout = self._expand(self._options.dir)
+        found = self._checkout_source(checkout) if checkout.is_dir() else None
+        if found is None and self._options.source_dir:
+            found = self._from_files(self._expand(self._options.source_dir))
+        return found
+
+    def _acquire_source(self) -> tuple[Source | None, list[str]]:
+        """install: refresh the checkout, clone when it is missing, then the other sources. Returns (source, attempts)."""
+        attempts: list[str] = []
+        checkout = self._expand(self._options.dir)
+        if checkout.is_dir():
+            if (checkout / ".git").exists() and self._options.ref:
+                fetched = self._runner.query(
+                    self._as_user(["git", "-C", str(checkout), "fetch", "--quiet", "origin"]), timeout=180
+                )
+                if fetched.returncode != 0:
+                    attempts.append(
+                        f"git fetch in {checkout}: {(fetched.stderr or fetched.stdout).strip()} (kept the last fetched {self._options.ref})"
+                    )
+            found = self._checkout_source(checkout)
+            if found:
+                return found, attempts
+            attempts.append(f"{checkout} has no {SOURCE_SCRIPT} at {self._options.ref or 'its working tree'}")
+        else:
+            for url in (self._options.repo, self._options.repo_fallback):
+                if not url:
+                    continue
+                if not self._staged:
+                    self._as_user_mkdir(checkout.parent)
+                cloned = self._runner.query(
+                    self._as_user(["git", "clone", "--quiet", "--", url, str(checkout)]), timeout=600
+                )
+                if cloned.returncode == 0:
+                    found = self._checkout_source(checkout)
+                    if found:
+                        return found, attempts
+                    attempts.append(
+                        f"{url} cloned, but it has no {SOURCE_SCRIPT} at {self._options.ref or 'its working tree'}"
+                    )
+                    break
+                attempts.append(f"git clone {url}: {(cloned.stderr or cloned.stdout).strip()}")
+        if self._options.source_dir:
+            found = self._from_files(self._expand(self._options.source_dir))
+            if found:
+                return found, attempts
+            attempts.append(f"source_dir {self._options.source_dir} has no mem_sentinel.py and mem-sentinel.service")
+        return None, attempts
+
+    def _as_user_mkdir(self, directory: Path) -> None:
+        if directory.is_dir():
+            return
+        self._runner.run(self._as_user(["mkdir", "-p", str(directory)]))
+
+    # -- the facts --------------------------------------------------------------------------------
+    def _stamp(self) -> dict[str, str]:
+        text = _read(self._path(self._stamp_relative))
+        entries: dict[str, str] = {}
+        for line in (text or b"").decode(errors="replace").splitlines():
+            digest, _, path = line.partition(" ")
+            if digest and path:
+                entries[path] = digest
+        return entries
+
+    def _other_logrotate_covers_log(self) -> bool:
+        """Another logrotate file already rotates the log (a second stanza for the same file makes logrotate refuse
+        with "duplicate log entry"). Files logrotate itself skips (its tabooext) and comment lines do not count."""
+        directory = self._path("etc/logrotate.d")
+        try:
+            files = sorted(path for path in directory.iterdir() if path.is_file() and path.name != "mem-sentinel")
+        except FileNotFoundError:
+            return False
+        for path in files:
+            if path.name.endswith(_LOGROTATE_TABOO) or path.name.startswith("."):
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.lstrip().startswith("#") and any(token in line for token in _LOG_TOKENS):
+                    return True
+        return False
+
+    def _installed(self) -> bool:
+        """Every code file is on disk and the install stamp exists: there is a copy to keep when no source is reachable."""
+        return all(self._path(item.relative).exists() for item in self._planned(None) if item.code) and bool(
+            self._stamp()
+        )
+
+    def _stamp_vouches(self) -> bool:
+        """Every installed code file is the one the install stamp recorded (nobody edited it by hand)."""
+        stamp = self._stamp()
+        for item in self._planned(None):
+            if item.code:
+                current = _read(self._path(item.relative))
+                if current is None or stamp.get(item.relative) != _sha(current):
+                    return False
+        return True
+
+    def _planned(self, source: Source | None) -> list[Planned]:
+        """Every file the module owns. Without a source the code stays as installed (None when it is not installed)."""
+        installed_script, installed_unit = _read(self._path(BIN)), _read(self._path(UNIT))
+        return [
+            Planned(BIN, source.script if source else installed_script, 0o755, code=True),
+            Planned(UNIT, source.unit if source else installed_unit, 0o644, code=True),
+            Planned(DROPIN, render_dropin(self._account, self._options).encode(), 0o644),
+            Planned(LOGROTATE, None if self._other_logrotate_covers_log() else render_logrotate().encode(), 0o644),
+        ]
+
+    def _unit_is(self, verb: str, wanted: str) -> bool:
+        result = self._runner.query([*self._ctl, verb, SERVICE])
+        return result.returncode == 0 and result.stdout.splitlines()[:1] == [wanted]
+
+    def _needs_daemon_reload(self) -> bool:
+        return (
+            self._runner.query([*self._ctl, "show", "-p", "NeedDaemonReload", "--value", SERVICE]).stdout.strip()
+            == "yes"
+        )
+
+    def findings(self, source: Source | None) -> list[Finding]:
+        stamp = self._stamp()
+        found: list[Finding] = []
+        for item in self._planned(source):
+            current, subject = _read(self._path(item.relative)), f"/{item.relative}"
+            if item.code and current is None:
+                found.append(Finding(False, subject, "not installed"))
+            elif item.code and source is None:
+                found.append(
+                    Finding(
+                        stamp.get(item.relative) == _sha(current),
+                        subject,
+                        "no source reachable: the install stamp vouches for it",
+                    )
+                )
+            elif item.code and source is not None:
+                found.append(Finding(current == item.wanted, subject, f"equals {source.origin}"))
+            elif item.wanted is None:
+                found.append(
+                    Finding(current is None, subject, "another logrotate file already covers hang-probe/*.log")
+                )
+            else:
+                found.append(Finding(current == item.wanted, subject))
+        if self._staged:
+            return found
+        found.append(Finding(self._unit_is("is-enabled", "enabled"), f"{SERVICE} is enabled"))
+        found.append(Finding(self._unit_is("is-active", "active"), f"{SERVICE} is active"))
+        found.append(Finding(not self._needs_daemon_reload(), "systemd has loaded the current unit files"))
+        return found
+
+    def _validate(self, source: Source) -> None:
+        validate_source(source.script, source.unit)
+        known = known_env_names(source.script)
+        unknown = sorted(name for name, _ in self._options.env if known and name not in known)
+        if unknown:
+            raise ModuleError(
+                f"[modules.mem-sentinel.env] {', '.join(unknown)}: the sentinel reads no such MEM_SENTINEL_ knob "
+                f"(known: {', '.join(sorted(known))})"
+            )
+
+    def check_source(self) -> Source | None:
+        source = self.local_source()
+        if source:
+            self._validate(source)
+        return source
+
+    def plan(self) -> list[str]:
+        source = self.check_source()
+        lines: list[str] = []
+        if source is None and not self._installed():
+            checkout = self._expand(self._options.dir)
+            how = f"git fetch in {checkout}" if checkout.is_dir() else f"git clone {self._options.repo} {checkout}"
+            lines.append(f"get agent-tools ({how}), read {SOURCE_SCRIPT} and {SOURCE_UNIT}")
+        if source is None and self._installed() and not self._stamp_vouches():
+            lines.append("cannot repair: the installed copy differs from its install stamp and no source is reachable")
+        restart = False
+        for item in self._planned(source):
+            current = _read(self._path(item.relative))
+            if item.wanted is None:
+                if current is not None and not item.code:
+                    lines.append(f"remove /{item.relative} (another logrotate file covers the log)")
+                continue
+            if current == item.wanted:
+                continue
+            restart = restart or item.relative in self._restart_on
+            verb = "create" if current is None else "update"
+            if item.relative in (BIN, USER_SCRIPT):  # a code diff is the sentinel's own git history, not shown here
+                lines.append(
+                    f"{verb} /{item.relative} (mode {item.mode:o}, {len(item.wanted.splitlines())} lines, sha256 {_sha(item.wanted)[:12]})"
+                )
+                continue
+            lines.append(f"{verb} /{item.relative}")
+            diff = difflib.unified_diff(
+                (current or b"").decode(errors="replace").splitlines(),
+                item.wanted.decode(errors="replace").splitlines(),
+                f"/{item.relative} (installed)",
+                f"/{item.relative} (new)",
+                lineterm="",
+                n=0,
+            )
+            lines += [f"  {line}" for line in diff]
+        if not self._staged:
+            if not self._unit_is("is-enabled", "enabled"):
+                lines.append(f"{' '.join(self._ctl)} enable {SERVICE}")
+            if not self._unit_is("is-active", "active"):
+                lines.append(f"{' '.join(self._ctl)} start {SERVICE}")
+            elif restart:
+                lines.append(f"{' '.join(self._ctl)} restart {SERVICE}")
+        return lines or ["nothing to change"]
+
+    def apply(self) -> None:
+        self._require_privilege()
+        source, attempts = self._acquire_source()
+        installed = self._installed()
+        if source is None and not installed:
+            raise ModuleError(
+                "no source for the sentinel was reachable:\n  " + "\n  ".join(attempts or ["no source configured"])
+            )
+        if source is None and not self._stamp_vouches():
+            raise ModuleError(
+                "the installed sentinel differs from its install stamp (edited by hand?) and no source is reachable to "
+                "restore it:\n  " + "\n  ".join(attempts or ["no source configured"])
+            )
+        if source is not None:
+            self._validate(source)
+        for note in attempts:
+            sys.stderr.write(f"mem-sentinel: warning: {note}\n")
+        if source is None:
+            sys.stderr.write(
+                "mem-sentinel: warning: no source reachable, keeping the installed copy (the install stamp vouches for it)\n"
+            )
+        changed: list[str] = []
+        stamp_lines: list[str] = []
+        for item in self._planned(source):
+            path = self._path(item.relative)
+            if item.wanted is None:
+                if path.exists() and not item.code:
+                    path.unlink()
+                    changed.append(item.relative)
+                continue
+            if _read(path) != item.wanted:
+                write_file(path, item.wanted, item.mode)
+                changed.append(item.relative)
+            if item.code:
+                stamp_lines.append(f"{_sha(item.wanted)} {item.relative}")
+        stamp = ("\n".join(sorted(stamp_lines)) + "\n").encode()
+        if _read(self._path(self._stamp_relative)) != stamp:
+            write_file(self._path(self._stamp_relative), stamp, 0o644)
+        self._prepare_log()
+        if not self._staged:
+            self._bring_up(changed)
+
+    def _require_privilege(self) -> None:
+        if not self._staged and not self._is_root:
+            raise ModuleError("must run as root (ubuntu-tweak runs it through sudo)")
+
+    def _prepare_log(self) -> None:
+        self._path(SENTINEL_LOG.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def is_root(self) -> bool:
+        return self._is_root
+
+    def system_installed(self) -> bool:
+        return self._path(BIN).exists()
+
+    def _bring_up(self, changed: list[str]) -> None:
+        if any(relative in self._reload_on for relative in changed) or self._needs_daemon_reload():
+            self._runner.run([*self._ctl, "daemon-reload"])
+        if not self._unit_is("is-enabled", "enabled"):
+            self._runner.run([*self._ctl, "enable", SERVICE])
+        touched = any(relative in self._restart_on for relative in changed)
+        was_active = self._unit_is("is-active", "active")
+        if not was_active:
+            self._runner.query([*self._ctl, "reset-failed", SERVICE])
+            self._runner.run([*self._ctl, "start", SERVICE])
+        elif touched:
+            self._runner.run([*self._ctl, "restart", SERVICE])
+        if was_active and not touched:
+            return
+        time.sleep(self._settle)
+        if not self._unit_is("is-active", "active"):
+            raise ModuleError(f"{SERVICE} did not stay active: see `journalctl -u mem-sentinel` and {SENTINEL_LOG}")
+
+
+class UserSentinel(MemSentinel):
+    """The rootless failover: the same script as a USER unit. It sees only the desktop user's own cgroups and
+    processes, which is where every omp session lives; it cannot raise its priority or lock its memory, and its unit
+    does not start once the system install exists."""
+
+    _ctl = ("systemctl", "--user")
+    _stamp_relative = USER_STAMP
+    _restart_on = (USER_SCRIPT, USER_UNIT)
+    _reload_on = (USER_UNIT,)
+
+    def _path(self, relative: str) -> Path:
+        return self._account.home / relative
+
+    def present(self) -> bool:
+        return self._path(USER_SCRIPT).is_file()
+
+    def running_beside_system(self) -> bool:
+        """Run as the desktop user: the copy still runs although the system service exists (two sentinels would
+        both steer the same session)."""
+        return self._path(USER_UNIT).exists() and self._unit_is("is-active", "active")
+
+    def retire(self) -> None:
+        """Run as root after the system install: stop and disable the user copy in the desktop user's manager.
+        Best effort (the manager may not be running: then nothing runs either)."""
+        if not self._path(USER_UNIT).exists():
+            return
+        try:
+            self._runner.run(
+                ["systemctl", "--user", "--machine", f"{self._account.name}@.host", "disable", "--now", SERVICE]
+            )
+        except ModuleError as error:
+            sys.stderr.write(f"{NAME}: warning: could not retire the rootless copy: {error}\n")
+
+    def _require_privilege(self) -> None:
+        if self._is_root:
+            raise ModuleError("the rootless copy is installed by the desktop user, not by root")
+        if (self._root / BIN).exists():
+            raise ModuleError(
+                f"/{BIN} exists, so the system service owns the sentinel and this user copy would not start "
+                "(ConditionPathExists): the root install is the one to repair (run apply with sudo available)"
+            )
+
+    def _unit_text(self) -> str:
+        env = [
+            ("USER", self._account.name),
+            ("UID", str(self._account.uid)),
+            ("LOG", USER_LOG.replace("~", "%h", 1)),
+            *self._options.env,
+        ]
+        body = "".join(f"Environment=MEM_SENTINEL_{key}={value}\n" for key, value in env)
+        return (
+            "# Managed by ubuntu-tweaks (profile module mem-sentinel, rootless failover): edit [modules.mem-sentinel], not this file.\n"
+            "[Unit]\n"
+            "Description=mem-sentinel, user-level copy (per-omp-session memory watchdog)\n"
+            "# the system install wins as soon as it exists\n"
+            f"ConditionPathExists=!/{BIN}\n"
+            "\n[Service]\n"
+            f"ExecStart=/usr/bin/python3 -u %h/{USER_SCRIPT}\n"
+            "Restart=always\nRestartSec=5\nEnvironment=PYTHONUNBUFFERED=1\nStandardOutput=null\nStandardError=journal\n"
+            f"{body}"
+            "\n[Install]\nWantedBy=default.target\n"
+        )
+
+    def _planned(self, source: Source | None) -> list[Planned]:
+        installed = _read(self._path(USER_SCRIPT))
+        return [
+            Planned(USER_SCRIPT, source.script if source else installed, 0o755, code=True),
+            Planned(USER_UNIT, self._unit_text().encode(), 0o644),
+        ]
+
+    def _prepare_log(self) -> None:
+        self._path(USER_LOG[2:]).parent.mkdir(parents=True, exist_ok=True)
+
+
+def build(env: Mapping[str, str]) -> tuple[MemSentinel, UserSentinel | None]:
+    text = env.get(CONFIG_ENV, "")
+    try:
+        raw = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError as error:
+        raise ModuleError(f"{CONFIG_ENV} is not valid JSON: {error}") from error
+    if not isinstance(raw, dict):
+        raise ModuleError(f"{CONFIG_ENV} must be a JSON object")
+    options = parse_options(raw)
+    staged = env.get(ROOT_ENV)
+    account = invoking_account(env)
+    is_root = os.geteuid() == 0
+    if is_root and account.uid == 0 and not staged:
+        raise ModuleError(
+            "cannot tell which desktop user the sentinel is for (no SUDO_USER or PKEXEC_UID): run apply from that "
+            "user's session, not from a root shell"
+        )
+    system = MemSentinel(
+        Runner(), Path(staged) if staged else Path("/"), account, options, staged=bool(staged), is_root=is_root
+    )
+    user = None if staged else UserSentinel(Runner(), Path("/"), account, options, staged=False, is_root=is_root)
+    return system, user
+
+
+def choose(system: MemSentinel, user: UserSentinel | None) -> MemSentinel:
+    """check and status judge the rootless copy only on a machine that has no system install but has that copy."""
+    if user is not None and user.present() and not system.system_installed() and not system.is_root:
+        return user
+    return system
+
+
+def main(system: MemSentinel, user: UserSentinel | None, argv: Sequence[str], out, err) -> int:
+    commands = ("check", "status", "plan", "install", "install-user")
+    if len(argv) != 1 or argv[0] not in commands:
+        err.write(f"usage: {NAME} {'|'.join(commands)}\n")
+        return 2
+    command = argv[0]
+    try:
+        if command == "install":
+            system.apply()
+            if user is not None:
+                user.retire()  # the system service replaces the rootless copy: both would steer the same session
+            return 0
+        if command == "install-user":
+            if user is None:
+                raise ModuleError("install-user needs a desktop user (run it as that user, not as root)")
+            user.apply()
+            return 0
+        module = choose(system, user)
+        beside = module is system and user is not None and not system.is_root and user.running_beside_system()
+        if command == "plan":
+            for line in module.plan():
+                out.write(line + "\n")
+            if beside:
+                out.write(
+                    "systemctl --user disable --now mem-sentinel.service (retire the rootless copy the service replaces)\n"
+                )
+            return 0
+        findings = module.findings(module.check_source())
+        if beside:
+            findings.append(
+                Finding(
+                    False,
+                    "no rootless copy of mem-sentinel runs beside the service",
+                    "run apply with root to retire it",
+                )
+            )
+    except (ModuleError, OSError) as error:
+        err.write(f"{NAME}: {error}\n")
+        return 1
+    unmet = [finding for finding in findings if not finding.ok]
+    for finding in findings if command == "status" else unmet:
+        out.write(finding.line() + "\n")
+    return 3 if unmet else 0
+
+
+def cli(argv: Sequence[str]) -> int:
+    try:
+        system, user = build(os.environ)
+    except ModuleError as error:
+        sys.stderr.write(f"{NAME}: {error}\n")
+        return 1
+    return main(system, user, argv, sys.stdout, sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv[1:]))
