@@ -19,7 +19,7 @@ ubuntu/
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
   packages.toml             # apt / snap / flatpak / brew / uv / npm / bun / cargo names, each with a `# reason`
   units.toml                # systemd user units to enable (their files are leaves of files/.config/systemd/user)
-  coverage.d/*.toml         # `[[coverage]]` rules: who owns / why excluded; one file per topic (units.toml, packages.toml)
+  coverage.d/*.toml         # `[[coverage]]` rules: who owns / why excluded; one file per topic, e.g. units.toml, packages.toml
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)
     machine.toml            # same schema as profile.toml; wins over it (no [machine] table: hostname = dir name)

@@ -1,3 +1,63 @@
+# Packages every machine of this profile gets (`ubuntu-tweak apply` installs the missing ones, never removes). A comment
+# after a name is its reason. This PC's own additions (drivers, the docker engine, snaps, the credentialsd build deps) are in
+# machines/ubuntu-pc/packages.toml; what a module installs is not repeated here (base-tools: curl git zsh build-essential ...,
+# clipboard, quicklook, ghostty's fonts-firacode, chatgpt-guardian's xvfb and xauth, sendspin-player's libportaudio2).
+# The apt repositories (tailscale, mozilla, nvidia-container-toolkit, ...) are declared by the apt-sources module in profile.toml.
+
 apt = [
+  "tmux",          # the terminal setup runs inside it: ctmux, tmux-boot, tg-ctl, rig's tmux block, hsw-observer-agent
+  "vim",           # editor; .vimrc and the vim-plug checkout come from the dotfiles-link module
   "mosh",  # mobile shell for ssh from the phone / IDE. The laptop got `mosh-server` through Homebrew plus a /usr/local/bin symlink so sshd could find it; the apt package installs /usr/bin/mosh-server, no symlink needed
+  "playerctl",     # media-inhibit.service follows the players with it
+  "tailscale",     # the tailnet to the ODROID (Home Assistant, Whisper STT, logs) and the phone; repository: apt-sources
+  "sqlite3",       # sqlite CLI; rig's tmux-resurrect list restores sqlite3 panes
+  "forgejo-cli",   # `fj` for git.hyperide.ai (rig/config.yaml fj.host; the git credential helper git-credential-fj)
+  "cargo",         # provides `cargo` for the cargo list below on a machine without rustup (this PC's ~/.cargo rustup toolchain, installed by passkey-qr for credentialsd, comes first on PATH)
+  "rustc",         # cargo's compiler, apt's copy
+]
+
+# Classic-confinement snaps (`snap install --classic`).
+snap_classic = [
+  "code",          # VS Code; the laptop had it
+]
+
+# Homebrew formulae, installed by the brew module's `formulae` post. vale is not here: rig's tools.items.text-lint asks for it.
+brew = [
+  "fzf",           # fuzzy finder; on both machines
+  "abduco",        # rig's harness wrappers run the agent CLIs under it (no apt package on 26.04)
+  "mergiraf",      # syntax-aware git merge driver: files/.config/git/attributes routes *.ts, *.py, *.json ... merges to it
+  "htop",          # the process viewer whose config files/.config/htop tracks
+]
+
+# Tools installed per user (`uv tool install`); the receipts of ~/.local/share/uv/tools say where each came from.
+# hyper-rig (the rig CLI itself) is the rig module's: coverage.d/packages.toml.
+uv = [
+  "hyper-qa @ git+https://git.hyperide.ai/ultrabricks/qa-cli.git",             # the `qa` CLI (rig tools.items.qa); the receipt is the ~/xp/qa-cli checkout, whose origin this is and whose HEAD is pushed
+  "hyper-text-lint @ git+https://git.hyperide.ai/ultrabricks/text-lint.git",   # `text-lint` and `slop-check` (rig tools.items.text-lint); the receipt is the ~/dev/text-lint checkout, same origin rule
+  "glances[web]",                  # Glances with its web UI (glances.service is linked, not enabled by apply: issue 58)
+  "esphome==2026.9.1",             # ESPHome (the ESP32 Bluetooth proxy and other devices); pinned as on this PC
+  "esptool",                       # flashing ESP32 boards (esphome's companion)
+  "py-spy",                        # sampling profiler for Python processes
+  "git-filter-repo",               # history rewrites
+  "trafilatura",                   # web page to text (the web-page-reading skill)
+  "aiw-ru>=2.5,<3",                # aiw-ru CLI from PyPI; the receipt says >=2.5,<3
+  "netprint @ git+https://github.com/alex-mextner/netprint.git@7fe2d8f1f774d635c34a6d9bc8af1c391f22fc53",  # the receipt's pinned commit
+]
+
+# `npm install -g --prefix ~/.local`: Node itself is the rootless copy in ~/.local/opt/node; on a machine without npm the
+# bun fallback installs these.
+npm = [
+  "@openai/codex",   # Codex CLI (rig harness kind codex)
+  "opencode-ai",     # OpenCode CLI
+  "agent-browser",   # browser automation CLI behind agent-browser.service and ha-host-actions
+]
+
+# `bun add -g`
+bun = [
+  "cf",              # Cloudflare's CLI (1.0.0-beta.20 is its latest tag)
+]
+
+# `cargo install`
+cargo = [
+  "wasm-bindgen-cli",   # wasm-bindgen, wasm-bindgen-test-runner, wasm2es6js
 ]
