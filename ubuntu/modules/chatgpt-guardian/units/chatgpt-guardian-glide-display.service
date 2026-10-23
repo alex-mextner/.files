@@ -1,0 +1,21 @@
+[Unit]
+Description=Private local X display for ChatGPT Guardian glide.vc
+StartLimitIntervalSec=300
+StartLimitBurst=2
+
+[Service]
+Type=simple
+UMask=0077
+RuntimeDirectory=chatgpt-guardian-glide-display
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/bash -c 'touch "$XDG_RUNTIME_DIR/chatgpt-guardian-glide-display/Xauthority"; /usr/bin/xauth -f "$XDG_RUNTIME_DIR/chatgpt-guardian-glide-display/Xauthority" add :111 MIT-MAGIC-COOKIE-1 "$(/usr/bin/mcookie)"'
+ExecStart=@XVFB@ :111 -screen 0 1280x1000x24 -nolisten tcp -auth %t/chatgpt-guardian-glide-display/Xauthority
+Restart=on-failure
+RestartSec=30
+CPUQuota=25%
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
