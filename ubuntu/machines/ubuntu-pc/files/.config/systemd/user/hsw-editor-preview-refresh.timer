@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 30 min: refresh HSW editor preview if inputs changed
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

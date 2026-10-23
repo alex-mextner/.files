@@ -28,3 +28,8 @@ check = ["systemctl", "--user", "is-enabled", "sendspin-ubuntu-pc.service"]
 match = ["file:~/.local/bin/sendspin"]
 class = "tracked"
 reason = "link made by the `sendspin-tool` post (uv tool install sendspin)"
+
+[[coverage]]
+match = ["unit:sendspin-ubuntu-pc.service"]
+class = "tracked"
+reason = "the player unit shipped in machines/ubuntu-pc/files and enabled by this module's `enable` post"

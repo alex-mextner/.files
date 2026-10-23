@@ -1,0 +1,17 @@
+[Unit]
+Description=HSW read-only event reviewer on ubuntu-pc
+After=network-online.target
+
+[Service]
+Type=forking
+Environment=PATH=/home/ultra/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TERM=xterm-256color
+ExecStart=/usr/bin/tmux -L hsw-observer new-session -d -s observer -c /home/ultra/.local/state/hsw-host-migration/observer-agent -x 160 -y 45 /home/ultra/.local/state/hsw-host-migration/observer-agent/run.sh
+ExecStop=/usr/bin/tmux -L hsw-observer kill-session -t observer
+Restart=always
+RestartSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Conloca monitor (prod, CI, PRs, build server, auth brokers)
+
+[Service]
+Type=oneshot
+ExecStart=/home/ultra/work/bin/conloca-watch
+Environment=PATH=/home/ultra/.local/bin:/usr/local/bin:/usr/bin:/bin

@@ -19,13 +19,13 @@ ubuntu/
   settings/**/*.ini         # settings bundles: dconf keyfiles named by purpose (dev-keyboard.ini, laptop/power.ini), shared by all machines
   files/                    # mirrors $HOME: files/.config/mimeapps.list -> ~/.config/mimeapps.list
   packages.toml             # apt / snap / flatpak names
-  coverage.d/*.toml         # [[coverage]] rules: what `ubuntu-tweak coverage` counts as excluded (reason), secret (where it is restored from) or untracked (with a ticket)
+  units.toml                # systemd user units to enable (their files are leaves of files/.config/systemd/user)
   system.toml               # root-level: timezone, locale, console keyboard
   machines/<hostname>/      # overlay, one dir per machine (hostname = /etc/hostname, or --machine)
     machine.toml            # same schema as profile.toml; wins over it (no [machine] table: hostname = dir name)
     settings/**/*.ini       # key-level overlay bundles on top of the shared ones
     files/                  # path-level overlay: same relative path wins over shared files/
-    packages.toml  system.toml   # same schema, merged (lists union, scalars replace)
+    packages.toml  system.toml  units.toml   # same schema, merged (lists union, scalars replace)
 ```
 
 Only `profile.toml` and `machines/home/machine.toml` exist initially; the rest appears
@@ -66,9 +66,12 @@ by itself (notification app ids, Ptyxis profile uuids, input-source MRU order, .
 `ubuntu-tweak capture --dry-run` is the explicit no-write preview (SUMMARY block first, `--summary`
 prints only that).
 
-`packages.toml` takes the arrays `apt`, `snap`, `flatpak` plus two optional scalars:
-`flatpak_remote = "flathub"` (the remote flatpaks install from) and `apt_update = true` (run
-`apt-get update` before the apt batch).
+`packages.toml` takes the arrays `apt`, `snap`, `snap_classic`, `flatpak`, `brew` and the user-level tool lists
+`uv`, `npm`, `bun`, `cargo`, `pipx` (install specs: `"glances[web]"`, `"name @ git+https://..."`), plus two optional
+scalars: `flatpak_remote = "flathub"` (the remote flatpaks install from) and `apt_update = true` (run
+`apt-get update` before the apt batch). `units.toml` lists the systemd user units that must be enabled; a unit stays out
+of it while the code it runs is not reproduced by the profile (https://github.com/alex-mextner/.files/issues/58), though its
+file is still linked.
 
 ## Fresh machine bootstrap
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=Scan web UIs of online network devices every 6 hours (devices only, not the router)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

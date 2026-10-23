@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for new Snapmaker Orca releases
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 00/3:00:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

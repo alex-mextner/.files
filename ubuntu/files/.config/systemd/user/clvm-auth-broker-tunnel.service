@@ -1,0 +1,16 @@
+# Reverse tunnel: the clvm build box's 127.0.0.1:18765 -> this workstation's omp
+# auth-broker (omp-auth-broker.service). The box's omp has auth.broker.url pointed at
+# it, so review seats on the box use this workstation's omp accounts without copying
+# OAuth refresh tokens (copied refresh tokens rotate and log one side out).
+[Unit]
+Description=Reverse SSH tunnel for the omp auth-broker to the clvm build box
+After=network-online.target omp-auth-broker.service
+Wants=omp-auth-broker.service
+
+[Service]
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:18765:127.0.0.1:18765 ultra@65.21.40.51
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

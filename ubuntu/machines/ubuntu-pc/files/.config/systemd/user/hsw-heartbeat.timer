@@ -1,0 +1,11 @@
+[Unit]
+Description=HSW proactive local reflection every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+AccuracySec=5s
+Persistent=false
+Unit=hsw-heartbeat.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh HSW editor preview when main or a WIP worktree changed
+
+[Service]
+Type=oneshot
+ExecStart=%h/.cache/hsw-editor/preview/check-and-refresh.sh
+Environment=PATH=/home/ultra/.local/bin:/home/ultra/.local/bin:/home/ultra/.bun/bin:/home/ultra/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.nvm/versions/node/v24.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+TimeoutStartSec=1200
+Nice=10

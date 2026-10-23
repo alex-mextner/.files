@@ -1,0 +1,12 @@
+# Parent slice for all omp sessions (one omp-<N>.scope per session, created by
+# ~/.local/bin/omp). On 2026-10-11 every session shared one ptyxis scope, so
+# systemd-oomd (which watched only user@1000.service at 50 %/20 s) had no
+# single hog to kill and the box thrashed for 18 min. Monitoring this slice
+# makes oomd pick the worst omp-*.scope (one session) at 40 % pressure.
+[Unit]
+Description=omp agent sessions (one scope per session, oomd-monitored)
+
+[Slice]
+MemoryAccounting=yes
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=40%
