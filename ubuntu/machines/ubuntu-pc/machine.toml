@@ -36,3 +36,15 @@ chats_glide = [
   "https://chatgpt.com/c/6aac7b42-40c0-83ed-8134-f569366b818f",
   "https://chatgpt.com/c/6ace8a63-3aec-83eb-a59f-202a585bc0ce",
 ]
+
+# Laptop parity (the laptop `home` had these GNOME extensions enabled; modules live in the engine).
+[modules.gsconnect]
+enabled = true
+
+[modules.allowlockedremotedesktop]
+enabled = true
+
+# Unattended self-heal: a user timer re-runs `ubuntu-tweak apply --commit --no-sudo` at login and daily
+# (never asks for root; the root remainder waits for an interactive `ubuntu-tweak apply --commit`).
+[modules.autoheal]
+enabled = true
