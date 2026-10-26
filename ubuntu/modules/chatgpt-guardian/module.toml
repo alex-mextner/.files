@@ -5,7 +5,7 @@ manual = "log in to ChatGPT once in each guardian browser profile (home account 
 
 # User level: writes $HOME and talks to the user's systemd, so it never runs as root. Options
 # ([modules.chatgpt-guardian] in profile.toml / machine.toml): repo, dir, package, chrome, home_port, glide_port,
-# xvfb, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin).
+# xvfb, home_memory_high, home_memory_max, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin and passed to the glide guardian unit).
 #
 # Personal module: the two accounts (workspaces `home` and `glide.vc`), their control ports 8790/8791 and the private
 # display :111 are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
@@ -37,7 +37,7 @@ reason = "chatgpt-guardian/<workspace>.json are written by this module (the unit
 
 # The one human step of the glide.vc browser: its Chrome profile lives on the private display, so the owner signs in
 # once in a visible window opened on the same profile. `./relogin` (see its header) stops the glide units, opens the
-# window, waits until it is closed, starts the units again and verifies them. `check` asks the running browser which
+# window, waits until it is closed, starts the units again and verifies them. `check --live` (the glide guardian unit's ExecStartPre) only asks the browser and never uses the marker; `check` asks the running browser which
 # account is signed in (the email domain `glide_email_domain`, default glide.vc), and falls back to the marker file
 # that `run` writes after a verified relogin. The `home` account is not part of it: its browser is a window on this desktop.
 [[finish]]

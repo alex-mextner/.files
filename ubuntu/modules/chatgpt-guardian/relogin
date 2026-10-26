@@ -5,6 +5,11 @@ The glide.vc guardian browser (chatgpt-guardian-glide-browser) lives on a privat
 type a password into it. This helper is the human part of the `glide-chatgpt-login` finish step (module.toml):
 
   relogin check   exit 0 = the glide.vc account is signed in, 1 = it is not (or cannot be told), 2 = usage/config
+  relogin check --live
+                  like check, but ONLY the browser's answer counts: exit 0 solely when the browser shows the right
+                  domain; an unreachable browser is retried within CHATGPT_RELOGIN_ACCOUNT_TIMEOUT, then exit 1
+                  (never the marker). The glide guardian unit runs it as ExecStartPre, so the sender never starts
+                  while the browser is signed in to another account.
   relogin run     stop the glide.vc guardian units, open the SAME profile in a visible Chrome window on the real
                   desktop, wait until that window is closed, start the units again in dependency order and verify
 
@@ -43,6 +48,7 @@ Environment (all optional; tests and throwaway experiments set them so the real 
   CHATGPT_RELOGIN_JOURNALCTL      command (shell syntax) default "journalctl --user"
   CHATGPT_RELOGIN_GUARDIAN_UNIT / _OBSERVER_UNIT / _BROWSER_UNIT    defaults chatgpt-guardian-glide, -observer, -browser
   CHATGPT_RELOGIN_DEVTOOLS_PORT   default: module option glide_port, else 9223
+  CHATGPT_RELOGIN_DOMAIN          email domain the account must have (like glide_email_domain; wins over the module option)
   CHATGPT_RELOGIN_MARKER          default ~/.local/state/ubuntu-tweaks/chatgpt-guardian-glide-login
   CHATGPT_RELOGIN_STOP_TIMEOUT    seconds to stop the units / free the profile (default 120)
   CHATGPT_RELOGIN_VERIFY_TIMEOUT  seconds for the units and the health line of step 5 (default 180: the guardian polls once a minute)
@@ -78,6 +84,7 @@ from urllib.parse import urlparse
 
 DEFAULT_DOMAIN = "glide.vc"
 DEFAULT_PORT = 9223
+DOMAIN_PATTERN = r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 STOPPED_STATES = ("inactive", "failed", "unknown")  # what is-active says of a unit that is not running (or not loaded)
@@ -97,7 +104,7 @@ PAGE_SCRIPT = """(async () => {
 
 TEXT = {
     "en": {
-        "usage": "usage: relogin check | run",
+        "usage": "usage: relogin check [--live] | run",
         "bad_option": "module option {name}: {why}",
         "ok_account": "glide.vc ChatGPT account is signed in (email domain {domain})",
         "wrong_account": "the guardian browser is signed in with another account (email domain {domain}, need {want})",
@@ -106,6 +113,7 @@ TEXT = {
         "no_answer": "could not ask the browser ({reason})",
         "marker_yes": "{asked}; the marker says the re-login was done on {when}",
         "marker_no": "{asked}; there is no marker of a finished re-login either",
+        "live_unavailable": "{asked}; --live uses no marker fallback, so the account is unconfirmed",
         "why_port": "no DevTools answer on port {port}",
         "why_tab": "no chatgpt.com tab is open",
         "why_unreadable": "the session answer was not readable",
@@ -136,7 +144,7 @@ TEXT = {
         "wrong_after": "the window was closed, but the account is wrong: {what}",
     },
     "ru": {
-        "usage": "использование: relogin check | run",
+        "usage": "использование: relogin check [--live] | run",
         "bad_option": "опция модуля {name}: {why}",
         "ok_account": "аккаунт ChatGPT glide.vc залогинен (домен почты {domain})",
         "wrong_account": "в браузере стража другой аккаунт (домен почты {domain}, нужен {want})",
@@ -145,6 +153,7 @@ TEXT = {
         "no_answer": "не удалось спросить браузер ({reason})",
         "marker_yes": "{asked}; по метке перелогин был сделан {when}",
         "marker_no": "{asked}; и метки о выполненном перелогине тоже нет",
+        "live_unavailable": "{asked}; --live не использует метку, поэтому аккаунт не подтверждён",
         "why_port": "на порту DevTools {port} нет ответа",
         "why_tab": "нет открытой вкладки chatgpt.com",
         "why_unreadable": "ответ сессии не удалось прочитать",
@@ -238,8 +247,12 @@ def load_settings(env: dict) -> Settings:
     if not isinstance(options, dict):
         raise ConfigError("UBUNTU_TWEAK_MODULE_CONFIG must be a JSON object")
     domain = options.get("glide_email_domain", DEFAULT_DOMAIN)
-    if not isinstance(domain, str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", domain):
+    if not isinstance(domain, str) or not re.fullmatch(DOMAIN_PATTERN, domain):
         raise ConfigError(TEXT[lang]["bad_option"].format(name="glide_email_domain", why="must be a domain name such as glide.vc"))
+    if env.get("CHATGPT_RELOGIN_DOMAIN"):
+        domain = env["CHATGPT_RELOGIN_DOMAIN"]
+        if not re.fullmatch(DOMAIN_PATTERN, domain):
+            raise ConfigError(f"CHATGPT_RELOGIN_DOMAIN must be a domain name such as glide.vc: {domain}")
     port_text = env.get("CHATGPT_RELOGIN_DEVTOOLS_PORT") or str(options.get("glide_port", DEFAULT_PORT))
     if not re.fullmatch(r"[0-9]+", port_text) or not 0 < int(port_text) <= 65535:
         raise ConfigError(TEXT[lang]["bad_option"].format(name="glide_port", why=f"not a port: {port_text}"))
@@ -479,6 +492,25 @@ def cmd_check(settings: Settings) -> int:
         tell(settings.say("marker_yes", asked=asked, when=when))
         return 0
     tell(settings.say("marker_no", asked=asked))
+    return 1
+
+
+def cmd_check_live(settings: Settings) -> int:
+    """Only the browser's answer counts, never the marker: 'unavailable' is retried, then it is a failure."""
+    deadline = time.monotonic() + settings.account_timeout
+    while True:
+        answer = probe(settings.port, max(1.0, min(settings.probe_timeout, deadline - time.monotonic())))
+        if answer.kind != "unavailable" or time.monotonic() >= deadline:
+            break
+        time.sleep(settings.poll)
+    if answer.kind == "account" and answer.domain == settings.domain:
+        tell(settings.say("ok_account", domain=answer.domain))
+        return 0
+    if answer.kind != "unavailable":
+        tell(describe_account(settings, answer))
+        return 1
+    asked = settings.say("no_answer", reason=settings.say(answer.reason, port=settings.port))
+    tell(settings.say("live_unavailable", asked=asked))
     return 1
 
 
@@ -740,7 +772,7 @@ def cmd_run(settings: Settings) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 1 or argv[0] not in ("check", "run"):
+    if argv not in (["check"], ["check", "--live"], ["run"]):
         print(TEXT["en"]["usage"], file=sys.stderr)
         return 2
     try:
@@ -748,7 +780,12 @@ def main(argv: list[str]) -> int:
     except ConfigError as error:
         print(f"relogin: {error}", file=sys.stderr)
         return 2
-    code = cmd_check(settings) if argv[0] == "check" else cmd_run(settings)
+    if argv == ["run"]:
+        code = cmd_run(settings)
+    elif argv == ["check", "--live"]:
+        code = cmd_check_live(settings)
+    else:
+        code = cmd_check(settings)
     for stream in (sys.stdout, sys.stderr):  # a hung-up terminal must not turn the exit code into 120 at shutdown
         try:
             stream.flush()

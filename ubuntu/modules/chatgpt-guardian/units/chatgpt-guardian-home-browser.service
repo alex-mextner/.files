@@ -15,8 +15,8 @@ ExecStart=@CHROME@ --user-data-dir=%h/.local/share/agent-tools/chatgpt-guardian/
 Restart=on-failure
 RestartSec=60
 CPUQuota=200%
-MemoryHigh=3G
-MemoryMax=4G
+MemoryHigh=@HOME_MEMORY_HIGH@
+MemoryMax=@HOME_MEMORY_MAX@
 TasksMax=512
 TimeoutStopSec=45
 SendSIGKILL=no

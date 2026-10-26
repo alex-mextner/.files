@@ -37,7 +37,10 @@
 #   glide_port  DevTools port of the glide.vc browser     (default 9223)
 #   xvfb        absolute path of Xvfb    (default: /usr/bin/Xvfb, else the chatgpt-native-ha gui-runtime copy)
 #   chats_home, chats_glide   lists of https://chatgpt.com/... chat URLs to enrol (default none)
-#   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); only `relogin` reads it
+#   home_memory_high, home_memory_max   MemoryHigh / MemoryMax of the home browser unit (defaults 3G / 4G): digits and
+#                      one of K M G T, never infinity; high <= max, max >= 1G
+#   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); `relogin` reads it, and the
+#                      glide guardian unit passes it to `relogin check --live` (ExecStartPre) as CHATGPT_RELOGIN_DOMAIN
 set -euo pipefail
 
 usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
@@ -65,7 +68,8 @@ import json, os, re, shlex, sys
 
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
-         "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc"}
+         "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
+         "home_memory_high": "3G", "home_memory_max": "4G"}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -88,9 +92,23 @@ if int(opt["home_port"]) == int(opt["glide_port"]):
 for key in ("repo", "dir", "package", "chrome", "xvfb"):
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
-# read by `relogin`, not by this script: accepted here so that one option set serves both
+# read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
 if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["glide_email_domain"]):
     fail("glide_email_domain must be a domain name such as glide.vc")
+UNIT = {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}
+for key in ("home_memory_high", "home_memory_max"):
+    if not isinstance(opt[key], str) or not re.fullmatch(r"[1-9][0-9]{0,5}[KMGT]", opt[key]):
+        fail("%s must look like 3G (digits and one of K, M, G, T; never infinity): %s" % (key, opt[key]))
+
+
+def memory_bytes(text):
+    return int(text[:-1]) * 1024 * UNIT[text[-1]]
+
+
+if memory_bytes(opt["home_memory_max"]) < 1024 ** 3:
+    fail("home_memory_max must be at least 1G: %s" % opt["home_memory_max"])
+if memory_bytes(opt["home_memory_high"]) > memory_bytes(opt["home_memory_max"]):
+    fail("home_memory_high must not exceed home_memory_max: %s > %s" % (opt["home_memory_high"], opt["home_memory_max"]))
 if opt["repo"].startswith("-"):
     fail("repo must not start with '-': %s" % opt["repo"])
 for key in ("chats_home", "chats_glide"):
@@ -111,7 +129,8 @@ if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
     fail('chrome must be an absolute path or "user": %s' % opt["chrome"])
 if not opt["package"]:
     opt["package"] = opt["dir"] + "/lib/agenttools_chatgpt"
-for key in ("repo", "dir", "package", "chrome", "xvfb", "home_port", "glide_port"):
+opt["glide_domain"] = opt["glide_email_domain"].lstrip("@").lower()
+for key in ("repo", "dir", "package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 for key in ("chats_home", "chats_glide"):
     print("opt_%s=(%s)" % (key, " ".join(shlex.quote(u) for u in opt[key])))
@@ -125,6 +144,9 @@ package=$opt_package
 chrome_opt=$opt_chrome
 home_port=$opt_home_port
 glide_port=$opt_glide_port
+home_memory_high=$opt_home_memory_high
+home_memory_max=$opt_home_memory_max
+glide_domain=$opt_glide_domain
 
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 vpy="$venv/bin/python"
@@ -181,7 +203,8 @@ if left:
 sys.stdout.write(header + "\n" + text)
 PY
 }
-render_unit() { render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb"; }
+render_unit() { render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb" \
+  "HOME_MEMORY_HIGH=$home_memory_high" "HOME_MEMORY_MAX=$home_memory_max" "GLIDE_DOMAIN=$glide_domain" "RELOGIN=$here/relogin"; }
 site_pkg() { # the installed package directory in the venv
   local d
   for d in "$venv"/lib/python3*/site-packages/agenttools_chatgpt; do
@@ -378,7 +401,7 @@ if [ "$mode" = plan ]; then
     if dep_ok "$ws"; then echo "$ws: deployment file present"; else echo "$ws: chatgpt-guardian init, write $(dep_file "$ws")"; fi
     chats_of "$ws" | while IFS= read -r url; do [ -z "$url" ] || echo "$ws: watch $url (when never seen)"; done
   done
-  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers"
+  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers"
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
