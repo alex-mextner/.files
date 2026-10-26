@@ -657,3 +657,91 @@ def test_the_unit_names_default_to_the_glide_stack_the_module_ships():
         assert unit in text
     assert DISPLAY_UNIT not in text.split('"""', 2)[2], "the display unit is left alone, never named in code"
 
+
+
+# -- check --live (the guardian unit's ExecStartPre: the browser's answer or nothing) ------------------------------------
+
+LIVE_FAST = {"CHATGPT_RELOGIN_ACCOUNT_TIMEOUT": "0.5", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
+
+
+def write_marker_file(box):
+    box.marker.parent.mkdir(parents=True)
+    box.marker.write_text("2026-10-23T07:00:00+00:00 glide.vc\n", encoding="utf-8")
+
+
+def test_live_is_done_when_the_browser_shows_the_glide_domain(box, devtools):
+    server = devtools([CHATGPT_TAB], session("glide.vc"))
+    done = box.call("check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **LIVE_FAST)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "glide.vc" in done.stdout
+
+
+def test_live_never_falls_back_to_the_marker_when_the_browser_is_unreachable(box):
+    write_marker_file(box)
+    started = time.monotonic()
+    done = box.call("check", "--live", **NO_BROWSER, **LIVE_FAST)
+    assert time.monotonic() - started < 8
+    assert done.returncode == 1
+    assert "could not ask the browser" in done.stdout
+    assert "no marker fallback" in done.stdout
+    assert "2026-10-23" not in done.stdout
+
+
+def test_live_retries_an_unavailable_answer_until_the_browser_shows_up(box, devtools):
+    server = devtools([NEWTAB], session("glide.vc"))
+    proc = box.start("check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), CHATGPT_RELOGIN_ACCOUNT_TIMEOUT="10", CHATGPT_RELOGIN_PROBE_TIMEOUT="1")
+    time.sleep(0.5)
+    assert proc.poll() is None, "still waiting for a chatgpt.com tab"
+    server.tabs[:] = [CHATGPT_TAB]
+    code, out, err = finish(proc, timeout=20)
+    assert code == 0, out + err
+
+
+def test_live_fails_on_the_wrong_domain_and_prints_the_domain_only(box, devtools):
+    write_marker_file(box)
+    server = devtools([CHATGPT_TAB], session("gmail.com"))
+    done = box.call("check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **LIVE_FAST)
+    assert done.returncode == 1
+    assert "gmail.com" in done.stdout and "glide.vc" in done.stdout
+    assert "@" not in done.stdout + done.stderr
+
+
+def test_live_fails_when_signed_out(box, devtools):
+    write_marker_file(box)
+    server = devtools([CHATGPT_TAB], {"state": "none", "domain": ""})
+    done = box.call("check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **LIVE_FAST)
+    assert done.returncode == 1
+    assert "signed out" in done.stdout
+
+
+def test_plain_check_still_falls_back_to_the_marker(box):
+    write_marker_file(box)
+    assert box.call("check", **NO_BROWSER, **LIVE_FAST).returncode == 0
+
+
+def test_live_speaks_russian(box):
+    done = box.call("check", "--live", UBUNTU_TWEAK_LANG="ru", **NO_BROWSER, **LIVE_FAST)
+    assert done.returncode == 1
+    assert re.search("[а-я]", done.stdout)
+
+
+@pytest.mark.parametrize("args", [["check", "--bogus"], ["check", "--live", "x"], ["run", "--live"], ["--live"], []])
+def test_other_argument_shapes_are_usage_errors(box, args):
+    done = box.call(*args)
+    assert done.returncode == 2
+    assert "usage" in done.stderr.lower()
+
+
+def test_the_domain_env_overrides_the_module_option(box, devtools):
+    server = devtools([CHATGPT_TAB], session("example.org"))
+    done = box.call(
+        "check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), CHATGPT_RELOGIN_DOMAIN="@Example.ORG",
+        UBUNTU_TWEAK_MODULE_CONFIG=json.dumps({"glide_email_domain": "glide.vc"}), **LIVE_FAST,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_an_invalid_domain_env_is_refused(box):
+    done = box.call("check", "--live", CHATGPT_RELOGIN_DOMAIN="not a domain", **LIVE_FAST)
+    assert done.returncode == 2
+    assert "CHATGPT_RELOGIN_DOMAIN" in done.stderr

@@ -10,9 +10,14 @@ StartLimitBurst=3
 [Service]
 Type=simple
 WorkingDirectory=%h
+# The glide sender must not start while the browser is signed in to another account: ask the browser (no marker fallback).
+Environment=CHATGPT_RELOGIN_DEVTOOLS_PORT=@GLIDE_PORT@
+Environment=CHATGPT_RELOGIN_DOMAIN=@GLIDE_DOMAIN@
+ExecStartPre=@RELOGIN@ check --live
 ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace glide.vc live --cdp http://127.0.0.1:@GLIDE_PORT@ --poll-interval 60 --max-pages 6 --min-available-mib 2048 --control-port 8791 --private-display --apply
+# 120 s x Burst 3 >= the 300 s interval: a persistent failure restarts at 0/120/240 s and never trips the start limit for good.
 Restart=on-failure
-RestartSec=60
+RestartSec=120
 CPUQuota=25%
 MemoryHigh=256M
 MemoryMax=768M

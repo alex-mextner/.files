@@ -15,8 +15,9 @@ Environment=TMPDIR=%h/.cache/chatgpt-guardian-monitor
 CacheDirectory=chatgpt-guardian-monitor
 CacheDirectoryMode=0700
 ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace home observer --cdp http://127.0.0.1:@HOME_PORT@ --interval 60
+# 120 s x Burst 3 >= the 300 s interval: a persistent failure restarts at 0/120/240 s and never trips the start limit for good.
 Restart=on-failure
-RestartSec=60
+RestartSec=120
 Nice=10
 CPUQuota=15%
 MemoryHigh=192M

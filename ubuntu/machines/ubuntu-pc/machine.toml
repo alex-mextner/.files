@@ -24,13 +24,28 @@ enabled = true
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).
+# The 3G default MemoryHigh of the home browser caused more than a million reclaim-throttle events on this 60 GiB machine.
+home_memory_high = "6G"
+home_memory_max = "8G"
+# The home browser runs on its own private Xvfb :112 (unit chatgpt-guardian-home-display), not on the desktop: a visible window
+# cannot be safely probed or focused by the guardian, and Chrome throttles the frames of a background tab. The home guardian is
+# then told --private-display; a profile that is signed in stays signed in.
+home_private_display = true
 chats_home = [
   "https://chatgpt.com/c/6ad8058d-4bac-83eb-88fa-8975fae297cc",
   "https://chatgpt.com/c/6ad3a9c9-bf94-83ed-91c5-d23f4b34f54d",
+  # Chihuahua
+  "https://chatgpt.com/c/6adceea6-2ad8-83ed-98c4-5fad5308956c",
+  # active Odroid
+  "https://chatgpt.com/c/6adcb4fa-dfd0-83eb-a016-dd7c908cfc37",
+  # active CCCC chat
+  "https://chatgpt.com/c/6adb6385-b8f8-83ed-935a-7e3adab09c81",
 ]
 chats_glide = [
   "https://chatgpt.com/c/6aac7b42-40c0-83ed-8134-f569366b818f",
   "https://chatgpt.com/c/6ace8a63-3aec-83eb-a59f-202a585bc0ce",
+  # the newest glide.vc chat, alongside StateLib and Canvas above
+  "https://chatgpt.com/c/6abe65a4-77e0-83eb-9ecc-56ec6ba10d9a",
 ]
 
 # iCloud Passwords (engine module `passwords-app`, enabled in ../../profile.toml). `finish-setup` runs
