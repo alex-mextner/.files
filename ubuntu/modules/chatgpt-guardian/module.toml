@@ -1,14 +1,14 @@
 description = "ChatGPT guardian (agent-tools): venv + chatgpt-guardian CLI, user-level Chrome when asked, two dedicated browsers (home account, glide.vc account), guardian + observer services, enrolled chats; no OpenAI API key"
 enabled = false   # a machine opts in: [modules.chatgpt-guardian] enabled = true in machines/<host>/machine.toml
 order = 130       # after rig (100) and tg-cli (120)
-manual = "log in to ChatGPT once in each guardian browser profile (home account on its debug port, glide.vc account on its private display; the profile keeps the login, the output names which one is signed out), then run apply again; the guardian tunnel (ChatGPT -> local MCP) needs an OpenAI platform API key and is NOT part of this module"
+manual = "log in to ChatGPT once in each guardian browser profile (home account on its debug port, or with home_private_display in a normal Chrome window on its profile while the home units are stopped; glide.vc account on its private display; the profile keeps the login, the output names which one is signed out), then run apply again; the guardian tunnel (ChatGPT -> local MCP) needs an OpenAI platform API key and is NOT part of this module"
 
 # User level: writes $HOME and talks to the user's systemd, so it never runs as root. Options
 # ([modules.chatgpt-guardian] in profile.toml / machine.toml): repo, dir, package, chrome, home_port, glide_port,
-# xvfb, home_memory_high, home_memory_max, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin and passed to the glide guardian unit).
+# xvfb, home_memory_high, home_memory_max, home_private_display, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin and passed to the glide guardian unit).
 #
 # Personal module: the two accounts (workspaces `home` and `glide.vc`), their control ports 8790/8791 and the private
-# display :111 are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
+# displays (:111 glide.vc, :112 home when home_private_display is true) are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
 # chrome = "user" installs a rootless Chrome from the HTTPS download of dl.google.com (Google publishes no checksum for the
 # `current` package) under ~/.local/opt and runs it with --no-sandbox (unprivileged user namespaces are AppArmor-restricted
 # and there is no setuid helper without root), through the dedicated wrapper ~/.local/bin/chatgpt-guardian-chrome that only
@@ -20,7 +20,7 @@ install = "install.sh"
 check = "install.sh --check"
 preview = "install.sh --plan"
 
-# The glide.vc browser runs on a private X display (Xvfb); mcookie and xauth come with util-linux / xauth.
+# The glide.vc browser (and the home browser when home_private_display is true) runs on a private X display (Xvfb); mcookie and xauth come with util-linux / xauth.
 [deps]
 apt = ["xvfb", "xauth"]
 
@@ -39,7 +39,7 @@ reason = "chatgpt-guardian/<workspace>.json are written by this module (the unit
 # once in a visible window opened on the same profile. `./relogin` (see its header) stops the glide units, opens the
 # window, waits until it is closed, starts the units again and verifies them. `check --live` (the glide guardian unit's ExecStartPre) only asks the browser and never uses the marker; `check` asks the running browser which
 # account is signed in (the email domain `glide_email_domain`, default glide.vc), and falls back to the marker file
-# that `run` writes after a verified relogin. The `home` account is not part of it: its browser is a window on this desktop.
+# that `run` writes after a verified relogin. The `home` account is not part of it: its browser is a window on this desktop (or, with home_private_display, on its own display :112 where its profile stays signed in).
 [[finish]]
 id = "glide-chatgpt-login"
 title = "Sign in to ChatGPT with the glide.vc account"
@@ -51,13 +51,13 @@ action_ru = "Откроется окно Chrome с профилем glide.vc: в
 check = ["./relogin", "check"]
 run = ["./relogin", "run"]
 
-# The seven units install.sh renders from units/ and enables. guardian-tunnel.service is not here: it is the user's own unit
+# The seven units install.sh renders from units/ and enables, plus the home display when home_private_display is true. guardian-tunnel.service is not here: it is the user's own unit
 # (files/.config/systemd/user), the module only gates it off with a drop-in until a platform API key exists.
 [[coverage]]
 match = [
   "unit:chatgpt-guardian-home.service", "unit:chatgpt-guardian-home-browser.service", "unit:chatgpt-guardian-home-observer.service",
   "unit:chatgpt-guardian-glide.service", "unit:chatgpt-guardian-glide-browser.service", "unit:chatgpt-guardian-glide-observer.service",
-  "unit:chatgpt-guardian-glide-display.service",
+  "unit:chatgpt-guardian-glide-display.service", "unit:chatgpt-guardian-home-display.service",
 ]
 class = "tracked"
 reason = "rendered from units/ and enabled by the chatgpt-guardian module"

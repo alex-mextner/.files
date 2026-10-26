@@ -16,11 +16,11 @@
 #   2. ~/.local/share/agent-tools/chatgpt-guardian-venv has agenttools_chatgpt (+ playwright) identical to the package
 #   3. ~/.local/bin/chatgpt-guardian links to the venv's CLI
 #   4. Chrome: <chrome> is an executable (chrome = "user": a dpkg -x copy of google-chrome-stable under ~/.local/opt)
-#   5. Xvfb, xauth and mcookie (the glide.vc private display) are found
+#   5. Xvfb, xauth and mcookie (the private displays of glide.vc, and of home when home_private_display is true) are found
 #   6. per workspace (home, glide.vc): control token + state exist, the deployment file
 #      ~/.config/agent-tools/chatgpt-guardian/<workspace>.json exists (the units' ConditionPathExists), the
 #      configured chats are enrolled (an explicit unwatch is respected: only a chat never seen is watched)
-#   7. the seven chatgpt-guardian-* units and the browsers' lifecycle drop-ins (from the package's own templates)
+#   7. the seven chatgpt-guardian-* units (eight with home_private_display: plus chatgpt-guardian-home-display) and the browsers' lifecycle drop-ins (from the package's own templates)
 #      are installed as rendered here, stale per-machine drop-ins (90-pc.conf, 95-port.conf) are gone; displays,
 #      browsers and observers are enabled and started; a copied guardian-tunnel.service is gated off (it needs a
 #      platform API key)
@@ -39,6 +39,13 @@
 #   chats_home, chats_glide   lists of https://chatgpt.com/... chat URLs to enrol (default none)
 #   home_memory_high, home_memory_max   MemoryHigh / MemoryMax of the home browser unit (defaults 3G / 4G): digits and
 #                      one of K M G T, never infinity; high <= max, max >= 1G
+#   home_private_display   true / false (default false): run the home browser on its own private Xvfb :112 (unit
+#                      chatgpt-guardian-home-display: RuntimeDirectory and Xauthority 0700, -nolisten tcp, 256M hard cap), the
+#                      way glide.vc runs on :111. Only then does the home guardian get --private-display, which tells it
+#                      that no human window is raised or shared there: a visible desktop never gets the flag. The home login
+#                      then cannot be typed into a window of this desktop (a profile that is signed in stays signed in)
+#                      Switching it back to false does not remove an installed chatgpt-guardian-home-display unit or any drop-in;
+#                      the home browser and guardian then run on their old definition until restarted (apply prints the command)
 #   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); `relogin` reads it, and the
 #                      glide guardian unit passes it to `relogin check --live` (ExecStartPre) as CHATGPT_RELOGIN_DOMAIN
 set -euo pipefail
@@ -69,7 +76,7 @@ import json, os, re, shlex, sys
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
          "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
-         "home_memory_high": "3G", "home_memory_max": "4G"}
+         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -95,6 +102,8 @@ for key in ("repo", "dir", "package", "chrome", "xvfb"):
 # read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
 if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["glide_email_domain"]):
     fail("glide_email_domain must be a domain name such as glide.vc")
+if not isinstance(opt["home_private_display"], bool):
+    fail("home_private_display must be true or false: %s" % opt["home_private_display"])
 UNIT = {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}
 for key in ("home_memory_high", "home_memory_max"):
     if not isinstance(opt[key], str) or not re.fullmatch(r"[1-9][0-9]{0,5}[KMGT]", opt[key]):
@@ -132,6 +141,7 @@ if not opt["package"]:
 opt["glide_domain"] = opt["glide_email_domain"].lstrip("@").lower()
 for key in ("repo", "dir", "package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
+print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
 for key in ("chats_home", "chats_glide"):
     print("opt_%s=(%s)" % (key, " ".join(shlex.quote(u) for u in opt[key])))
 PY
@@ -146,6 +156,7 @@ home_port=$opt_home_port
 glide_port=$opt_glide_port
 home_memory_high=$opt_home_memory_high
 home_memory_max=$opt_home_memory_max
+home_private_display=$opt_home_private_display
 glide_domain=$opt_glide_domain
 
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
@@ -175,6 +186,14 @@ declare -A ws_unit=([home]=home [glide.vc]=glide)
 declare -A ws_port=([home]="$home_port" [glide.vc]="$glide_port")
 unit_names=(chatgpt-guardian-glide-display chatgpt-guardian-glide-browser chatgpt-guardian-glide chatgpt-guardian-glide-observer
             chatgpt-guardian-home-browser chatgpt-guardian-home chatgpt-guardian-home-observer)
+# Displays, browsers and observers are started by the module; the --apply guardians only after a verified login.
+started_units=(chatgpt-guardian-glide-display chatgpt-guardian-glide-browser chatgpt-guardian-home-browser
+               chatgpt-guardian-glide-observer chatgpt-guardian-home-observer)
+home_display_unit=chatgpt-guardian-home-display
+if [ "$home_private_display" = true ]; then
+  unit_names=("$home_display_unit" "${unit_names[@]}")
+  started_units=("$home_display_unit" "${started_units[@]}")
+fi
 stale_dropins=(90-pc.conf 95-port.conf)
 login_attempts=10
 login_wait=3
@@ -183,11 +202,21 @@ start_wait=60
 sc() { systemctl --user "$@"; }
 is_active() { [ "$(sc is-active "$1.service" 2>/dev/null || true)" = active ]; }
 is_enabled() { [ "$(sc is-enabled "$1.service" 2>/dev/null || true)" = enabled ]; }
+home_browser_unit=chatgpt-guardian-home-browser
+# Chrome's /proc/PID/environ cannot be read (the process is not dumpable), so ask the display: only the home browser holds the
+# cookie of :112, so an established client of that socket means it runs there (a running unit keeps its old definition until restarted).
+home_browser_on_private_display() {
+  local sockets x112='ESTAB[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+@?/tmp/\.X11-unix/X112[[:space:]]'
+  sockets=$(ss -xn 2>/dev/null) || return 1
+  [[ $sockets =~ $x112 ]]
+}
+# true = the private flag would claim a window that is still shared with this desktop
+home_browser_on_desktop() { [ "$home_private_display" = true ] && is_active "$home_browser_unit" && ! home_browser_on_private_display; }
 chats_of() { local -n chats="opt_chats_${ws_unit[$1]}"; printf '%s\n' "${chats[@]}"; }
 
 # -- rendering ---------------------------------------------------------------------------------
 header="# Managed by ubuntu-tweaks (profile module chatgpt-guardian); local edits are overwritten on apply."
-render() { # render TEMPLATE KEY=VALUE...: the template with every @KEY@ replaced; any other @TOKEN@ is an error
+render() { # render TEMPLATE KEY=VALUE...: the template with every @KEY@ replaced (a token alone on its line vanishes with the line when its value is empty); any other @TOKEN@ is an error
   local template=$1; shift
   python3 -B - "$template" "$header" "$@" <<'PY'
 import re, sys
@@ -196,15 +225,36 @@ path, header, *pairs = sys.argv[1:]
 text = open(path, encoding="utf-8").read()
 for pair in pairs:
     key, _, value = pair.partition("=")
-    text = text.replace("@%s@" % key, value)
+    token = "@%s@" % key
+    if not value:  # a token alone on its line vanishes with the line
+        text = re.sub(r"^%s\n" % re.escape(token), "", text, flags=re.M)
+    text = text.replace(token, value)
 left = sorted(set(re.findall(r"@[A-Z_]+@", text)))
 if left:
     sys.exit("unreplaced template token(s) in %s: %s" % (path, " ".join(left)))
 sys.stdout.write(header + "\n" + text)
 PY
 }
-render_unit() { render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb" \
-  "HOME_MEMORY_HIGH=$home_memory_high" "HOME_MEMORY_MAX=$home_memory_max" "GLIDE_DOMAIN=$glide_domain" "RELOGIN=$here/relogin"; }
+home_display_tokens() { # the template tokens that switch the home account between the desktop and its own Xvfb :112
+  if [ "$home_private_display" = true ]; then
+    # Requires + After only (no BindsTo): an Xvfb crash must not leave the browser stopped, Chrome exits on its own and is restarted
+    home_display_unit_lines="Requires=$home_display_unit.service"$'\n'"After=$home_display_unit.service"
+    # Xvfb is Type=simple (no readiness signal): wait for its socket so the first start does not race it
+    home_display_service_lines=$'Environment=DISPLAY=:112\nEnvironment=XAUTHORITY=%t/'"$home_display_unit"$'/Xauthority\nExecStartPre=/usr/bin/bash -c \'for i in $(seq 100); do [ -S /tmp/.X11-unix/X112 ] && exit 0; sleep 0.2; done; exit 1\''
+    home_private_flag=" --private-display"
+    # the flag claims that no human window is shared: no guardian start (a restart too) without a client on :112, whatever apply did
+    home_private_guard=$'ExecStartPre=/usr/bin/bash -c \'for i in $(seq 150); do /usr/bin/ss -xn | /usr/bin/grep -Eq "ESTAB +[0-9]+ +[0-9]+ +@?/tmp/[.]X11-unix/X112 " && exit 0; sleep 0.2; done; exit 1\''
+  else
+    home_display_unit_lines=""; home_display_service_lines=""; home_private_flag=""; home_private_guard=""
+  fi
+}
+render_unit() {
+  home_display_tokens
+  render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb" \
+    "HOME_MEMORY_HIGH=$home_memory_high" "HOME_MEMORY_MAX=$home_memory_max" "GLIDE_DOMAIN=$glide_domain" "RELOGIN=$here/relogin" \
+    "HOME_DISPLAY_UNIT=$home_display_unit_lines" "HOME_DISPLAY_SERVICE=$home_display_service_lines" "HOME_PRIVATE_FLAG=$home_private_flag" \
+    "HOME_PRIVATE_GUARD=$home_private_guard"
+}
 site_pkg() { # the installed package directory in the venv
   local d
   for d in "$venv"/lib/python3*/site-packages/agenttools_chatgpt; do
@@ -373,6 +423,10 @@ if [ "$mode" = check ]; then
         done
       fi
     done
+    if [ "$home_private_display" = true ] && dep_ok home; then
+      is_active "$home_display_unit" || problems+=("$home_display_unit.service is not active")
+      if home_browser_on_desktop; then problems+=("$home_browser_unit.service still runs on the desktop display, not on :112: restart it"); fi
+    fi
   else
     echo "systemctl --user is unavailable (no user bus): the check cannot decide" >&2
     exit 1
@@ -401,7 +455,7 @@ if [ "$mode" = plan ]; then
     if dep_ok "$ws"; then echo "$ws: deployment file present"; else echo "$ws: chatgpt-guardian init, write $(dep_file "$ws")"; fi
     chats_of "$ws" | while IFS= read -r url; do [ -z "$url" ] || echo "$ws: watch $url (when never seen)"; done
   done
-  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers"
+  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers"
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
@@ -534,8 +588,7 @@ start_unit() {
 }
 
 # Only stopped units are started: a running browser keeps its windows; a changed unit takes effect at its next restart.
-for n in chatgpt-guardian-glide-display chatgpt-guardian-glide-browser chatgpt-guardian-home-browser \
-         chatgpt-guardian-glide-observer chatgpt-guardian-home-observer; do
+for n in "${started_units[@]}"; do
   enable_unit "$n"
   start_unit "$n"
 done
@@ -544,6 +597,7 @@ done
 # started only once its profile is signed in.
 signed_out=()
 unreachable=()
+desktop_browser=0
 for ws in "${workspaces[@]}"; do
   state=unreachable
   for _ in $(seq "$login_attempts"); do
@@ -552,7 +606,15 @@ for ws in "${workspaces[@]}"; do
     sleep "$login_wait"
   done
   case "$state" in
-    yes) enable_unit "chatgpt-guardian-${ws_unit[$ws]}"; start_unit "chatgpt-guardian-${ws_unit[$ws]}" ;;
+    yes)
+      # the --private-display flag claims that no human window is shared: never start the guardian against a browser that is still on the desktop
+      if [ "$ws" = home ] && home_browser_on_desktop; then
+        desktop_browser=1
+        # a running guardian would take the flag from its next restart
+        if is_active chatgpt-guardian-home; then sc stop chatgpt-guardian-home.service; fi
+      else
+        enable_unit "chatgpt-guardian-${ws_unit[$ws]}"; start_unit "chatgpt-guardian-${ws_unit[$ws]}"
+      fi ;;
     no) signed_out+=("$ws") ;;
     *) unreachable+=("$ws") ;;
   esac
@@ -572,6 +634,11 @@ if [ ${#unreachable[@]} -gt 0 ]; then
   echo "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)" >&2
   exit 1
 fi
+if [ "$desktop_browser" = 1 ]; then
+  manual "the home browser still runs on the desktop display, not on the private display :112, so the home guardian was not started or, when it was running, stopped (its --private-display flag would claim a window that is shared with this desktop): restart $home_browser_unit.service (its window closes, the profile and its tabs are restored), then run apply again"
+fi
 if [ ${#signed_out[@]} -gt 0 ]; then
-  manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} (home = the browser window on this desktop, DevTools port $home_port; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
+  if [ "$home_private_display" = true ]; then home_login="home = its private display :112 (no window on this desktop: stop the home units and sign in with a normal Chrome window on the profile ~/.local/share/agent-tools/chatgpt-guardian/profiles/home), DevTools port $home_port"
+  else home_login="home = the browser window on this desktop, DevTools port $home_port"; fi
+  manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} ($home_login; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
 fi

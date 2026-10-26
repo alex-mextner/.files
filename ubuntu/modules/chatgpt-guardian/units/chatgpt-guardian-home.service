@@ -13,9 +13,11 @@ Type=simple
 UMask=0077
 WorkingDirectory=%h
 # The module (profile module chatgpt-guardian) enables and starts this unit only once the profile is signed in.
-# This is a visible desktop, so --private-display is deliberately absent: the guardian never raises a tab, and Chrome
-# throttles the frames of a background tab, so only the foreground tab of this window can be model-probed and acted on.
-ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace home live --cdp http://127.0.0.1:@HOME_PORT@ --poll-interval 60 --max-pages 6 --min-available-mib 2048 --control-port 8790 --apply
+# The private-display flag is added by the module only when home_private_display is set (the home browser then runs on its
+# own Xvfb display, so no human window is shared). On the visible desktop the flag is absent: the guardian never raises a tab,
+# and Chrome throttles the frames of a background tab, so only the foreground tab of that window can be model-probed and acted on.
+@HOME_PRIVATE_GUARD@
+ExecStart=%h/.local/share/agent-tools/chatgpt-guardian-venv/bin/chatgpt-guardian --workspace home live --cdp http://127.0.0.1:@HOME_PORT@ --poll-interval 60 --max-pages 6 --min-available-mib 2048 --control-port 8790@HOME_PRIVATE_FLAG@ --apply
 # 120 s x Burst 3 >= the 300 s interval: a persistent failure restarts at 0/120/240 s and never trips the start limit for good.
 Restart=on-failure
 RestartSec=120

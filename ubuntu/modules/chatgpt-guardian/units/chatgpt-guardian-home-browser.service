@@ -1,6 +1,7 @@
 [Unit]
 Description=ChatGPT Guardian main-account browser (dedicated home profile)
 After=graphical-session.target
+@HOME_DISPLAY_UNIT@
 PartOf=graphical-session.target
 ConditionPathExists=%h/.config/agent-tools/chatgpt-guardian/home.json
 StartLimitIntervalSec=300
@@ -11,6 +12,7 @@ Type=simple
 UMask=0077
 WorkingDirectory=%h
 UnsetEnvironment=WAYLAND_DISPLAY
+@HOME_DISPLAY_SERVICE@
 ExecStart=@CHROME@ --user-data-dir=%h/.local/share/agent-tools/chatgpt-guardian/profiles/home --remote-debugging-address=127.0.0.1 --remote-debugging-port=@HOME_PORT@ --ozone-platform=x11 --no-first-run --restore-last-session --start-maximized --window-size=1280,1000
 Restart=on-failure
 RestartSec=60
