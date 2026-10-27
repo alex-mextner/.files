@@ -27,6 +27,9 @@ chrome = "user"
 # The 3G default MemoryHigh of the home browser caused more than a million reclaim-throttle events on this 60 GiB machine.
 home_memory_high = "6G"
 home_memory_max = "8G"
+# The ChatGPT account that works for the glide guardian is chatgpt@app.glide.vc, so its exact email domain is app.glide.vc
+# (the module default glide.vc does not match it; the check stays an exact comparison).
+glide_email_domain = "app.glide.vc"
 # The home browser runs on its own private Xvfb :112 (unit chatgpt-guardian-home-display), not on the desktop: a visible window
 # cannot be safely probed or focused by the guardian, and Chrome throttles the frames of a background tab. The home guardian is
 # then told --private-display; a profile that is signed in stays signed in.
