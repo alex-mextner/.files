@@ -1,6 +1,6 @@
 [submodule "vscode-configs"]
 	path = vscode-configs
-	url = git@github.com:a-x-/vscode-configs.git
+	url = https://github.com/alex-mextner/vscode-configs.git
 [submodule "bin/git-worktree-runner"]
 	path = bin/git-worktree-runner
 	url = https://github.com/coderabbitai/git-worktree-runner

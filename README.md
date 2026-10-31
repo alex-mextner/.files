@@ -64,5 +64,5 @@ rig apply commit                    # converge the machine to rig/config.yaml
 It links `.zprofile .vimrc .gitattributes .hyper.js .tmux`, adds one marked block each to the
 machine's `~/.profile`, `~/.bashrc`, `~/.zshrc`, includes `.gitconfig.shared` from `~/.gitconfig`
 and merges `rig/config.yaml` into `~/.config/rig/config.yaml`. Machine-specific files are merged,
-never overwritten; running it twice changes nothing. The private `vscode-configs` submodule needs
-access to its repository (the script says so when it cannot clone it).
+never overwritten; running it twice changes nothing. A private submodule whose repository this machine cannot
+read is reported as a `manual:` step (the script names the owner account) instead of failing.
