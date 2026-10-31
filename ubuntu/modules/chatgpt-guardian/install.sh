@@ -7,6 +7,7 @@
 #   install.sh           make every fact below true
 #   install.sh --plan    read-only: what install is going to do
 #   install.sh --check   read-only: exit 0 = all facts hold, 3 = drift (one line each), 1 = the check broke
+#   install.sh --print-sync-wrapper   read-only: the text of the profile-sync wrapper (fact 3)
 #
 # Exit codes (the ubuntu-tweak system-module protocol): 0 ok, 3 drift (--check), 10 needs a manual step
 # (the last output line says which), anything else is a failure.
@@ -15,6 +16,9 @@
 #   1. the checkout <dir> of agent-tools exists (cloned from <repo> when missing) and holds the package
 #   2. ~/.local/share/agent-tools/chatgpt-guardian-venv has agenttools_chatgpt (+ playwright) identical to the package
 #   3. ~/.local/bin/chatgpt-guardian links to the venv's CLI
+#      and ~/.local/bin/chatgpt-guardian-profile-sync is a wrapper that runs ./profile-sync with this machine's ports and glide
+#      domain; ./profile-sync (copies the ChatGPT sign-in of the dock Chrome into a guardian profile) is OPT-IN: apply writes the
+#      wrapper and NEVER runs it, only the owner does (see the header of ./profile-sync)
 #   4. Chrome: <chrome> is an executable (chrome = "user": a dpkg -x copy of google-chrome-stable under ~/.local/opt)
 #   5. Xvfb, xauth and mcookie (the private displays of glide.vc, and of home when home_private_display is true) are found
 #   6. per workspace (home, glide.vc): control token + state exist, the deployment file
@@ -56,9 +60,10 @@ mode=install
 case "${1:-}" in
   --check) mode=check ;;
   --plan) mode=plan ;;
+  --print-sync-wrapper) mode=wrapper ;;
   "") ;;
   -h|--help) usage; exit 0 ;;
-  *) echo "usage: $0 [--plan|--check]" >&2; exit 2 ;;
+  *) echo "usage: $0 [--plan|--check|--print-sync-wrapper]" >&2; exit 2 ;;
 esac
 
 die() { echo "[modules.chatgpt-guardian] $1" >&2; exit 1; }
@@ -298,6 +303,15 @@ pkg_same() { # the installed copy holds exactly the package's code, scripts and 
   return 0
 }
 link_ok() { [ -L "$cli_link" ] && [ "$(readlink -f "$cli_link")" = "$(readlink -f "$venv/bin/chatgpt-guardian")" ]; }
+# ./profile-sync is opt-in (nothing runs it); apply only installs this wrapper, which hands it the options of this machine
+# (the DevTools ports and the glide account's email domain) the way finish-setup hands them to ./relogin.
+sync_wrapper="$HOME/.local/bin/chatgpt-guardian-profile-sync"
+sync_wrapper_text() {
+  printf '#!/usr/bin/env bash\n# written by the chatgpt-guardian module (install.sh). Opt-in: nothing runs this by itself; see profile-sync in the module.\n'
+  printf "UBUNTU_TWEAK_MODULE_CONFIG='{\"home_port\": %s, \"glide_port\": %s, \"glide_email_domain\": \"%s\"}'\\n" "$((10#$home_port))" "$((10#$glide_port))" "$glide_domain"
+  printf 'export UBUNTU_TWEAK_MODULE_CONFIG\nexec %q "$@"\n' "$here/profile-sync"
+}
+sync_wrapper_ok() { [ -f "$sync_wrapper" ] && [ ! -L "$sync_wrapper" ] && [ -x "$sync_wrapper" ] && [ "$(cat "$sync_wrapper")" = "$(sync_wrapper_text)" ]; }
 chrome_ok() { [ -x "$chrome" ] && { [ "$chrome_opt" != user ] || [ -x "$chrome_user_bin" ]; }; }
 xvfb_ok() { [ -n "$xvfb" ] && [ -x "$xvfb" ]; }
 display_tools_ok() { [ -x /usr/bin/xauth ] && [ -x /usr/bin/mcookie ]; } # the glide display unit's ExecStartPre
@@ -368,6 +382,8 @@ print(answer)
 PY
 }
 
+if [ "$mode" = wrapper ]; then sync_wrapper_text; exit 0; fi
+
 # -- --check: read-only ------------------------------------------------------------------------
 if [ "$mode" = check ]; then
   problems=()
@@ -380,6 +396,7 @@ if [ "$mode" = check ]; then
     fi
   fi
   link_ok || problems+=("$cli_link is missing or points elsewhere")
+  sync_wrapper_ok || problems+=("$sync_wrapper is missing or out of date (the opt-in profile-sync command)")
   chrome_ok || problems+=("Chrome is not executable at $chrome")
   xvfb_ok || problems+=("Xvfb not found (apt install xvfb)")
   display_tools_ok || problems+=("/usr/bin/xauth or /usr/bin/mcookie missing (apt install xauth; mcookie is util-linux)")
@@ -447,6 +464,7 @@ if [ "$mode" = plan ]; then
   if venv_ok && has_package && pkg_same; then echo "venv: $venv matches the package"
   else echo "uv venv / pip install $package[browser] into $venv"; fi
   if link_ok; then echo "link: $cli_link ok"; else echo "ln -sfn $venv/bin/chatgpt-guardian $cli_link"; fi
+  if sync_wrapper_ok; then echo "profile-sync: $sync_wrapper ok (opt-in, never run by apply)"; else echo "write $sync_wrapper (the opt-in profile-sync command; apply never runs it)"; fi
   if chrome_ok; then echo "chrome: $chrome ok"
   elif [ "$chrome_opt" = user ]; then echo "download google-chrome-stable .deb, dpkg-deb -x into $chrome_user_dir, wrapper $chrome_wrapper (--no-sandbox)"
   else echo "chrome: $chrome missing: needs manual (install google-chrome-stable or set chrome = \"user\")"; fi
@@ -492,6 +510,13 @@ mkdir -p "$(dirname "$cli_link")"
 if ! link_ok; then
   [ ! -e "$cli_link" ] || [ -L "$cli_link" ] || manual "$cli_link exists and is not a symlink; move it away"
   ln -sfn "$venv/bin/chatgpt-guardian" "$cli_link"
+fi
+
+if ! sync_wrapper_ok; then
+  [ ! -e "$sync_wrapper" ] || [ -f "$sync_wrapper" ] || manual "$sync_wrapper exists and is not a regular file; move it away"
+  sync_wrapper_text > "$sync_wrapper.tmp"
+  chmod 0755 "$sync_wrapper.tmp"
+  mv -f "$sync_wrapper.tmp" "$sync_wrapper"
 fi
 
 if ! chrome_ok; then

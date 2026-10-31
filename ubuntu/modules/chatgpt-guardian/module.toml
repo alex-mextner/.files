@@ -26,9 +26,9 @@ apt = ["xvfb", "xauth"]
 
 # What install.sh creates (facts 2, 3, 4 and the dependency files of the units).
 [[coverage]]
-match = ["file:~/.local/bin/chatgpt-guardian", "file:~/.local/bin/chatgpt-guardian-chrome", "file:~/.local/bin/pm", "file:~/.local/share/agent-tools"]
+match = ["file:~/.local/bin/chatgpt-guardian", "file:~/.local/bin/chatgpt-guardian-chrome", "file:~/.local/bin/chatgpt-guardian-profile-sync", "file:~/.local/bin/pm", "file:~/.local/share/agent-tools"]
 class = "tracked"
-reason = "the guardian venv with the CLI links (chatgpt-guardian, pm), the Chrome wrapper, and the two dedicated browser profiles under ~/.local/share/agent-tools/chatgpt-guardian; the ChatGPT login inside each profile is a manual step of this module (see `manual`)"
+reason = "the guardian venv with the CLI links (chatgpt-guardian, pm), the Chrome wrapper, the wrapper of the opt-in ./profile-sync (see the comment below), and the two dedicated browser profiles under ~/.local/share/agent-tools/chatgpt-guardian; the ChatGPT login inside each profile is a manual step of this module (see `manual`)"
 
 [[coverage]]
 match = ["file:~/.config/agent-tools"]
@@ -50,6 +50,11 @@ action = "A Chrome window opens on the glide.vc profile: sign in to ChatGPT with
 action_ru = "Откроется окно Chrome с профилем glide.vc: войди в ChatGPT аккаунтом glide.vc и закрой окно; юниты стража перезапустятся и проверятся сами"
 check = ["./relogin", "check"]
 run = ["./relogin", "run"]
+
+# OPT-IN sign-in copy: `chatgpt-guardian-profile-sync pull <home|glide>` (this directory's ./profile-sync, a wrapper of it is written
+# by install.sh and NEVER run by apply or by a finish step) copies the ChatGPT / OpenAI cookies of the dock Chrome profile
+# (~/.config/google-chrome) into a guardian profile, after stopping that profile's guardian units and with a backup and a rollback; `status` is
+# read-only. It reuses ./relogin's stop / start / verify / DevTools-probe code by import. The header of ./profile-sync has the workflow, the exit codes and the limits.
 
 # The seven units install.sh renders from units/ and enables, plus the home display when home_private_display is true. guardian-tunnel.service is not here: it is the user's own unit
 # (files/.config/systemd/user), the module only gates it off with a drop-in until a platform API key exists.

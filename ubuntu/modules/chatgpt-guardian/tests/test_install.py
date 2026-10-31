@@ -437,3 +437,61 @@ def test_display_cap_does_not_limit_the_home_browser(home, fake_bin):
     display = rendered(home, fake_bin, HOME_DISPLAY, private=True, high="6G", max="8G")
     assert unit_setting(browser, "MemoryHigh") == "6G" and unit_setting(browser, "MemoryMax") == "8G"
     assert memory_bytes(unit_setting(display, "MemoryMax")) == 256 * 1024**2
+
+
+# -- the opt-in profile-sync wrapper ---------------------------------------------------------------------------------------
+
+
+def test_plan_and_check_name_the_profile_sync_wrapper(home, fake_bin):
+    wrapper = f"{home}/.local/bin/chatgpt-guardian-profile-sync"
+    plan = run(home, fake_bin, "--plan")
+    assert f"write {wrapper}" in plan.stdout
+    assert "apply never runs it" in plan.stdout
+    check = run(home, fake_bin, "--check")
+    assert f"drift: {wrapper} is missing or out of date" in check.stdout
+    assert list(home.iterdir()) == []
+
+
+def test_the_wrapper_hands_profile_sync_the_options_of_the_machine(home, fake_bin, tmp_path):
+    done = run(home, fake_bin, "--print-sync-wrapper", config={"home_port": "09300", "glide_port": 9301, "glide_email_domain": "@App.Glide.vc"})
+    assert done.returncode == 0, done.stderr
+    assert list(home.iterdir()) == []
+    wrapper = tmp_path / "chatgpt-guardian-profile-sync"
+    wrapper.write_text(done.stdout, encoding="utf-8")
+    wrapper.chmod(0o755)
+    config = re.search(r"UBUNTU_TWEAK_MODULE_CONFIG='(.*)'", done.stdout).group(1)
+    assert json.loads(config) == {"home_port": 9300, "glide_port": 9301, "glide_email_domain": "app.glide.vc"}
+    # run it: `status` asks the two DevTools ports of this machine and reads nothing else (a temp HOME has no profiles)
+    env = {**os.environ, "HOME": str(home), "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
+    env.pop("UBUNTU_TWEAK_MODULE_CONFIG", None)
+    status = subprocess.run([str(wrapper), "status"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert status.returncode == 0, status.stderr
+    assert "home: cannot be asked (no DevTools answer on port 9300)" in status.stdout
+    assert "glide: cannot be asked (no DevTools answer on port 9301)" in status.stdout
+
+
+def test_the_module_ships_profile_sync_next_to_relogin():
+    sync = MODULE / "profile-sync"
+    assert sync.is_file() and os.access(sync, os.X_OK)
+    assert (MODULE / "relogin").is_file()
+
+
+def test_the_wrapper_survives_a_checkout_path_that_bash_quotes_with_dollar_quotes(tmp_path):
+    """printf %q writes $'...' for a non-ASCII path in the C locale: the wrapper's interpreter must be bash, not sh."""
+    module = tmp_path / "dé"
+    module.mkdir()
+    for name in ("install.sh", "profile-sync", "relogin"):
+        (module / name).write_bytes((MODULE / name).read_bytes())
+        (module / name).chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home), "LC_ALL": "C", "UBUNTU_TWEAK_MODULE_CONFIG": "{}", "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
+    printed = subprocess.run([str(module / "install.sh"), "--print-sync-wrapper"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert printed.returncode == 0, printed.stderr
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(printed.stdout, encoding="utf-8")
+    wrapper.chmod(0o755)
+    env.pop("UBUNTU_TWEAK_MODULE_CONFIG")
+    status = subprocess.run([str(wrapper), "status"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert status.returncode == 0, status.stderr
+    assert "home:" in status.stdout

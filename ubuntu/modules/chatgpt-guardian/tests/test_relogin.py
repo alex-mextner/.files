@@ -6,6 +6,7 @@ log, so the order of the stop / open / wait / start steps is asserted on that lo
 """
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -745,3 +746,14 @@ def test_an_invalid_domain_env_is_refused(box):
     done = box.call("check", "--live", CHATGPT_RELOGIN_DOMAIN="not a domain", **LIVE_FAST)
     assert done.returncode == 2
     assert "CHATGPT_RELOGIN_DOMAIN" in done.stderr
+
+
+def test_run_refuses_while_another_process_holds_the_profile_lock(box):
+    locks = box.home / ".local/state/ubuntu-tweaks/chatgpt-guardian-locks"
+    locks.mkdir(parents=True)
+    with open(locks / "glide.vc.lock", "a", encoding="utf-8") as holder:  # profile-sync's pull takes this lock too
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        done = box.call("run")
+    assert done.returncode == 1
+    assert "another relogin or profile-sync run" in done.stderr
+    assert not any(line.startswith("systemctl ") for line in box.log())
