@@ -645,3 +645,11 @@ def test_a_status_query_that_times_out_is_a_failed_stop_not_a_crash(monkeypatch,
     monkeypatch.setattr(relogin, "unit_state", hang)
     problem = relogin.stop_unit(settings, "x")
     assert problem and "could not stop x" in problem
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "soon"])
+def test_a_database_timeout_that_is_not_a_positive_finite_number_is_refused_before_anything_stops(box, value):
+    done = box.call("pull", "home", CHATGPT_PROFILE_SYNC_DB_TIMEOUT=value)
+    assert done.returncode == 2
+    assert "CHATGPT_PROFILE_SYNC_DB_TIMEOUT" in done.stderr
+    assert box.systemctl_events() == []

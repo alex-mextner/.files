@@ -307,7 +307,7 @@ link_ok() { [ -L "$cli_link" ] && [ "$(readlink -f "$cli_link")" = "$(readlink -
 # (the DevTools ports and the glide account's email domain) the way finish-setup hands them to ./relogin.
 sync_wrapper="$HOME/.local/bin/chatgpt-guardian-profile-sync"
 sync_wrapper_text() {
-  printf '#!/bin/sh\n# written by the chatgpt-guardian module (install.sh). Opt-in: nothing runs this by itself; see profile-sync in the module.\n'
+  printf '#!/usr/bin/env bash\n# written by the chatgpt-guardian module (install.sh). Opt-in: nothing runs this by itself; see profile-sync in the module.\n'
   printf "UBUNTU_TWEAK_MODULE_CONFIG='{\"home_port\": %s, \"glide_port\": %s, \"glide_email_domain\": \"%s\"}'\\n" "$((10#$home_port))" "$((10#$glide_port))" "$glide_domain"
   printf 'export UBUNTU_TWEAK_MODULE_CONFIG\nexec %q "$@"\n' "$here/profile-sync"
 }

@@ -474,3 +474,24 @@ def test_the_module_ships_profile_sync_next_to_relogin():
     sync = MODULE / "profile-sync"
     assert sync.is_file() and os.access(sync, os.X_OK)
     assert (MODULE / "relogin").is_file()
+
+
+def test_the_wrapper_survives_a_checkout_path_that_bash_quotes_with_dollar_quotes(tmp_path):
+    """printf %q writes $'...' for a non-ASCII path in the C locale: the wrapper's interpreter must be bash, not sh."""
+    module = tmp_path / "dé"
+    module.mkdir()
+    for name in ("install.sh", "profile-sync", "relogin"):
+        (module / name).write_bytes((MODULE / name).read_bytes())
+        (module / name).chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home), "LC_ALL": "C", "UBUNTU_TWEAK_MODULE_CONFIG": "{}", "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
+    printed = subprocess.run([str(module / "install.sh"), "--print-sync-wrapper"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert printed.returncode == 0, printed.stderr
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(printed.stdout, encoding="utf-8")
+    wrapper.chmod(0o755)
+    env.pop("UBUNTU_TWEAK_MODULE_CONFIG")
+    status = subprocess.run([str(wrapper), "status"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    assert status.returncode == 0, status.stderr
+    assert "home:" in status.stdout
