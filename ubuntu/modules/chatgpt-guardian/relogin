@@ -13,6 +13,9 @@ type a password into it. This helper is the human part of the `glide-chatgpt-log
   relogin run     stop the glide.vc guardian units, open the SAME profile in a visible Chrome window on the real
                   desktop, wait until that window is closed, start the units again in dependency order and verify
 
+`run` takes a per-profile lock first (CHATGPT_RELOGIN_LOCK_DIR; profile-sync's `pull` takes the same one), so the two never
+stop the units or open the profile at once.
+
 `run` in order: (1) stop chatgpt-guardian-glide, then -observer, then -browser (the display unit and everything of
 the `home` account are never touched); (2) open <profile> with the module's Chrome wrapper on the WAYLAND_DISPLAY /
 DISPLAY of the calling shell (ozone auto, start page https://chatgpt.com/auth/login, no DevTools port); (3) wait
@@ -55,6 +58,7 @@ Environment (all optional; tests and throwaway experiments set them so the real 
   CHATGPT_RELOGIN_ACCOUNT_TIMEOUT seconds to wait for a chatgpt.com tab to answer after the restart (default 30)
   CHATGPT_RELOGIN_PROBE_TIMEOUT   seconds one question to the browser may take in all (default 40: finish gives `check` 60)
   CHATGPT_RELOGIN_POLL            seconds between polls (default 1)
+  CHATGPT_RELOGIN_LOCK_DIR        where the per-profile lock lives (default ~/.local/state/ubuntu-tweaks/chatgpt-guardian-locks)
 Module options come as JSON in UBUNTU_TWEAK_MODULE_CONFIG; the language in UBUNTU_TWEAK_LANG (ru or en);
 UBUNTU_TWEAK_FINISH_DRY_RUN=1 makes `run` print what it would do and change nothing.
 Exit codes: 0 ok, 1 not done / failed, 2 usage or configuration, 130 interrupted.
@@ -62,6 +66,7 @@ Exit codes: 0 ok, 1 not done / failed, 2 usage or configuration, 130 interrupted
 
 import base64
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -123,6 +128,7 @@ TEXT = {
         "no_profile": "the glide.vc profile directory does not exist: {path}",
         "no_chrome": "Chrome not found or not executable: {path}",
         "stopping": "Stopping the glide.vc guardian units: {units}",
+        "profile_locked": "another relogin or profile-sync run is working on this profile; wait for it to finish",
         "stop_failed": "could not stop {unit}: {why}",
         "profile_busy": "another process still uses the profile after {seconds:.0f}s (pids {pids}); close it and run again",
         "opening": "Opening Chrome on the glide.vc profile. Sign in to ChatGPT with the glide.vc account, then CLOSE THE WINDOW.",
@@ -163,6 +169,7 @@ TEXT = {
         "no_profile": "каталога профиля glide.vc нет: {path}",
         "no_chrome": "Chrome не найден или не запускается: {path}",
         "stopping": "Останавливаю юниты стража glide.vc: {units}",
+        "profile_locked": "с этим профилем сейчас работает другой relogin или profile-sync; дождись его конца",
         "stop_failed": "не удалось остановить {unit}: {why}",
         "profile_busy": "профиль всё ещё занят другим процессом через {seconds:.0f} с (pid {pids}); закрой его и запусти снова",
         "opening": "Открываю Chrome с профилем glide.vc. Войди в ChatGPT аккаунтом glide.vc, затем ЗАКРОЙ ОКНО.",
@@ -217,6 +224,7 @@ class Settings:
     account_timeout: float
     probe_timeout: float
     poll: float
+    lock_dir: Path
     lang: str
     dry_run: bool
 
@@ -284,6 +292,7 @@ def load_settings(env: dict) -> Settings:
         account_timeout=_number(env, "CHATGPT_RELOGIN_ACCOUNT_TIMEOUT", 30.0),
         probe_timeout=_number(env, "CHATGPT_RELOGIN_PROBE_TIMEOUT", 40.0),
         poll=_number(env, "CHATGPT_RELOGIN_POLL", 1.0),
+        lock_dir=Path(env.get("CHATGPT_RELOGIN_LOCK_DIR") or home / ".local/state/ubuntu-tweaks/chatgpt-guardian-locks"),
         lang=lang,
         dry_run=env.get("UBUNTU_TWEAK_FINISH_DRY_RUN") == "1",
     )
@@ -589,6 +598,19 @@ def wait_profile_free(settings: Settings, timeout: float) -> list[int]:
         time.sleep(settings.poll)
 
 
+@contextmanager
+def profile_lock(settings: Settings):
+    """One process at a time may stop the units of a profile and write into it: `relogin run` and profile-sync's `pull` share
+    this flock (a file named after the profile directory; the open file holds it, the end of the process releases it)."""
+    settings.lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(settings.lock_dir / f"{settings.profile.name}.lock", "a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise RunError(settings.say("profile_locked")) from None
+        yield
+
+
 class Guard:
     """`armed` = a signal turns into Interrupted; the cleanup path disarms it, so a second signal cannot cut it short."""
 
@@ -613,14 +635,27 @@ def interrupts_as_exception():
             signal.signal(s, handler)
 
 
+def stop_unit(settings: Settings, unit: str) -> str | None:
+    """Stop one unit; None when it is stopped, else the printable reason. Shared with profile-sync, which tries every unit."""
+    try:
+        done = systemctl(settings, "stop", unit, timeout=settings.stop_timeout)
+    except subprocess.TimeoutExpired:
+        return settings.say("stop_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s")
+    if done.returncode != 0:
+        try:
+            state = unit_state(settings, unit)
+        except subprocess.TimeoutExpired:
+            state = ""  # not asked: not "stopped"
+        if state not in STOPPED_STATES:
+            return settings.say("stop_failed", unit=unit, why=_why(done))
+    return None
+
+
 def stop_units(settings: Settings) -> None:
     for unit in (settings.guardian, settings.observer, settings.browser):  # the guardian BindsTo the browser: top first
-        try:
-            done = systemctl(settings, "stop", unit, timeout=settings.stop_timeout)
-        except subprocess.TimeoutExpired:
-            raise RunError(settings.say("stop_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s")) from None
-        if done.returncode != 0 and unit_state(settings, unit) not in STOPPED_STATES:
-            raise RunError(settings.say("stop_failed", unit=unit, why=_why(done)))
+        problem = stop_unit(settings, unit)
+        if problem:
+            raise RunError(problem)
 
 
 def launch_chrome(settings: Settings) -> subprocess.Popen:
@@ -654,17 +689,21 @@ def close_chrome(settings: Settings, chrome: subprocess.Popen | None) -> None:
     wait_profile_free(settings, settings.stop_timeout)
 
 
+def start_unit(settings: Settings, unit: str) -> str | None:
+    """Start one unit; None when it started, else the printable reason. Shared with profile-sync, which starts the browser alone first."""
+    try:
+        done = systemctl(settings, "start", unit, timeout=settings.stop_timeout)
+    except subprocess.TimeoutExpired:
+        return settings.say("start_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s")
+    if done.returncode != 0:
+        return settings.say("start_failed", unit=unit, why=_why(done))
+    return None
+
+
 def start_units(settings: Settings) -> list[str]:
-    failures = []
-    for unit in (settings.browser, settings.observer, settings.guardian):  # dependency order: the browser first
-        try:
-            done = systemctl(settings, "start", unit, timeout=settings.stop_timeout)
-        except subprocess.TimeoutExpired:
-            failures.append(settings.say("start_failed", unit=unit, why=f"no answer in {settings.stop_timeout:.0f}s"))
-            continue
-        if done.returncode != 0:
-            failures.append(settings.say("start_failed", unit=unit, why=_why(done)))
-    return failures
+    # dependency order: the browser first
+    results = [start_unit(settings, unit) for unit in (settings.browser, settings.observer, settings.guardian)]
+    return [line for line in results if line]
 
 
 def health_seen(settings: Settings, since: str) -> bool:
@@ -679,7 +718,9 @@ def health_seen(settings: Settings, since: str) -> bool:
     return bool(HEALTH_LINE.search(done.stdout))
 
 
-def verify(settings: Settings, since: str, start_failures: list[str]) -> int:
+def wait_stack(settings: Settings, since: str, start_failures: list[str]) -> bool:
+    """The three units are active and the guardian has logged a health line since `since`, within verify_timeout.
+    Prints why not and returns False otherwise. Shared with profile-sync."""
     tell(settings.say("verifying", seconds=settings.verify_timeout))
     deadline = time.monotonic() + settings.verify_timeout
     while True:
@@ -690,18 +731,28 @@ def verify(settings: Settings, since: str, start_failures: list[str]) -> int:
         if not missing and not health_seen(settings, since):
             missing.append(settings.say("no_health", unit=settings.guardian))
         if not missing:
-            break
+            return True
         if time.monotonic() >= deadline:
             tell(settings.say("verify_failed", what="; ".join([*start_failures, *missing])), error=True)
-            return 1
+            return False
         time.sleep(settings.poll)
+
+
+def await_account(settings: Settings) -> Probe:
+    """Ask the browser which account is signed in, retrying an 'unavailable' answer for account_timeout. Shared with profile-sync."""
     account_deadline = time.monotonic() + settings.account_timeout
     while True:
         # one question never outlasts what is left of the account wait (at least a second, so there is always one try)
         answer = probe(settings.port, max(1.0, min(settings.probe_timeout, account_deadline - time.monotonic())))
         if answer.kind != "unavailable" or time.monotonic() >= account_deadline:
-            break
+            return answer
         time.sleep(settings.poll)
+
+
+def verify(settings: Settings, since: str, start_failures: list[str]) -> int:
+    if not wait_stack(settings, since, start_failures):
+        return 1
+    answer = await_account(settings)
     if answer.kind == "account" and answer.domain == settings.domain:
         write_marker(settings, settings.domain)
         tell(settings.say("verified_account", domain=settings.domain))
@@ -729,7 +780,17 @@ def cmd_run(settings: Settings) -> int:
     if not (os.access(settings.chrome, os.X_OK) and Path(settings.chrome).is_file()):
         tell(settings.say("no_chrome", path=settings.chrome), error=True)
         return 2
+    try:
+        with profile_lock(settings):
+            return run_window(settings)
+    except RunError as error:  # the lock only: run_window handles the errors of its own steps
+        tell(str(error), error=True)
+        return 1
 
+
+def run_window(settings: Settings) -> int:
+    units = [settings.guardian, settings.observer, settings.browser]
+    back = [settings.browser, settings.observer, settings.guardian]
     chrome: subprocess.Popen | None = None
     failure = ""
     code = 1
