@@ -146,6 +146,35 @@ remote_reachable() {
   $gh_https && opts=(-c url."https://github.com/".insteadOf=git@github.com:)
   GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$files" "${opts[@]}" ls-remote --exit-code "$1" HEAD >/dev/null 2>&1
 }
+# A submodule whose declared url moved (the repository moved, or an ssh url that gh_https rewrites) is re-registered before
+# anything fetches from it: the url recorded in .git/config and the origin of its git directory (the checkout's, or the one
+# a deinitialised submodule retains under .git/modules) win over .gitmodules, so a plain `git submodule update` would fetch
+# the new commit from the old repository, whether the submodule is initialised or not. It runs again after the clone of a
+# fresh submodule, which records the url .gitmodules declares (ssh, where gh_https wants https).
+repoint_submodules() { while read -r key path; do
+  name=${key#submodule.}; name=${name%.path}
+  url=$(git -C "$files" config -f .gitmodules --get "submodule.$name.url")
+  want=$url
+  case $url in ./*|../*) continue ;; esac   # relative to the superproject: git resolves it itself when it registers the submodule
+  if $gh_https && [[ $url == git@github.com:* ]]; then want="https://github.com/${url#git@github.com:}"; fi
+  recorded=$(git -C "$files" config --get "submodule.$name.url" 2>/dev/null)
+  modules_dir=$(git -C "$files" rev-parse --path-format=absolute --git-path "modules/$name" 2>/dev/null)
+  origin=
+  # the raw value: `remote get-url` applies insteadOf rewrites and would never equal what was stored
+  if [ -e "$files/$path/.git" ]; then origin=$(git -C "$files/$path" config --get remote.origin.url 2>/dev/null)
+  elif [ -d "$modules_dir" ]; then origin=$(git --git-dir="$modules_dir" config --get remote.origin.url 2>/dev/null); fi
+  if { [ -n "$recorded" ] && [ "$recorded" != "$want" ]; } || { [ -n "$origin" ] && [ "$origin" != "$want" ]; }; then
+    todo "point submodule $path at $want"
+    applying || continue
+    {
+      { [ -z "$recorded" ] || git -C "$files" config "submodule.$name.url" "$want"; } \
+        && if [ -e "$files/$path/.git" ]; then git -C "$files/$path" remote set-url origin "$want"
+           elif [ -d "$modules_dir" ]; then git --git-dir="$modules_dir" config remote.origin.url "$want"
+           else true; fi
+    } || manual "could not point submodule $path at $want (is another git process holding a config lock?), then re-run"
+  fi
+done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.path$'); }
+repoint_submodules
 while IFS= read -r line; do
   [ -n "$line" ] || continue
   flag=${line:0:1}
@@ -168,24 +197,7 @@ while IFS= read -r line; do
     ok "submodule $path"
   fi
 done < <(gitm submodule status 2>/dev/null)
-if $gh_https; then
-  while read -r key path; do
-    name=${key#submodule.}; name=${name%.path}
-    url=$(git -C "$files" config -f .gitmodules --get "submodule.$name.url")
-    [[ $url == git@github.com:* ]] || continue
-    https="https://github.com/${url#git@github.com:}"
-    # only a submodule that is already initialised has a recorded URL and an origin to correct
-    recorded=$(git -C "$files" config --get "submodule.$name.url" 2>/dev/null)
-    origin=
-    [ -e "$files/$path/.git" ] && origin=$(git -C "$files/$path" remote get-url origin 2>/dev/null)
-    if { [ -n "$recorded" ] && [ "$recorded" != "$https" ]; } || { [ -n "$origin" ] && [ "$origin" != "$https" ]; }; then
-      todo "record the https URL for submodule $path"
-      applying || continue
-      [ -n "$recorded" ] && git -C "$files" config "submodule.$name.url" "$https"
-      [ -n "$origin" ] && git -C "$files/$path" remote set-url origin "$https"
-    fi
-  done < <(git -C "$files" config -f .gitmodules --get-regexp '^submodule\..*\.path$')
-fi
+applying && repoint_submodules
 
 # -- links ----------------------------------------------------------------------------------------------
 for f in .zprofile .vimrc .gitattributes .hyper.js .tmux; do link_into_home "$f"; done
