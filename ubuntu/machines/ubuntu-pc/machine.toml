@@ -230,3 +230,11 @@ action_ru = "Посмотри два пути и ответь y, чтобы уд
 check = ["./machines/ubuntu-pc/scripts/build-server-cleanup", "check"]
 run = ["./machines/ubuntu-pc/scripts/build-server-cleanup", "run"]
 optional = true
+
+# The Ubuntu Dock (ubuntu-dock@ubuntu.com, schema org.gnome.shell.extensions.dash-to-dock) is switched off on this PC: it is
+# in org.gnome.shell disabled-extensions and the engine's hyperdock module declares conflicts = ["ubuntu-dock@ubuntu.com"]
+# and draws the dock instead (position, size and multi-monitor of the dock in use are keys of the hyperdock schema,
+# modules/hyperdock/dock.ini in the engine). The retired dock keeps the dock-position BOTTOM it was given by hand, which
+# has no effect now, so `capture` must not carry it into the shared settings (and `coverage` does not list it as untracked).
+[capture]
+exclude = ["/org/gnome/shell/extensions/dash-to-dock/dock-position"]
