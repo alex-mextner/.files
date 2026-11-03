@@ -21,6 +21,8 @@ enabled = true
 # ChatGPT guardian (profile module chatgpt-guardian): works through the ChatGPT web login of two dedicated Chrome
 # profiles, never through an OpenAI API key. This PC has no root for apt, so Chrome is the rootless copy under ~/.local/opt.
 [modules.chatgpt-guardian]
+# The promoted guardian release (agenttools-chatgpt 0.3.28, branch guardian-integration-20261103); promote the next release here, never an older one.
+package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/a57e0442cfb1f503f9f71faad634645801d0507a/lib/agenttools_chatgpt"
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).
