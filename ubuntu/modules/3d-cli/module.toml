@@ -1,0 +1,34 @@
+description = "3d-cli: ~/.local/bin/3d linked to the checkout at ~/xp/3d-cli (inert without one), and a non-interactive report whether the Spoolman / PrintOps client is configured (`3d init --env --no-input --spoolman auto`: reports only, never installs or deploys)"
+enabled = true
+order = 130   # after tg-cli (120); it needs only the checkout and python3
+manual = "Spoolman is not set up for 3d-cli on this machine: run `3d init --env` and pick where it lives (a configured printer, this computer, a server over ssh, or a script to run by hand), then run apply again. `[modules.3d-cli] spoolman = \"skip\"` in machine.toml declines it for a machine that does not print"
+
+# User level: the installer writes only ~/.local/bin/3d and, through `3d init --env`, ~/.config/3d-cli, so it never
+# runs as root. It never clones the checkout (the user's working copy) and never deploys: without a checkout, or
+# with one that predates `3d init --env`, it says so and does nothing (exit 0). Offline-safe: the configured check
+# reads ~/.config/3d-cli/printops.yaml and makes no network request.
+# Options ([modules.3d-cli] in profile.toml / machine.toml): dir (default ~/xp/3d-cli), spoolman ("auto" | "skip").
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
+
+[[coverage]]
+match = ["file:~/.local/bin/3d"]
+class = "tracked"
+reason = "a symlink to <checkout>/bin/3d made by this module (install.sh); the checkout itself is the user's working copy and is not cloned here"
+
+# The decision this module leaves to the user: install.sh --finish-check is 0 once the client is configured, declined
+# (spoolman = "skip") or the checkout cannot do it yet; --finish-run is the interactive `3d init --env` itself.
+[[finish]]
+id = "3d-cli-spoolman"
+title = "Set up Spoolman for 3d-cli"
+title_ru = "Настроить Spoolman для 3d-cli"
+why = "3d-cli has no PrintOps client configuration on this machine, so the filament tracker is not connected"
+why_ru = "у 3d-cli на этой машине нет настройки клиента PrintOps, поэтому учёт филамента не подключён"
+action = "`3d init --env` asks where Spoolman should live (a configured printer, this computer, a server over ssh, or a script to copy by hand) and writes ~/.config/3d-cli/printops.yaml; a setup script for a server is written to your home directory"
+action_ru = "`3d init --env` спросит, где жить Spoolman (настроенный принтер, этот компьютер, сервер по ssh или скрипт для ручной установки), и запишет ~/.config/3d-cli/printops.yaml; скрипт установки для сервера окажется в твоей домашней папке"
+check = ["./install.sh", "--finish-check"]
+run = ["./install.sh", "--finish-run"]
