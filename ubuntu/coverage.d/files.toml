@@ -282,7 +282,6 @@ ticket = "alex-mextner/.files#61"
 
 [[coverage]]
 match = [
-  "file:~/.local/bin/3d",
   "file:~/.local/bin/3d-printer-runtime",
   "file:~/.local/bin/hsw-editor",
 ]
