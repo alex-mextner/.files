@@ -23,6 +23,8 @@ enabled = true
 [modules.chatgpt-guardian]
 # The promoted guardian release (agenttools-chatgpt 0.3.28, branch guardian-integration-20261103); promote the next release here, never an older one.
 package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/a57e0442cfb1f503f9f71faad634645801d0507a/lib/agenttools_chatgpt"
+# pm CLI (hyper-pm) installed into the guardian venv: 0.10.2 = pm-direct + PR 60 standing worker + unlimited consent; move to the committed SHA tree once its review stamp lands.
+pm_package = "/home/ultra/.local/share/pm-releases/snapshot-06311d82b263a7bf45e317e643e0611bdf0267c4"
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).

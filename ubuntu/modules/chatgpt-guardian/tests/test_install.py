@@ -73,6 +73,8 @@ def test_unknown_option_is_refused(home, fake_bin):
         ({"glide_port": "abc"}, "ports must be numbers"),
         ({"home_port": 9300, "glide_port": 9300}, "must differ"),
         ({"dir": "relative/path"}, "dir must be absolute"),
+        ({"pm_package": "relative/pm"}, "pm_package must be absolute"),
+        ({"pm_package": 5}, "pm_package must be a string"),
         ({"chrome": "google-chrome"}, 'chrome must be an absolute path or "user"'),
         ({"repo": "--upload-pack=x"}, "repo must not start with"),
         ({"chats_home": "https://chatgpt.com/c/x"}, "chats_home must be a list"),
@@ -105,6 +107,23 @@ def test_plan_on_a_fresh_home_names_every_step(home, fake_bin):
     for step in ("git clone", "chatgpt-guardian-venv", "wrapper", "home: chatgpt-guardian init", "glide.vc: chatgpt-guardian init",
                  "home: watch https://chatgpt.com/c/x", "9226", "9223", "logins:"):
         assert step in done.stdout, step
+
+
+def test_pm_is_not_managed_without_pm_package(home, fake_bin):
+    plan = run(home, fake_bin, "--plan")
+    assert "pm: not managed" in plan.stdout
+    check = run(home, fake_bin, "--check")
+    assert not any("hyper-pm" in line or "bin/pm" in line for line in check.stdout.splitlines())
+
+
+def test_a_pinned_pm_is_planned_and_checked(home, fake_bin):
+    pm = home / "pm-release"
+    plan = run(home, fake_bin, "--plan", config={"pm_package": str(pm)})
+    assert f"uv pip install --no-deps --reinstall {pm}" in plan.stdout
+    assert f"ln -sfn {home}/.local/share/agent-tools/chatgpt-guardian-venv/bin/pm {home}/.local/bin/pm" in plan.stdout
+    check = run(home, fake_bin, "--check", config={"pm_package": str(pm)})
+    assert any(f"holds a different hyper-pm than {pm}" in line for line in check.stdout.splitlines())
+    assert any("bin/pm is missing or points elsewhere" in line for line in check.stdout.splitlines())
 
 
 def test_plan_writes_nothing(home, fake_bin):

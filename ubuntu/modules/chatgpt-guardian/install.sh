@@ -36,6 +36,10 @@
 #   repo        git URL of agent-tools   (default https://git.hyperide.ai/ultrabricks/agent-tools.git)
 #   dir         where its checkout lives (default ~/xp/agent-tools)
 #   package     the package directory    (default <dir>/lib/agenttools_chatgpt)
+#   pm_package  absolute path of a hyper-pm (pm CLI) source tree, e.g. a `git archive` of a committed pm-cli SHA under
+#               ~/.local/share/pm-releases/<sha> (default empty: pm is not managed by this module). When set, the venv's hyper-pm
+#               is that tree (installed with --no-deps) and ~/.local/bin/pm links to the venv's pm: the approvals worker and the
+#               audit units of the guardian run that pm, so a daily apply must not put another one back
 #   chrome      absolute path of Chrome, or "user" for the rootless install (default /usr/bin/google-chrome)
 #   home_port   DevTools port of the home account browser (default 9226: omp's browser relay owns 9224)
 #   glide_port  DevTools port of the glide.vc browser     (default 9223)
@@ -78,7 +82,7 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 options=$(python3 -B - <<'PY'
 import json, os, re, shlex, sys
 
-known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "",
+known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "", "pm_package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
          "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
          "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False}
@@ -101,7 +105,7 @@ for port_key in ("home_port", "glide_port"):
         fail("port out of range: %s" % opt[port_key])
 if int(opt["home_port"]) == int(opt["glide_port"]):
     fail("home_port and glide_port must differ")
-for key in ("repo", "dir", "package", "chrome", "xvfb"):
+for key in ("repo", "dir", "package", "chrome", "xvfb", "pm_package"):
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
 # read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
@@ -135,8 +139,10 @@ def expand(path):
     return os.path.expanduser(path) if path.startswith("~/") else path
 
 
-for key in ("dir", "package", "chrome", "xvfb"):
+for key in ("dir", "package", "chrome", "xvfb", "pm_package"):
     opt[key] = expand(opt[key])
+if opt["pm_package"] and not opt["pm_package"].startswith("/"):
+    fail("pm_package must be absolute or start with ~/: %s" % opt["pm_package"])
 if not opt["dir"].startswith("/"):
     fail("dir must be absolute or start with ~/: %s" % opt["dir"])
 if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
@@ -144,7 +150,7 @@ if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
 if not opt["package"]:
     opt["package"] = opt["dir"] + "/lib/agenttools_chatgpt"
 opt["glide_domain"] = opt["glide_email_domain"].lstrip("@").lower()
-for key in ("repo", "dir", "package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain"):
+for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
 for key in ("chats_home", "chats_glide"):
@@ -156,6 +162,7 @@ eval "$options"
 repo_url=$opt_repo
 dir=$opt_dir
 package=$opt_package
+pm_package=$opt_pm_package
 chrome_opt=$opt_chrome
 home_port=$opt_home_port
 glide_port=$opt_glide_port
@@ -167,6 +174,7 @@ glide_domain=$opt_glide_domain
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 vpy="$venv/bin/python"
 cli_link="$HOME/.local/bin/chatgpt-guardian"
+pm_link="$HOME/.local/bin/pm"
 # The units hardcode %h/.config/agent-tools/... in their ConditionPathExists, so no XDG_CONFIG_HOME indirection here.
 units_dir="$HOME/.config/systemd/user"
 dep_dir="$HOME/.config/agent-tools/chatgpt-guardian"
@@ -303,6 +311,19 @@ pkg_same() { # the installed copy holds exactly the package's code, scripts and 
   return 0
 }
 link_ok() { [ -L "$cli_link" ] && [ "$(readlink -f "$cli_link")" = "$(readlink -f "$venv/bin/chatgpt-guardian")" ]; }
+# pm_package (optional): the hyper-pm of the venv is exactly that source tree. A direct install records the tree in the
+# distribution's direct_url.json, which is what the check compares (an unset option means pm is not this module's business).
+pm_ok() {
+  [ -z "$pm_package" ] && return 0
+  [ -f "$pm_package/pyproject.toml" ] && [ -x "$venv/bin/pm" ] || return 1
+  "$vpy" - "$pm_package" <<'PM' 2>/dev/null
+import importlib.metadata as m, json, sys
+dist = m.distribution("hyper-pm")
+url = json.loads(dist.read_text("direct_url.json") or "{}").get("url", "")
+sys.exit(0 if url == "file://" + sys.argv[1] else 1)
+PM
+}
+pm_link_ok() { [ -z "$pm_package" ] || { [ -L "$pm_link" ] && [ "$(readlink -f "$pm_link")" = "$(readlink -f "$venv/bin/pm")" ]; }; }
 # ./profile-sync is opt-in (nothing runs it); apply only installs this wrapper, which hands it the options of this machine
 # (the DevTools ports and the glide account's email domain) the way finish-setup hands them to ./relogin.
 sync_wrapper="$HOME/.local/bin/chatgpt-guardian-profile-sync"
@@ -396,6 +417,8 @@ if [ "$mode" = check ]; then
     fi
   fi
   link_ok || problems+=("$cli_link is missing or points elsewhere")
+  pm_ok || problems+=("$venv holds a different hyper-pm than $pm_package")
+  pm_link_ok || problems+=("$pm_link is missing or points elsewhere")
   sync_wrapper_ok || problems+=("$sync_wrapper is missing or out of date (the opt-in profile-sync command)")
   chrome_ok || problems+=("Chrome is not executable at $chrome")
   xvfb_ok || problems+=("Xvfb not found (apt install xvfb)")
@@ -464,6 +487,9 @@ if [ "$mode" = plan ]; then
   if venv_ok && has_package && pkg_same; then echo "venv: $venv matches the package"
   else echo "uv venv / pip install $package[browser] into $venv"; fi
   if link_ok; then echo "link: $cli_link ok"; else echo "ln -sfn $venv/bin/chatgpt-guardian $cli_link"; fi
+  if [ -z "$pm_package" ]; then echo "pm: not managed (no pm_package)"
+  elif pm_ok && pm_link_ok; then echo "pm: $venv hyper-pm matches $pm_package, $pm_link ok"
+  else echo "uv pip install --no-deps --reinstall $pm_package into $venv; ln -sfn $venv/bin/pm $pm_link"; fi
   if sync_wrapper_ok; then echo "profile-sync: $sync_wrapper ok (opt-in, never run by apply)"; else echo "write $sync_wrapper (the opt-in profile-sync command; apply never runs it)"; fi
   if chrome_ok; then echo "chrome: $chrome ok"
   elif [ "$chrome_opt" = user ]; then echo "download google-chrome-stable .deb, dpkg-deb -x into $chrome_user_dir, wrapper $chrome_wrapper (--no-sandbox)"
@@ -506,7 +532,19 @@ if ! venv_ok || ! pkg_same; then
   venv_ok || die "the venv still cannot import agenttools_chatgpt + playwright"
 fi
 
+if ! pm_ok; then
+  [ -f "$pm_package/pyproject.toml" ] || manual "pm_package $pm_package has no pyproject.toml (extract the committed pm-cli SHA there: git archive <sha> | tar -x -C $pm_package)"
+  command -v uv >/dev/null || manual "uv is not installed (module base-tools installs it); hyper-pm is installed with uv"
+  echo "installing hyper-pm from $pm_package into $venv"
+  uv pip install --quiet --python "$vpy" --no-deps --reinstall "$pm_package"
+  pm_ok || die "the venv still holds a different hyper-pm than $pm_package"
+fi
+
 mkdir -p "$(dirname "$cli_link")"
+if ! pm_link_ok; then
+  [ ! -e "$pm_link" ] || [ -L "$pm_link" ] || manual "$pm_link exists and is not a symlink; move it away"
+  ln -sfn "$venv/bin/pm" "$pm_link"
+fi
 if ! link_ok; then
   [ ! -e "$cli_link" ] || [ -L "$cli_link" ] || manual "$cli_link exists and is not a symlink; move it away"
   ln -sfn "$venv/bin/chatgpt-guardian" "$cli_link"
