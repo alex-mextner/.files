@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Exit 42 when the Chrome sessions of agent-browser hold more than 4 GiB resident or 1.5 GiB of swap, else 0.
+# agent-browser-memory-guard.service (every minute) closes them and restarts agent-browser.service on 42.
 import os
 from pathlib import Path
 LIMIT_RSS_KB = int(os.getenv("AGENT_BROWSER_GUARD_RSS_KB", str(4 * 1024 * 1024)))
