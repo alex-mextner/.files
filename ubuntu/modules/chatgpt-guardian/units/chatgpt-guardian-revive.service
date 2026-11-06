@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart ChatGPT Guardian units that ended in the failed state (crash, oom kill, start limit)
+
+[Service]
+Type=oneshot
+ExecStart=@REVIVE@ sweep
+TimeoutStartSec=60
+Nice=10

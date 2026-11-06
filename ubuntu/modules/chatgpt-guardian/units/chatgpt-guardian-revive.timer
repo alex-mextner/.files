@@ -1,0 +1,10 @@
+[Unit]
+Description=Every 5 minutes: restart ChatGPT Guardian units that are failed (never an operator-stopped one)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

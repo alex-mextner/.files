@@ -23,6 +23,8 @@ RestartSec=60
 CPUQuota=200%
 MemoryHigh=3G
 MemoryMax=4G
+# systemd-oomd killed this browser on 2026-11-06 (its MemoryHigh throttling made it the top pressure candidate); prefer other victims.
+ManagedOOMPreference=avoid
 TasksMax=1024
 TimeoutStopSec=45
 SendSIGKILL=no

@@ -17,7 +17,7 @@ MODULE = Path(__file__).resolve().parents[1]
 INSTALL = MODULE / "install.sh"
 UNITS = sorted((MODULE / "units").glob("*.service"))
 RENDER_TOKENS = {"@CHROME@", "@HOME_PORT@", "@GLIDE_PORT@", "@XVFB@", "@HOME_MEMORY_HIGH@", "@HOME_MEMORY_MAX@", "@GLIDE_DOMAIN@", "@RELOGIN@",
-                 "@HOME_DISPLAY_UNIT@", "@HOME_DISPLAY_SERVICE@", "@HOME_PRIVATE_FLAG@", "@HOME_PRIVATE_GUARD@"}  # the keys install.sh's render_unit passes
+                 "@HOME_DISPLAY_UNIT@", "@HOME_DISPLAY_SERVICE@", "@HOME_PRIVATE_FLAG@", "@HOME_PRIVATE_GUARD@", "@REVIVE@"}  # the keys install.sh's render_unit passes
 GATED = {  # unit -> workspace whose deployment file gates it
     "chatgpt-guardian-home": "home",
     "chatgpt-guardian-home-browser": "home",
@@ -139,8 +139,28 @@ def test_every_unit_template_is_installed_and_vice_versa():
     script = INSTALL.read_text(encoding="utf-8")
     listed = re.search(r"unit_names=\(([^)]*)\)", script).group(1).split()
     conditional = re.search(r"^home_display_unit=(\S+)$", script, re.M).group(1)  # prepended to unit_names only when home_private_display is true
-    assert sorted([*listed, conditional]) == sorted(p.stem for p in UNITS)
-    assert conditional not in listed
+    revive = re.search(r"^revive_unit=(\S+)", script, re.M).group(1)  # a oneshot without [Install]: its timer is enabled, the service is not
+    assert sorted([*listed, conditional, revive]) == sorted(p.stem for p in UNITS)
+    assert conditional not in listed and revive not in listed
+    assert (MODULE / "units" / f"{revive}.timer").is_file()
+
+
+def test_every_guardian_unit_asks_oomd_to_pick_other_victims():
+    # 2026-11-06: systemd-oomd killed the glide browser (MemoryHigh throttling made it the top pressure candidate) and the BindsTo= sender went with it
+    for unit in UNITS:
+        if unit.stem != "chatgpt-guardian-revive":
+            assert unit_setting(unit.read_text(encoding="utf-8"), "ManagedOOMPreference") == "avoid", unit.stem
+
+
+@pytest.mark.parametrize("ws", ["home", "glide"])
+def test_browser_restart_brings_the_sender_and_observer_back(ws):
+    script = INSTALL.read_text(encoding="utf-8")
+    assert re.search(r"^revive_dropin_names=\(.*\b%s-browser\b" % ws, script, re.M)
+    assert f"ExecStartPost=-$here/revive after-browser {ws}" in script
+    if ws == "glide":  # the sender's login gate needs a chatgpt.com tab: revive opens it on the browser's own DevTools port
+        assert 'Environment=CHATGPT_REVIVE_DEVTOOLS_PORT=$glide_port' in script
+        assert 'echo "TimeoutStartSec=180"' in script  # the hook waits ~85 s inside the browser's start job; the default 90 s would turn a slow start into a timeout
+    assert "91-revive.conf" in script  # sorts after a machine's 90-* drop-in that resets ExecStartPost=
 
 
 @pytest.mark.parametrize(("name", "workspace"), sorted(GATED.items()))
