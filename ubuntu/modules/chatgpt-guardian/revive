@@ -19,6 +19,8 @@
 # CHATGPT_REVIVE_DEVTOOLS_PORT (glide browser DevTools port, default 9223; install.sh sets it from glide_port), REVIVE_TAB_WAIT
 # (seconds to wait for DevTools, default 60), REVIVE_TAB_SETTLE (seconds to let session restore bring tabs back, default 15),
 # REVIVE_PYTHON (default /usr/bin/python3).
+# The glide `after-browser` runs inside the browser's start job (ExecStartPost) and can take REVIVE_TAB_WAIT + REVIVE_TAB_SETTLE + the
+# request timeout (about 85 s): install.sh gives that drop-in TimeoutStartSec=180, so keep the sum below it when changing the defaults.
 set -u
 
 read -r -a sc <<< "${REVIVE_SYSTEMCTL:-systemctl --user}"
