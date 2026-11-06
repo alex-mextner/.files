@@ -21,6 +21,7 @@ RestartSec=120
 CPUQuota=25%
 MemoryHigh=256M
 MemoryMax=768M
+ManagedOOMPreference=avoid
 TasksMax=64
 TimeoutStopSec=45
 SendSIGKILL=no

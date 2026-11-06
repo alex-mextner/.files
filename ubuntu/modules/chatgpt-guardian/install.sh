@@ -26,7 +26,9 @@
 #      configured chats are enrolled (an explicit unwatch is respected: only a chat never seen is watched)
 #   7. the seven chatgpt-guardian-* units (eight with home_private_display: plus chatgpt-guardian-home-display) and the browsers' lifecycle drop-ins (from the package's own templates)
 #      are installed as rendered here, stale per-machine drop-ins (90-pc.conf, 95-port.conf) are gone; displays,
-#      browsers and observers are enabled and started; a copied guardian-tunnel.service is gated off (it needs a
+#      browsers and observers are enabled and started; the glide display and both browsers get a 91-revive.conf drop-in and the
+#      chatgpt-guardian-revive.timer (every 5 min, ./revive sweep) restarts units that ended `failed`, so an oom-killed browser
+#      never leaves its BindsTo= sender stopped; a copied guardian-tunnel.service is gated off (it needs a
 #      platform API key)
 #   8. each browser profile is logged in to ChatGPT (cannot be declared: reported as a manual step); only then
 #      its --apply guardian is enabled and started, because a guardian that meets the login page latches a
@@ -195,6 +197,11 @@ unit_names=(chatgpt-guardian-glide-display chatgpt-guardian-glide-browser chatgp
 started_units=(chatgpt-guardian-glide-display chatgpt-guardian-glide-browser chatgpt-guardian-home-browser
                chatgpt-guardian-glide-observer chatgpt-guardian-home-observer)
 home_display_unit=chatgpt-guardian-home-display
+# ./revive (a restart helper, see its header): the oneshot service + timer that restart `failed` units, and the 91-revive.conf drop-ins of
+# the units whose (re)start must bring their dependents back (the Guardian BindsTo= its browser and is stopped, not failed, when the browser is killed).
+# The oneshot has no [Install] section, so it is not in unit_names; its timer is enabled and started below.
+revive_unit=chatgpt-guardian-revive
+revive_dropin_names=(glide-display glide-browser home-browser)
 if [ "$home_private_display" = true ]; then
   unit_names=("$home_display_unit" "${unit_names[@]}")
   started_units=("$home_display_unit" "${started_units[@]}")
@@ -258,7 +265,7 @@ render_unit() {
   render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb" \
     "HOME_MEMORY_HIGH=$home_memory_high" "HOME_MEMORY_MAX=$home_memory_max" "GLIDE_DOMAIN=$glide_domain" "RELOGIN=$here/relogin" \
     "HOME_DISPLAY_UNIT=$home_display_unit_lines" "HOME_DISPLAY_SERVICE=$home_display_service_lines" "HOME_PRIVATE_FLAG=$home_private_flag" \
-    "HOME_PRIVATE_GUARD=$home_private_guard"
+    "HOME_PRIVATE_GUARD=$home_private_guard" "REVIVE=$here/revive"
 }
 site_pkg() { # the installed package directory in the venv
   local d
@@ -335,6 +342,27 @@ lifecycle_ok() {
   want=$(render_lifecycle "$1" 2>/dev/null) || return 1
   [ -f "$(lifecycle_file "$1")" ] && [ "$(cat "$(lifecycle_file "$1")")" = "$want" ]
 }
+revive_timer_file="$units_dir/$revive_unit.timer"
+revive_timer_ok() {
+  local want
+  want=$(render "$here/units/$revive_unit.timer" 2>/dev/null) || return 1
+  [ -f "$revive_timer_file" ] && [ "$(cat "$revive_timer_file")" = "$want" ]
+}
+revive_dropin_file() { echo "$units_dir/chatgpt-guardian-$1.service.d/91-revive.conf"; }
+revive_dropin_text() { # revive_dropin_text NAME: sorts after a machine's 90-* drop-in that resets ExecStartPost=
+  printf '%s\n[Service]\n' "$header"
+  case $1 in
+    glide-display) echo "ExecStartPost=-$here/revive after-display" ;;
+    glide-browser) # after-browser opens a chatgpt.com tab for the sender's login gate, on this browser's DevTools port
+      # the hook waits up to ~85 s (DevTools 60 s + session restore 15 s + request) inside the start job, on top of the startup restore: the 90 s default would turn a slow start into a start timeout
+      echo "TimeoutStartSec=180"
+      echo "Environment=CHATGPT_REVIVE_DEVTOOLS_PORT=$glide_port"
+      echo "ExecStartPost=-$here/revive after-browser glide" ;;
+    home-browser) echo "ExecStartPost=-$here/revive after-browser home" ;;
+  esac
+}
+revive_dropin_ok() { [ -f "$(revive_dropin_file "$1")" ] && [ "$(cat "$(revive_dropin_file "$1")")" = "$(revive_dropin_text "$1")" ]; }
+revive_ok() { revive_timer_ok && unit_ok "$revive_unit" && for n in "${revive_dropin_names[@]}"; do revive_dropin_ok "$n" || return 1; done; }
 tunnel_unit="$units_dir/guardian-tunnel.service"
 tunnel_gate="$units_dir/guardian-tunnel.service.d/90-no-platform-key.conf"
 tunnel_gate_ok() { [ ! -f "$tunnel_unit" ] || { [ -f "$tunnel_gate" ] && [ "$(cat "$tunnel_gate")" = "$(tunnel_gate_text)" ]; }; }
@@ -424,6 +452,7 @@ if [ "$mode" = check ]; then
   if has_package && site_pkg >/dev/null; then
     for n in "${unit_names[@]}"; do unit_ok "$n" || problems+=("$(unit_file "$n") is missing or differs"); done
     for ws in "${workspaces[@]}"; do lifecycle_ok "$ws" || problems+=("$(lifecycle_file "$ws") is missing or differs"); done
+    revive_ok || problems+=("$revive_unit.service/.timer or a 91-revive.conf drop-in (${revive_dropin_names[*]}) is missing or differs")
   else
     problems+=("the package is not installed in the venv yet: the units cannot be compared")
   fi
@@ -433,6 +462,7 @@ if [ "$mode" = check ]; then
     for n in "${unit_names[@]}"; do
       is_enabled "$n" || problems+=("$n.service is not enabled")
     done
+    [ "$(sc is-enabled "$revive_unit.timer" 2>/dev/null || true)" = enabled ] || problems+=("$revive_unit.timer is not enabled")
     for ws in "${workspaces[@]}"; do
       if dep_ok "$ws"; then
         for n in "chatgpt-guardian-${ws_unit[$ws]}-browser" "chatgpt-guardian-${ws_unit[$ws]}" "chatgpt-guardian-${ws_unit[$ws]}-observer"; do
@@ -473,7 +503,7 @@ if [ "$mode" = plan ]; then
     if dep_ok "$ws"; then echo "$ws: deployment file present"; else echo "$ws: chatgpt-guardian init, write $(dep_file "$ws")"; fi
     chats_of "$ws" | while IFS= read -r url; do [ -z "$url" ] || echo "$ws: watch $url (when never seen)"; done
   done
-  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers"
+  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins + the $revive_unit service/timer and its 3 91-revive.conf drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers, enable the $revive_unit.timer"
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
@@ -591,6 +621,17 @@ for ws in "${workspaces[@]}"; do
     install_text "$(lifecycle_file "$ws")" "$text"
   fi
 done
+if ! unit_ok "$revive_unit"; then
+  text=$(render_unit "$revive_unit") || die "cannot render $revive_unit.service"
+  install_text "$(unit_file "$revive_unit")" "$text"
+fi
+if ! revive_timer_ok; then
+  text=$(render "$here/units/$revive_unit.timer") || die "cannot render $revive_unit.timer"
+  install_text "$revive_timer_file" "$text"
+fi
+for n in "${revive_dropin_names[@]}"; do
+  revive_dropin_ok "$n" || install_text "$(revive_dropin_file "$n")" "$(revive_dropin_text "$n")"
+done
 tunnel_gate_ok || install_text "$tunnel_gate" "$(tunnel_gate_text)"
 while IFS= read -r f; do rm -f -- "$f"; changed=1; done < <(stale_list)
 if [ "$changed" != 0 ]; then
@@ -617,6 +658,8 @@ for n in "${started_units[@]}"; do
   enable_unit "$n"
   start_unit "$n"
 done
+# restarts units that ended `failed` (never an operator-stopped one), whether or not a profile is signed in yet
+sc enable --now "$revive_unit.timer" >/dev/null || echo "warning: $revive_unit.timer failed to start" >&2
 
 # logins live in the browser profiles: report, never fake. The --apply guardian of a workspace is enabled and
 # started only once its profile is signed in.

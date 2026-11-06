@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# revive: bring a ChatGPT Guardian stack back after a crash or an oom kill, and never undo an operator stop.
+#
+#   revive after-display      the glide display (re)started: start the glide browser (its BindsTo= display stopped it)
+#   revive after-browser WS   the browser of WS (home | glide) (re)started: start its observer and its sender; for glide first make
+#                             sure the browser shows a chatgpt.com tab (the sender's ExecStartPre refuses to start without one)
+#   revive sweep              timer entry: every unit of both accounts that is in the `failed` state is reset and started
+#
+# Why: the sender BindsTo= its browser, so when systemd-oomd kills the browser (state `failed`, result oom-kill) systemd also
+# stops the sender, and the browser's own restart (Restart=always) never starts it again: on 2026-11-06 the glide sender sat
+# stopped for 4 h behind a running browser. The browser units call `after-browser` from ExecStartPost, which closes that gap.
+#
+# What is NOT touched: a unit an operator stopped with `systemctl --user stop` is `inactive`, not `failed`, and the sweep leaves
+# it alone; a profile held by `relogin run` or `profile-sync pull` (the flock they share, see ./relogin profile_lock) is skipped
+# entirely, so the browser-alone-first verification of profile-sync and the sign-in window of relogin keep working. The
+# Guardian's own operator stops (manual stop, human draft, challenge) live in its store, not in systemd, and are not affected.
+#
+# Environment (tests): REVIVE_SYSTEMCTL (default "systemctl --user"), CHATGPT_RELOGIN_LOCK_DIR (as in ./relogin).
+# CHATGPT_REVIVE_DEVTOOLS_PORT (glide browser DevTools port, default 9223; install.sh sets it from glide_port), REVIVE_TAB_WAIT
+# (seconds to wait for DevTools, default 60), REVIVE_TAB_SETTLE (seconds to let session restore bring tabs back, default 15),
+# REVIVE_PYTHON (default /usr/bin/python3).
+# The glide `after-browser` runs inside the browser's start job (ExecStartPost) and can take REVIVE_TAB_WAIT + REVIVE_TAB_SETTLE + the
+# request timeout (about 85 s): install.sh gives that drop-in TimeoutStartSec=180, so keep the sum below it when changing the defaults.
+set -u
+
+read -r -a sc <<< "${REVIVE_SYSTEMCTL:-systemctl --user}"
+lock_dir=${CHATGPT_RELOGIN_LOCK_DIR:-$HOME/.local/state/ubuntu-tweaks/chatgpt-guardian-locks}
+
+profile_of() { case $1 in glide) echo glide.vc ;; *) echo "$1" ;; esac; }
+
+profile_locked() { # profile_locked WS: true while relogin / profile-sync hold the profile
+  local lock; lock="$lock_dir/$(profile_of "$1").lock"
+  [ -e "$lock" ] || return 1
+  ! flock -s -n "$lock" true
+}
+
+start() { # start UNIT...: clear a failed state and its start-limit counter, then queue the start without waiting for it
+  "${sc[@]}" reset-failed "${@/%/.service}" >/dev/null 2>&1
+  "${sc[@]}" --no-block start "${@/%/.service}"
+}
+
+open_chat_tab() { # open_chat_tab PORT: make sure the browser on PORT shows one chatgpt.com page; never touches an existing tab
+  # The glide sender's ExecStartPre (`relogin check --live`) asks a chatgpt.com tab who is signed in and refuses to start without
+  # one. After a browser restart that restored nothing (2026-11-06 22:55: a crashed profile showed only chrome://newtab/) that
+  # gate is a permanent deadlock, so the restart hook opens the one tab itself, through the same loopback DevTools HTTP
+  # endpoint the Guardian's own startup restore uses (PUT /json/new). It waits for DevTools, then REVIVE_TAB_SETTLE seconds for
+  # --restore-last-session to bring its tabs back, and only then opens https://chatgpt.com/ if no page is on that origin.
+  # No credential is typed and the signed-in state stays whatever the persistent profile holds (relogin --live judges it).
+  "${REVIVE_PYTHON:-/usr/bin/python3}" - "$1" "${REVIVE_TAB_WAIT:-60}" "${REVIVE_TAB_SETTLE:-15}" <<'PY'
+import json, sys, time, urllib.parse, urllib.request
+
+port, wait, settle = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+base = f"http://127.0.0.1:{port}"
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def pages():
+    with opener.open(base + "/json/list", timeout=5) as answer:
+        return [t for t in json.load(answer) if t.get("type") == "page"]
+
+
+def on_chatgpt(tabs):
+    return any(urllib.parse.urlparse(str(t.get("url", ""))).hostname == "chatgpt.com" for t in tabs)
+
+
+start = time.monotonic()
+while True:
+    try:
+        tabs = pages()
+        break
+    except (OSError, ValueError):
+        if time.monotonic() - start >= wait:
+            print(f"revive: no DevTools answer on port {port} within {wait:.0f}s: no chatgpt.com tab opened")
+            sys.exit(1)
+        time.sleep(1)
+up = time.monotonic()
+while not on_chatgpt(tabs) and time.monotonic() - up < settle:
+    time.sleep(1)
+    try:
+        tabs = pages()
+    except (OSError, ValueError):
+        pass
+if on_chatgpt(tabs):
+    print("revive: a chatgpt.com tab is already open")
+    sys.exit(0)
+request = urllib.request.Request(base + "/json/new?" + urllib.parse.quote("https://chatgpt.com/", safe=""), method="PUT")
+try:
+    opener.open(request, timeout=10).close()
+except (OSError, ValueError) as error:
+    print(f"revive: could not open https://chatgpt.com/: {type(error).__name__}")
+    sys.exit(1)
+print("revive: opened https://chatgpt.com/ (the browser showed no chatgpt.com tab)")
+PY
+}
+
+case ${1:-} in
+  after-display)
+    profile_locked glide && exit 0
+    start chatgpt-guardian-glide-browser ;;
+  after-browser)
+    ws=${2:?usage: revive after-browser home|glide}
+    case $ws in home | glide) ;; *) echo "revive: unknown account: $ws" >&2; exit 2 ;; esac
+    profile_locked "$ws" && exit 0
+    # the glide sender's ExecStartPre needs a chatgpt.com tab in its browser (see open_chat_tab); a failure here must not keep the sender down
+    [ "$ws" = glide ] && { open_chat_tab "${CHATGPT_REVIVE_DEVTOOLS_PORT:-9223}" || true; }
+    start "chatgpt-guardian-$ws-observer" "chatgpt-guardian-$ws" ;;
+  sweep)
+    status=0
+    for ws in glide home; do
+      profile_locked "$ws" && continue
+      # dependency order: display, browser, observer, sender
+      for unit in "chatgpt-guardian-$ws-display" "chatgpt-guardian-$ws-browser" "chatgpt-guardian-$ws-observer" "chatgpt-guardian-$ws"; do
+        [ "$("${sc[@]}" is-failed "$unit.service" 2>/dev/null)" = failed ] || continue
+        echo "revive: $unit.service is failed: reset and start"
+        start "$unit" || status=1
+      done
+    done
+    exit "$status" ;;
+  *)
+    echo "usage: revive after-display | after-browser home|glide | sweep" >&2
+    exit 2 ;;
+esac

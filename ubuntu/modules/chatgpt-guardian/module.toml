@@ -63,6 +63,7 @@ match = [
   "unit:chatgpt-guardian-home.service", "unit:chatgpt-guardian-home-browser.service", "unit:chatgpt-guardian-home-observer.service",
   "unit:chatgpt-guardian-glide.service", "unit:chatgpt-guardian-glide-browser.service", "unit:chatgpt-guardian-glide-observer.service",
   "unit:chatgpt-guardian-glide-display.service", "unit:chatgpt-guardian-home-display.service",
+  "unit:chatgpt-guardian-revive.service", "unit:chatgpt-guardian-revive.timer",
 ]
 class = "tracked"
 reason = "rendered from units/ and enabled by the chatgpt-guardian module"

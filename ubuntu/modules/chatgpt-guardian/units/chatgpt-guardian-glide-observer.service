@@ -21,6 +21,7 @@ Nice=10
 CPUQuota=15%
 MemoryHigh=192M
 MemoryMax=384M
+ManagedOOMPreference=avoid
 TasksMax=32
 NoNewPrivileges=yes
 UMask=0077

@@ -19,6 +19,7 @@ RestartSec=60
 CPUQuota=200%
 MemoryHigh=@HOME_MEMORY_HIGH@
 MemoryMax=@HOME_MEMORY_MAX@
+ManagedOOMPreference=avoid
 TasksMax=1024
 TimeoutStopSec=45
 SendSIGKILL=no
