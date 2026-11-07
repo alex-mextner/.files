@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""audit-gate WORKSPACE: ExecCondition of the pm-chatgpt-audit-<account> units (home | glide.vc).
+
+Exit 0 = run the audit, exit 1 = skip this run (systemd counts a failed ExecCondition as "skipped", not as a failed unit; the
+reason is the one line on stdout, kept in the journal). Every uncertainty skips: an audit is never worth a request the
+account might not take.
+
+The audit makes about 28 browser requests per account (it reads chat lists and turns through the owned browser). It runs only when
+
+  * the account's sender and browser units are active and running (the audit rides the same logged-in browser),
+  * the Guardian monitor is readable and the browser is connected,
+  * there is NO live 429 cooldown (rotation cooldown of the monitor, or the cooldown of the schedule holds), no global stop and no
+    quota latch on the account. pm's own audit guard only learns of a 429 that its own reads hit (its `not_before`); the
+    Guardian's cooldown, set by the patrol's 429s, is invisible to it, which is why this gate exists.
+
+Environment (tests): AUDIT_GATE_PM (default ~/.local/bin/pm), AUDIT_GATE_SYSTEMCTL (default "systemctl --user").
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+UNIT_OF = {"home": "chatgpt-guardian-home", "glide.vc": "chatgpt-guardian-glide"}
+PM = os.environ.get("AUDIT_GATE_PM") or os.path.expanduser("~/.local/bin/pm")
+SYSTEMCTL = shlex.split(os.environ.get("AUDIT_GATE_SYSTEMCTL") or "systemctl --user")
+
+
+def run(cmd):
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+    return done.returncode, done.stdout, done.stderr
+
+
+def pm_json(workspace, *args):
+    rc, out, _ = run([PM, "chatgpt", "--workspace", workspace, *args])
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def unit_running(unit):
+    _, out, _ = run([*SYSTEMCTL, "show", unit + ".service", "-p", "ActiveState,SubState"])
+    fields = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return fields.get("ActiveState") == "active" and fields.get("SubState") == "running"
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def reasons(workspace, now):
+    unit = UNIT_OF[workspace]
+    found = [f"{name} unit is not running" for name in (unit, unit + "-browser") if not unit_running(name)]
+    monitor = pm_json(workspace, "monitor", "--json")
+    schedule = pm_json(workspace, "schedule", "--json")
+    if monitor is None:
+        return found + ["monitor unreadable"]
+    if monitor.get("connection") != "connected":
+        found.append(f"browser {monitor.get('connection')}")
+    controls = monitor.get("effective_controls") or {}
+    if controls.get("global_stop"):
+        found.append(f"global stop {controls['global_stop']}")
+    if controls.get("quota_latched"):
+        found.append("quota latched")
+    cooldown = (monitor.get("rotation") or {}).get("cooldown") or {}
+    if number(cooldown.get("until")) and cooldown["until"] > now:
+        found.append(f"429 cooldown live for {round(cooldown['until'] - now)} s ({cooldown.get('reason') or 'no reason'})")
+    if schedule is None:
+        return found + ["schedule unreadable"]
+    holds = schedule.get("holds") or {}
+    hold_cooldown = holds.get("cooldown") or {}
+    if hold_cooldown.get("remaining") or holds.get("global_stop"):
+        found.append(f"schedule hold: cooldown {hold_cooldown.get('remaining') or 0} s ({hold_cooldown.get('reason') or ''}) stop {holds.get('global_stop') or 'none'}")
+    return found
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in UNIT_OF:
+        print(f"usage: audit-gate {{{'|'.join(UNIT_OF)}}}", file=sys.stderr)
+        return 2
+    found = reasons(argv[1], time.time())
+    if found:
+        print(f"skip audit of {argv[1]}: " + "; ".join(found))
+        return 1
+    print(f"audit of {argv[1]}: sender and browser running, no cooldown, stop or quota latch")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

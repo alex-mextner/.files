@@ -33,6 +33,12 @@
 #   8. each browser profile is logged in to ChatGPT (cannot be declared: reported as a manual step); only then
 #      its --apply guardian is enabled and started, because a guardian that meets the login page latches a
 #      durable human-challenge stop that only an explicit `resume` clears
+#   9. control_pass_dir (option, opt-in): ./control-pass (the 30-minute control pass: control-pass.sh, control-precheck.py, CONTROL_PASS_BRIEF.md)
+#      is copied there, the model's refusing tg/slack/mail stubs are written to <dir>/bin-quiet, and guardian-proactive-control.service/.timer
+#      are rendered from units/control and the timer is enabled
+#  10. audit_timers (option, opt-in): pm-chatgpt-audit-home and pm-chatgpt-audit-glide (service + timer each, from units/audit): `pm chatgpt
+#      audit --workspace <account>` every 4 h (home at :10, glide.vc at :40), niced and CPU-capped, started only when ./audit-gate says the
+#      account's sender and browser run and no 429 cooldown, global stop or quota latch is live; the timers are enabled
 #
 # Options ([modules.chatgpt-guardian] of profile.toml / machine.toml, JSON in UBUNTU_TWEAK_MODULE_CONFIG):
 #   repo        git URL of agent-tools   (default https://git.hyperide.ai/ultrabricks/agent-tools.git)
@@ -58,6 +64,10 @@
 #                      the home browser and guardian then run on their old definition until restarted (apply prints the command)
 #   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); `relogin` reads it, and the
 #                      glide guardian unit passes it to `relogin check --live` (ExecStartPre) as CHATGPT_RELOGIN_DOMAIN
+#   control_pass_dir   absolute path (or ~/...) of the directory the control pass runs from and writes its output to (default empty: the
+#                      pass is not managed by this module); the units' paths follow it
+#   audit_timers       true / false (default false): install the per-account pm audit timers of fact 10; needs a pm that merges a
+#                      single account's audit into last-report.json (pm >= 0.10.3, see pm_package)
 set -euo pipefail
 
 usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
@@ -87,7 +97,7 @@ import json, os, re, shlex, sys
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "", "pm_package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
          "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
-         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False}
+         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -107,7 +117,7 @@ for port_key in ("home_port", "glide_port"):
         fail("port out of range: %s" % opt[port_key])
 if int(opt["home_port"]) == int(opt["glide_port"]):
     fail("home_port and glide_port must differ")
-for key in ("repo", "dir", "package", "chrome", "xvfb", "pm_package"):
+for key in ("repo", "dir", "package", "chrome", "xvfb", "pm_package", "control_pass_dir"):
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
 # read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
@@ -115,6 +125,8 @@ if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-
     fail("glide_email_domain must be a domain name such as glide.vc")
 if not isinstance(opt["home_private_display"], bool):
     fail("home_private_display must be true or false: %s" % opt["home_private_display"])
+if not isinstance(opt["audit_timers"], bool):
+    fail("audit_timers must be true or false: %s" % opt["audit_timers"])
 UNIT = {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}
 for key in ("home_memory_high", "home_memory_max"):
     if not isinstance(opt[key], str) or not re.fullmatch(r"[1-9][0-9]{0,5}[KMGT]", opt[key]):
@@ -141,20 +153,27 @@ def expand(path):
     return os.path.expanduser(path) if path.startswith("~/") else path
 
 
-for key in ("dir", "package", "chrome", "xvfb", "pm_package"):
+for key in ("dir", "package", "chrome", "xvfb", "pm_package", "control_pass_dir"):
     opt[key] = expand(opt[key])
 if opt["pm_package"] and not opt["pm_package"].startswith("/"):
     fail("pm_package must be absolute or start with ~/: %s" % opt["pm_package"])
 if not opt["dir"].startswith("/"):
     fail("dir must be absolute or start with ~/: %s" % opt["dir"])
+if opt["control_pass_dir"] and not opt["control_pass_dir"].startswith("/"):
+    fail("control_pass_dir must be absolute or start with ~/: %s" % opt["control_pass_dir"])
+if opt["control_pass_dir"] and re.search(r"[\s%$\"'\\]", opt["control_pass_dir"]):
+    fail("control_pass_dir must not contain whitespace, quotes, backslash, %% or $ (systemd splits, unquotes and expands them in ExecStart): %s" % opt["control_pass_dir"])
+if opt["audit_timers"] and not opt["pm_package"]:
+    fail("audit_timers needs pm_package (a pm that merges a single account's audit into last-report.json, pm >= 0.10.3)")
 if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
     fail('chrome must be an absolute path or "user": %s' % opt["chrome"])
 if not opt["package"]:
     opt["package"] = opt["dir"] + "/lib/agenttools_chatgpt"
 opt["glide_domain"] = opt["glide_email_domain"].lstrip("@").lower()
-for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain"):
+for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain", "control_pass_dir"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
+print("opt_audit_timers=%s" % ("true" if opt["audit_timers"] else "false"))
 for key in ("chats_home", "chats_glide"):
     print("opt_%s=(%s)" % (key, " ".join(shlex.quote(u) for u in opt[key])))
 PY
@@ -172,6 +191,8 @@ home_memory_high=$opt_home_memory_high
 home_memory_max=$opt_home_memory_max
 home_private_display=$opt_home_private_display
 glide_domain=$opt_glide_domain
+control_dir=$opt_control_pass_dir
+audit_timers=$opt_audit_timers
 
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 vpy="$venv/bin/python"
@@ -387,6 +408,43 @@ revive_ok() { revive_timer_ok && unit_ok "$revive_unit" && for n in "${revive_dr
 tunnel_unit="$units_dir/guardian-tunnel.service"
 tunnel_gate="$units_dir/guardian-tunnel.service.d/90-no-platform-key.conf"
 tunnel_gate_ok() { [ ! -f "$tunnel_unit" ] || { [ -f "$tunnel_gate" ] && [ "$(cat "$tunnel_gate")" = "$(tunnel_gate_text)" ]; }; }
+
+# The control pass (option control_pass_dir): its files are copied next to the output it writes (the two scripts keep the source's
+# executable bit), and the model's "quiet" PATH (tg, slack, mail and friends refuse) is written beside them.
+control_unit=guardian-proactive-control
+control_files=(control-pass.sh control-precheck.py CONTROL_PASS_BRIEF.md)
+quiet_names=(mail msmtp mutt sendmail slack telegram-send tg)
+control_active() { [ -n "$control_dir" ]; }
+text_ok() { [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]; } # text_ok FILE TEXT: the installed file is exactly that text
+file_same() { # file_same SRC DST: a regular file with the same bytes and the same executable bit
+  [ -f "$2" ] && [ ! -L "$2" ] && cmp -s "$1" "$2" || return 1
+  if [ -x "$1" ]; then [ -x "$2" ]; else [ ! -x "$2" ]; fi
+}
+quiet_text() { printf '#!/bin/sh\necho "guardian control pass is quiet: %s is disabled for this run (write control-passes/<ts>.md instead)" >&2\nexit 1\n' "$1"; }
+quiet_ok() { [ -x "$control_dir/bin-quiet/$1" ] && [ ! -L "$control_dir/bin-quiet/$1" ] && [ "$(cat "$control_dir/bin-quiet/$1")" = "$(quiet_text "$1")" ]; }
+control_unit_text() { render "$here/units/control/$control_unit.$1" "CONTROL_DIR=$control_dir"; }
+control_unit_file() { echo "$units_dir/$control_unit.$1"; }
+control_ok() {
+  local f
+  for f in "${control_files[@]}"; do file_same "$here/control-pass/$f" "$control_dir/$f" || return 1; done
+  for f in "${quiet_names[@]}"; do quiet_ok "$f" || return 1; done
+  for f in service timer; do text_ok "$(control_unit_file "$f")" "$(control_unit_text "$f" 2>/dev/null)" || return 1; done
+}
+# The per-account pm audit (option audit_timers): one rendered service + timer per account, staggered so the two never overlap.
+declare -A audit_minute=([home]=10 [glide.vc]=40)
+audit_unit() { echo "pm-chatgpt-audit-${ws_unit[$1]}"; }
+audit_file() { echo "$units_dir/$(audit_unit "$1").$2"; }
+audit_text() { # audit_text service|timer WS
+  render "$here/units/audit/pm-chatgpt-audit.$1" "WORKSPACE=$2" "UNIT=${ws_unit[$2]}" "MINUTE=${audit_minute[$2]}" "AUDIT_GATE=$here/audit-gate"
+}
+audit_ok() {
+  local ws kind
+  for ws in "${workspaces[@]}"; do
+    for kind in service timer; do text_ok "$(audit_file "$ws" "$kind")" "$(audit_text "$kind" "$ws" 2>/dev/null)" || return 1; done
+  done
+  [ -x "$here/audit-gate" ]
+}
+timer_on() { [ "$(sc is-enabled "$1.timer" 2>/dev/null || true)" = enabled ] && [ "$(sc is-active "$1.timer" 2>/dev/null || true)" = active ]; }
 stale_list() {
   local n f
   for n in "${unit_names[@]}"; do
@@ -480,12 +538,18 @@ if [ "$mode" = check ]; then
     problems+=("the package is not installed in the venv yet: the units cannot be compared")
   fi
   tunnel_gate_ok || problems+=("$tunnel_gate is missing or differs (guardian-tunnel needs a platform API key)")
+  if control_active && ! control_ok; then problems+=("the control pass in $control_dir (${control_files[*]}, bin-quiet stubs) or $control_unit.service/.timer is missing or differs"); fi
+  if [ "$audit_timers" = true ] && ! audit_ok; then problems+=("a pm-chatgpt-audit-<account> service/timer is missing or differs, or $here/audit-gate is not executable"); fi
   while IFS= read -r f; do problems+=("stale drop-in $f"); done < <(stale_list)
   if sc show -p Id --value default.target >/dev/null 2>&1; then
     for n in "${unit_names[@]}"; do
       is_enabled "$n" || problems+=("$n.service is not enabled")
     done
     [ "$(sc is-enabled "$revive_unit.timer" 2>/dev/null || true)" = enabled ] || problems+=("$revive_unit.timer is not enabled")
+    if control_active && ! timer_on "$control_unit"; then problems+=("$control_unit.timer is not enabled and active"); fi
+    if [ "$audit_timers" = true ]; then
+      for ws in "${workspaces[@]}"; do timer_on "$(audit_unit "$ws")" || problems+=("$(audit_unit "$ws").timer is not enabled and active"); done
+    fi
     for ws in "${workspaces[@]}"; do
       if dep_ok "$ws"; then
         for n in "chatgpt-guardian-${ws_unit[$ws]}-browser" "chatgpt-guardian-${ws_unit[$ws]}" "chatgpt-guardian-${ws_unit[$ws]}-observer"; do
@@ -530,6 +594,12 @@ if [ "$mode" = plan ]; then
     chats_of "$ws" | while IFS= read -r url; do [ -z "$url" ] || echo "$ws: watch $url (when never seen)"; done
   done
   echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins + the $revive_unit service/timer and its 3 91-revive.conf drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers, enable the $revive_unit.timer"
+  if ! control_active; then echo "control pass: not managed (no control_pass_dir)"
+  elif control_ok && timer_on "$control_unit"; then echo "control pass: $control_dir matches ./control-pass, $control_unit.service/.timer ok and enabled"
+  else echo "control pass: copy ${control_files[*]} and the ${#quiet_names[@]} quiet stubs into $control_dir, render $control_unit.service/.timer, enable the timer (what differs)"; fi
+  if [ "$audit_timers" != true ]; then echo "pm audit timers: not managed (audit_timers is false)"
+  elif audit_ok && timer_on "$(audit_unit home)" && timer_on "$(audit_unit glide.vc)"; then echo "pm audit timers: $(audit_unit home) (:${audit_minute[home]}) and $(audit_unit glide.vc) (:${audit_minute[glide.vc]}) every 4 h ok and enabled"
+  else echo "pm audit timers: render $(audit_unit home) / $(audit_unit glide.vc) service + timer (every 4 h at :${audit_minute[home]} / :${audit_minute[glide.vc]}, gated by $here/audit-gate), enable the timers"; fi
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
@@ -671,6 +741,45 @@ for n in "${revive_dropin_names[@]}"; do
   revive_dropin_ok "$n" || install_text "$(revive_dropin_file "$n")" "$(revive_dropin_text "$n")"
 done
 tunnel_gate_ok || install_text "$tunnel_gate" "$(tunnel_gate_text)"
+rewritten_timers=() # timers whose file changed: a running timer keeps its old schedule until restarted
+if control_active; then
+  install_file() { # install_file SRC DST: copy through a temp name, keeping the source's executable bit
+    mkdir -p "$(dirname "$2")"
+    install -m "$([ -x "$1" ] && echo 0755 || echo 0644)" "$1" "$2.tmp"
+    mv -f "$2.tmp" "$2"
+    changed=1
+  }
+  for f in "${control_files[@]}"; do
+    file_same "$here/control-pass/$f" "$control_dir/$f" || install_file "$here/control-pass/$f" "$control_dir/$f"
+  done
+  for f in "${quiet_names[@]}"; do
+    if ! quiet_ok "$f"; then
+      mkdir -p "$control_dir/bin-quiet"
+      quiet_text "$f" > "$control_dir/bin-quiet/$f.tmp"
+      chmod 0755 "$control_dir/bin-quiet/$f.tmp"
+      mv -f "$control_dir/bin-quiet/$f.tmp" "$control_dir/bin-quiet/$f"
+    fi
+  done
+  for f in service timer; do
+    text=$(control_unit_text "$f") || die "cannot render $control_unit.$f"
+    if ! text_ok "$(control_unit_file "$f")" "$text"; then
+      install_text "$(control_unit_file "$f")" "$text"
+      if [ "$f" = timer ]; then rewritten_timers+=("$control_unit"); fi
+    fi
+  done
+fi
+if [ "$audit_timers" = true ]; then
+  [ -x "$here/audit-gate" ] || die "$here/audit-gate is not executable"
+  for ws in "${workspaces[@]}"; do
+    for kind in service timer; do
+      text=$(audit_text "$kind" "$ws") || die "cannot render $(audit_unit "$ws").$kind"
+      if ! text_ok "$(audit_file "$ws" "$kind")" "$text"; then
+        install_text "$(audit_file "$ws" "$kind")" "$text"
+        if [ "$kind" = timer ]; then rewritten_timers+=("$(audit_unit "$ws")"); fi
+      fi
+    done
+  done
+fi
 while IFS= read -r f; do rm -f -- "$f"; changed=1; done < <(stale_list)
 if [ "$changed" != 0 ]; then
   sc daemon-reload
@@ -698,6 +807,16 @@ for n in "${started_units[@]}"; do
 done
 # restarts units that ended `failed` (never an operator-stopped one), whether or not a profile is signed in yet
 sc enable --now "$revive_unit.timer" >/dev/null || echo "warning: $revive_unit.timer failed to start" >&2
+# the control pass and the audits are driven by their timers; an enabled and running timer is left alone (never restarted)
+for n in "${rewritten_timers[@]}"; do # a rewritten schedule takes effect now (restarting a timer never interrupts a running pass or audit)
+  if timer_on "$n"; then sc restart "$n.timer" || echo "warning: $n.timer failed to restart" >&2; fi
+done
+if control_active && ! timer_on "$control_unit"; then sc enable --now "$control_unit.timer" >/dev/null || echo "warning: $control_unit.timer failed to start" >&2; fi
+if [ "$audit_timers" = true ]; then
+  for ws in "${workspaces[@]}"; do
+    timer_on "$(audit_unit "$ws")" || sc enable --now "$(audit_unit "$ws").timer" >/dev/null || echo "warning: $(audit_unit "$ws").timer failed to start" >&2
+  done
+fi
 
 # logins live in the browser profiles: report, never fake. The --apply guardian of a workspace is enabled and
 # started only once its profile is signed in.

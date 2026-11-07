@@ -1,0 +1,12 @@
+[Unit]
+Description=Guardian proactive control pass every 30 minutes
+
+[Timer]
+OnActiveSec=30min
+OnUnitActiveSec=30min
+RandomizedDelaySec=60
+AccuracySec=30s
+Unit=guardian-proactive-control.service
+
+[Install]
+WantedBy=timers.target

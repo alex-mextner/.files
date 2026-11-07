@@ -1,0 +1,47 @@
+# One account's pm ChatGPT task-completion audit (read-only: no send, no tab, no model). install.sh renders it once per account
+# (pm-chatgpt-audit-home, pm-chatgpt-audit-glide) from this template; the timer next to it starts it every 4 h.
+# Optional settings go in ~/.config/pm-chatgpt-audit/env (see pm's own template of this unit): PM_AUDIT_LAYA_UNIT starts the warm
+# classifier server before the audit.
+# `pm chatgpt audit --workspace @WORKSPACE@` merges its account into last-report.json and leaves the other account's section alone
+# (pm >= 0.10.3); an older pm replaces the whole file, so the installed pm is pinned in the machine's pm_package.
+[Unit]
+Description=pm ChatGPT task-completion audit of @WORKSPACE@ (read-only)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/pm-chatgpt-audit/env
+# A failed ExecCondition skips the run without marking the unit failed: it runs only while this account's sender and browser run and
+# no 429 cooldown, global stop or quota latch is live (the audit makes about 28 browser requests; ./audit-gate says why it skips).
+ExecCondition=@AUDIT_GATE@ @WORKSPACE@
+# Starts the warm Laya server the classifier needs ('$$' is systemd's escape for a literal '$'); the leading '-' lets the audit run
+# even if that fails, and it then reports the classifier as unavailable.
+ExecStartPre=-/bin/sh -c 'unit="$${PM_AUDIT_LAYA_UNIT:-}"; if [ -n "$$unit" ]; then case "$$unit" in -*|*..*|*[!A-Za-z0-9@._-]*) echo "PM_AUDIT_LAYA_UNIT is not a plain unit name" >&2; exit 1;; esac; exec systemctl --user start "$$unit"; fi; launcher="$${PM_AUDIT_TASK_LAUNCHER:-$$HOME/.local/bin/task}"; case "$$launcher" in /*) ;; *) echo "PM_AUDIT_TASK_LAUNCHER must be an absolute path" >&2; exit 1;; esac; exec "$$launcher" classify-server start'
+# No --notify: only the repair coordinator may notify the owner; the report stays in last-report.json.
+ExecStart=%h/.local/bin/pm chatgpt audit --workspace @WORKSPACE@ --days 7 --json
+# Low priority: the audit must never compete with the guardian's own browser work.
+Nice=15
+CPUQuota=100%
+CPUWeight=20
+IOWeight=20
+IOSchedulingClass=idle
+TasksMax=256
+# 3 = partial coverage, 4 = the account is unavailable: both are fully reported in the JSON. 75 = pm's run lock is busy (the other
+# account's audit still runs): the run is skipped, never retried.
+SuccessExitStatus=3 4 75
+RestartPreventExitStatus=75
+Restart=no
+# pm's own read budget is 20 min.
+TimeoutStartSec=1680
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pm-chatgpt-audit-@UNIT@
+LogRateLimitIntervalSec=30min
+LogRateLimitBurst=40
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true

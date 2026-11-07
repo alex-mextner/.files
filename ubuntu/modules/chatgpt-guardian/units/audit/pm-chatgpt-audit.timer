@@ -1,0 +1,13 @@
+# The audit of one account, every 4 h at minute @MINUTE@ (home :10, glide.vc :40: the two runs never overlap, pm serialises them by
+# its run lock anyway). A run missed while the machine was off is not made up (no catch-up storm after boot).
+[Unit]
+Description=pm ChatGPT task-completion audit of @WORKSPACE@ every 4 hours at minute @MINUTE@
+
+[Timer]
+OnCalendar=*-*-* 00/4:@MINUTE@:00
+Persistent=false
+AccuracySec=1min
+Unit=pm-chatgpt-audit-@UNIT@.service
+
+[Install]
+WantedBy=timers.target
