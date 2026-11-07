@@ -23,8 +23,8 @@ enabled = true
 [modules.chatgpt-guardian]
 # The promoted guardian release: agenttools-chatgpt 0.3.39, agent-tools tree 3155feb3 (main 2016c6e: PR 1170 sent recovery Go outcome + PR 1171 read retry with stage labels, #1168/#1162); re-promote the main-branch build for the next release, never an older one.
 package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/3155feb3d4978d90e7ac997e0d07b86c5e399040/lib/agenttools_chatgpt"
-# pm CLI (hyper-pm) installed into the guardian venv: 0.10.2 = pm-direct + PR 60 standing worker + unlimited consent; move to the committed SHA tree once its review stamp lands.
-pm_package = "/home/ultra/.local/share/pm-releases/snapshot-06311d82b263a7bf45e317e643e0611bdf0267c4"
+# pm CLI (hyper-pm) installed into the guardian venv: 0.10.3 = 0.10.2 (pm-direct + PR 60 standing worker + unlimited consent) + a single-account audit merges into last-report.json instead of replacing it (pm-cli ticket 68, PR 69, commit 9640c6f, git archive tree f18dce35).
+pm_package = "/home/ultra/.local/share/pm-releases/9640c6f339e0610b8101a30e6175388efcef74f9"
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).
@@ -38,6 +38,11 @@ glide_email_domain = "app.glide.vc"
 # cannot be safely probed or focused by the guardian, and Chrome throttles the frames of a background tab. The home guardian is
 # then told --private-display; a profile that is signed in stays signed in.
 home_private_display = true
+# The 30-minute control pass runs from the guardian recovery state dir (its output lives there too) and the pm audit of each account
+# runs every 4 h (home :10, glide.vc :40): fresh audit verdicts are the control pass's only view of a chat whose last turn is complete
+# but whose task is not. The audit needs pm >= 0.10.3 (merges one account into last-report.json), see pm_package above.
+control_pass_dir = "~/.local/state/guardian-recovery-20261101-1653"
+audit_timers = true
 chats_home = [
   "https://chatgpt.com/c/6ad8058d-4bac-83eb-88fa-8975fae297cc",
   "https://chatgpt.com/c/6ad3a9c9-bf94-83ed-91c5-d23f4b34f54d",

@@ -5,11 +5,16 @@
 # 2. The model (CONTROL_PASS_BRIEF.md) runs ONLY when the pre-check reports an anomaly it cannot
 #    resolve (exit 10); a healthy pass never calls it (ticket #1126). No Telegram/Slack/email.
 # Usage: control-pass.sh [--dry-run]   (dry run: never starts, posts or requests; no model)
-# The timer runs the copy in $P (guardian-recovery state dir), not this directory: after a change here,
-# install with `cp control-pass.sh control-precheck.py CONTROL_PASS_BRIEF.md "$P"/` (the units are not in this repo).
+# The timer runs the copy install.sh puts into the module option control_pass_dir (a directory outside the repo that also holds
+# the pass's output); $P below is that copy's own directory, so the script works from wherever it was installed.
 set -u
-P=/home/ultra/.local/state/guardian-recovery-20261101-1653
-VENV=/home/ultra/.local/share/agent-tools/chatgpt-guardian-venv
+P=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$P/../install.sh" ]; then
+  echo "control-pass.sh: this is the repo copy; its state (lock, ledger, logs) would land in the git checkout and ignore the installed pass's ledger." >&2
+  echo "Run the installed copy (module option control_pass_dir, installed by install.sh)." >&2
+  exit 2
+fi
+VENV="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 MODEL="${GUARDIAN_CONTROL_MODEL:-anthropic/claude-sonnet-5-5}"
 DRY=""
 [ "${1:-}" = "--dry-run" ] && DRY="--dry-run"

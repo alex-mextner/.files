@@ -1,0 +1,18 @@
+# The 30-minute control pass (see ../../control-pass): install.sh puts its files into @CONTROL_DIR@ and runs it from there.
+[Unit]
+Description=Guardian proactive control pass (deterministic pre-check; the model only analyses anomalies)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CONTROL_DIR@
+UMask=0077
+# omp (the model of the pass) lives in ~/.local/bin; do not rely on the user manager's PATH.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Nice=15
+IOSchedulingClass=idle
+# pre-check (600 s) + model (1500 s) + recording its outcome; a pass that overruns the 30 min period is skipped by the script's flock
+TimeoutStartSec=40min
+ExecStart=@CONTROL_DIR@/control-pass.sh
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
