@@ -21,8 +21,8 @@ enabled = true
 # ChatGPT guardian (profile module chatgpt-guardian): works through the ChatGPT web login of two dedicated Chrome
 # profiles, never through an OpenAI API key. This PC has no root for apt, so Chrome is the rootless copy under ~/.local/opt.
 [modules.chatgpt-guardian]
-# The promoted guardian release: agenttools-chatgpt 0.3.37, agent-tools tree bb02fff9 (commit c8c8f14 on guardian-0337, #1156 follow-up, on top of main 4af295a); re-promote the main-branch build once that branch merges, never an older one.
-package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/bb02fff9c9cb1ca93cc8d529bbc9faf960c93230/lib/agenttools_chatgpt"
+# The promoted guardian release: agenttools-chatgpt 0.3.38, agent-tools tree eebda2a8 (commit 985f941 on guardian-go-follow-through, PR 1169, Go follow-through #1165, on top of main 9f0956c); re-promote the main-branch build once that branch merges, never an older one.
+package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/eebda2a854b7e182dc90cb81133af83b22384ef9/lib/agenttools_chatgpt"
 # pm CLI (hyper-pm) installed into the guardian venv: 0.10.2 = pm-direct + PR 60 standing worker + unlimited consent; move to the committed SHA tree once its review stamp lands.
 pm_package = "/home/ultra/.local/share/pm-releases/snapshot-06311d82b263a7bf45e317e643e0611bdf0267c4"
 enabled = true
