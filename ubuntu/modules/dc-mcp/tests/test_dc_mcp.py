@@ -49,7 +49,7 @@ CLOUDFLARED = """#!/bin/sh
 echo "cloudflared $*" >> "$STUB/calls.log"
 case "$1 $2" in
   "tunnel login") mkdir -p "$HOME/.cloudflared"; echo CERT > "$HOME/.cloudflared/cert.pem" ;;
-  "tunnel list") [ -e "$STUB/tunnel-exists" ] && echo '[{"id":"11111111-2222-3333-4444-555555555555","name":"x"}]' || echo '[]' ;;
+  "tunnel list") [ -e "$STUB/list-fails" ] && exit 1; [ -e "$STUB/tunnel-exists" ] && echo '[{"id":"11111111-2222-3333-4444-555555555555","name":"x"}]' || echo '[]' ;;
   "tunnel create") : > "$STUB/tunnel-exists"; mkdir -p "$HOME/.cloudflared"; echo CRED > "$HOME/.cloudflared/11111111-2222-3333-4444-555555555555.json" ;;
 esac
 exit 0
@@ -257,6 +257,16 @@ class Installer(Base):
             self.assertEqual(fh.read(), "PASSWORD=existing-secret\nEXTERNAL_URL=https://old.example.com\n")
         self.assertEqual(stat.S_IMODE(os.stat(self.auth).st_mode), 0o600)
 
+    def test_a_password_is_appended_on_its_own_line_after_an_unterminated_file(self):
+        os.makedirs(os.path.dirname(self.auth))
+        with open(self.auth, "w") as fh:
+            fh.write("# my comment without a newline")
+        os.chmod(self.auth, 0o600)
+        self.install_ok()
+        lines = slurp(self.auth).splitlines()
+        self.assertEqual(lines[0], "# my comment without a newline")
+        self.assertRegex(lines[1], r"^PASSWORD=[A-Za-z0-9]{32}$")
+
     def test_no_hostname_installs_the_binaries_and_asks_for_the_option(self):
         self.config = {}
         self.fake_npx()
@@ -426,6 +436,16 @@ class Finish(Base):
         res = self.run_script("finish.sh", "run", stdin="y\n")
         self.assertEqual(res.returncode, 1)
         self.assertIn("credentials", res.stderr)
+        self.assertFalse([c for c in self.cloudflared_calls() if "create" in c or "route" in c])
+
+    def test_a_failing_tunnel_list_is_not_taken_for_a_missing_tunnel(self):
+        os.makedirs(os.path.join(self.home, ".cloudflared"))
+        with open(os.path.join(self.home, ".cloudflared", "cert.pem"), "w") as fh:
+            fh.write("CERT\n")
+        open(os.path.join(self.stub, "list-fails"), "w").close()
+        res = self.run_script("finish.sh", "run", stdin="y\n")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("cannot ask Cloudflare", res.stderr)
         self.assertFalse([c for c in self.cloudflared_calls() if "create" in c or "route" in c])
 
     def test_run_before_apply_says_what_is_missing(self):
@@ -853,6 +873,30 @@ class ShimLog(ShimHarness, unittest.TestCase):
         self.assertTrue(line.endswith("rpc=tools/call,tools/list,? tool=read_file"), line)
         self.assertNotIn("shadow", slurp(self.log))
 
+    def test_a_scanner_inventing_paths_cannot_push_the_real_records_out(self):
+        self.upstream.routes["/mcp"] = (200, {}, b"ok")
+        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
+        for i in range(400):
+            self.request("GET", f"/wp-admin/{i}.php")
+        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
+        self.settle()
+        lines = self.lines(3)
+        self.assertEqual(len([line for line in lines if " /mcp " in line]), 2)
+        self.assertLessEqual(len([line for line in lines if "/wp-admin/" in line]), 1)
+
+    def test_stopping_the_shim_writes_the_buffered_lines_exactly_once(self):
+        self.proc.terminate()
+        self.proc.wait()
+        self.start_shim(LOG_FILE=self.log, LOG_FLUSH_MS="60000")  # nothing is flushed until the shim is told to stop
+        self.upstream.routes["/mcp"] = (200, {}, b"ok")
+        for i in range(3):
+            self.request("POST", "/mcp", rpc_body("tools/call", params={"name": f"stop{i}"}), {"Authorization": "Bearer t"})
+        self.assertFalse(os.path.exists(self.log))
+        self.proc.terminate()
+        self.assertEqual(self.proc.wait(timeout=5), 0)
+        lines = slurp(self.log).splitlines()
+        self.assertEqual([line.split()[-1] for line in lines], ["tool=stop0", "tool=stop1", "tool=stop2"])
+
     def test_a_server_error_is_always_logged(self):
         self.upstream.routes["/boom"] = (500, {}, b"")
         for _ in range(3):
@@ -1007,6 +1051,15 @@ class LogReader(unittest.TestCase):
         self.assertEqual(self.read("--oauth").stdout.splitlines(), [self.LIVE[1]])
         self.assertEqual(self.read("--tool", "get_config", "--status", "200").stdout.splitlines(), [self.LIVE[2]])
 
+    def test_a_batch_line_matches_each_of_its_methods_and_tools(self):
+        with open(self.log, "a") as fh:
+            fh.write("2026-11-08T11:00:05.000Z 200 POST /mcp 7ms client=openai-mcp rpc=tools/call,tools/list tool=read_file,write_file\n")
+        self.assertEqual(len(self.read("--tool", "read_file").stdout.splitlines()), 2, "one single call and the batch")
+        self.assertEqual(len(self.read("--tool", "write_file").stdout.splitlines()), 1)
+        self.assertEqual(len(self.read("--rpc", "tools/list").stdout.splitlines()), 1)
+        self.assertEqual(len(self.read("--rpc", "tools/call").stdout.splitlines()), 4, "three single calls plus the batch")
+        self.assertEqual(self.read("--tool", "read").stdout, "", "a part of a name is not the name")
+
     def test_rotated_files_only_with_all_and_oldest_first(self):
         self.assertNotIn("old_tool", self.read().stdout)
         self.assertEqual(self.read("--all", "--tool", "old_tool").stdout.splitlines(), [self.OLD])
@@ -1078,6 +1131,16 @@ class ToolLogRetention(unittest.TestCase):
             self.assertIn(name, self.left(), f"{name} must never be touched")
         with open(os.path.join(self.tmp, "target.log")) as fh:
             self.assertEqual(fh.read(), "keep me")
+
+    def test_a_file_that_cannot_be_removed_is_a_failure_not_a_success(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        done = self.prune(self.dir)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("cannot remove", done.stderr)
+        self.assertIn("0 rotated file(s) removed", done.stdout)
 
     def test_a_second_run_changes_nothing(self):
         self.prune(self.dir)

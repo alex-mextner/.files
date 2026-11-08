@@ -118,7 +118,8 @@ fi
 if ! auth_has_password; then
   pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
   [ "${#pw}" -eq 32 ] || { echo "dc-mcp: could not generate a password" >&2; exit 1; }
-  ( umask 077; printf 'PASSWORD=%s\n' "$pw" >> "$auth_file" ) || exit 1
+  # an existing file may end without a newline: the password must start its own line
+  ( umask 077; { [ ! -s "$auth_file" ] || [ -z "$(tail -c1 "$auth_file")" ] || echo; printf 'PASSWORD=%s\n' "$pw"; } >> "$auth_file" ) || exit 1
   unset pw
   echo "dc-mcp: generated the proxy password in $auth_file (mode 600; not printed)"
 fi

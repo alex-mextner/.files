@@ -44,7 +44,15 @@ if [ ! -e "$log" ]; then echo "dc-mcp-log: no log yet at $log" >&2; exit 1; fi
     for (i = 1; i <= n; i++) {
       if (w[i] ~ /^STATUS:/) { if ($2 != substr(w[i], 8)) next }
       else if (w[i] == "OAUTH:") { if ($4 !~ /^\/\.(idp|auth)\//) next }
-      else { found = 0; for (f = 6; f <= NF; f++) { if ($f == w[i]) found = 1 } if (!found) next }
+      else {
+        split(w[i], kv, "="); found = 0
+        for (f = 6; f <= NF; f++) {
+          if (index($f, kv[1] "=") != 1) continue
+          m = split(substr($f, length(kv[1]) + 2), vals, ",")
+          for (v = 1; v <= m; v++) if (vals[v] == kv[2]) found = 1
+        }
+        if (!found) next
+      }
     }
     print
   }' | tail -n "$lines"

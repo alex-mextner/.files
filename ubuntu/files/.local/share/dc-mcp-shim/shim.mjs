@@ -85,6 +85,7 @@ class AccessLog {
     this.busy = false;
     this.dropped = 0;
     this.warned = false;
+    this.current = Promise.resolve(); // the write in progress; stopping waits for it instead of rewriting its batch
     if (file) {
       this.timer = setInterval(() => this.flush(), flushMs);
       this.timer.unref();
@@ -105,7 +106,7 @@ class AccessLog {
     const batch = this.lines;
     this.lines = [];
     this.bytes = 0;
-    this.append(batch.join(''))
+    this.current = this.append(batch.join(''))
       .then(() => {
         if (this.warned) {
           this.warned = false;
@@ -157,9 +158,17 @@ class AccessLog {
     this.fd = null;
   }
 
-  flushSync() { // on exit: whatever is buffered, without rotation
+  async drain() { // on exit: let the write in progress finish (never repeat its batch), then write what is still buffered
+    await this.current.catch(() => {});
+    this.flushSync();
+  }
+
+  flushSync() { // whatever is buffered, without rotation
     if (!this.file || this.lines.length === 0) return;
-    try { fs.appendFileSync(this.file, this.lines.join(''), { mode: 0o600 }); } catch { /* nothing left to do */ }
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(this.file, this.lines.join(''), { mode: 0o600 });
+    } catch { /* nothing left to do */ }
     this.lines = [];
   }
 }
@@ -200,10 +209,17 @@ function describeRpc(buffer) {
   }
 }
 
+// Paths the connector really uses keep their own collapse key; any other path shares one, so a scanner that invents a new path
+// per request cannot push the real records out of the log.
+const KNOWN_PATHS = new Set(['/mcp', PRM, '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration']);
+const collapseName = (pathname) => {
+  if (pathname.startsWith(PRM + '/')) return PRM;
+  return KNOWN_PATHS.has(pathname) ? pathname : '(other)';
+};
 const collapsed = new Map(); // "METHOD path status" -> { last, suppressed }
 // Returns the suppressed count to print (0 = none), or -1 when this line is collapsed away.
 function collapse(key, now) {
-  if (collapsed.size >= COLLAPSE_KEYS_MAX) collapsed.clear();
+  if (collapsed.size >= COLLAPSE_KEYS_MAX) collapsed.delete(collapsed.keys().next().value); // drop the oldest key only
   const entry = collapsed.get(key);
   if (!entry) { collapsed.set(key, { last: now, suppressed: 0 }); return 0; }
   if (now - entry.last < COLLAPSE_MS) { entry.suppressed += 1; return -1; }
@@ -219,7 +235,7 @@ function logRequest({ req, pathname, status, startedAt, rpc }) {
   const authenticatedCall = pathname === '/mcp' && Boolean(req.headers.authorization);
   let suppressed = 0;
   if (!oauthStep && !authenticatedCall && status < 500) {
-    suppressed = collapse(`${req.method} ${pathname} ${status}`, Date.now());
+    suppressed = collapse(`${req.method} ${collapseName(pathname)} ${status}`, Date.now());
     if (suppressed < 0) return;
   }
   const ms = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6);
@@ -296,5 +312,9 @@ server.keepAliveTimeout = 65000;
 server.listen(LISTEN_PORT, '127.0.0.1', () => console.log(`dc-mcp shim listening 127.0.0.1:${LISTEN_PORT} -> ${UPSTREAM_HOST}:${UPSTREAM_PORT}${accessLog.file ? `, access log ${accessLog.file}` : ''}`));
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
-  process.on(signal, () => { accessLog.flushSync(); console.log(`dc-mcp shim stopping (${signal})`); process.exit(0); });
+  process.on(signal, () => {
+    console.log(`dc-mcp shim stopping (${signal})`);
+    const giveUp = setTimeout(() => process.exit(0), 1500); // never hold a stop for a stuck disk
+    accessLog.drain().finally(() => { clearTimeout(giveUp); process.exit(0); });
+  });
 }

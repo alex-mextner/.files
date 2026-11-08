@@ -54,17 +54,21 @@ else
 fi
 
 # 2. the tunnel: reuse one whose credentials are here, create it when Cloudflare does not know the name
-tunnel_id=$("$cf" tunnel list --name "$opt_tunnel" -o json 2>/dev/null \
-  | python3 -c 'import json,sys
+tunnel_id_of() { # prints the id, or nothing when Cloudflare knows no such tunnel; fails when it cannot be asked
+  local listing
+  listing=$("$cf" tunnel list --name "$opt_tunnel" -o json) || return 1
+  printf '%s' "$listing" | python3 -c 'import json,sys
 try:
     rows = json.load(sys.stdin) or []
 except ValueError:
-    rows = []
-print(rows[0]["id"] if rows else "")')
+    sys.exit(1)
+print(rows[0]["id"] if rows else "")'
+}
+tunnel_id=$(tunnel_id_of) || die "cannot ask Cloudflare for tunnel $opt_tunnel (network, or the login is stale: remove $cf_dir/cert.pem and run this step again)"
 if [ -z "$tunnel_id" ]; then
   echo "dc-mcp: step 2/4: creating tunnel $opt_tunnel"
   "$cf" tunnel create "$opt_tunnel" || die "cloudflared tunnel create $opt_tunnel failed"
-  tunnel_id=$("$cf" tunnel list --name "$opt_tunnel" -o json 2>/dev/null | python3 -c 'import json,sys; rows=json.load(sys.stdin) or []; print(rows[0]["id"] if rows else "")')
+  tunnel_id=$(tunnel_id_of) || die "cannot ask Cloudflare for tunnel $opt_tunnel after creating it"
 fi
 [ -n "$tunnel_id" ] || die "cannot find tunnel $opt_tunnel after creating it"
 if [ ! -s "$cf_dir/$tunnel_id.json" ]; then
