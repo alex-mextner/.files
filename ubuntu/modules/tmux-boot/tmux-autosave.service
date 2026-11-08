@@ -1,0 +1,8 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): one autosave trigger for the running tmux server; tmux-autosave.timer runs it.
+[Unit]
+Description=Fire tmux-continuum's autosave for the running tmux server (tmux-resurrect snapshot + omp/claude/codex session maps)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-autosave
+TimeoutStartSec=60

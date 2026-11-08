@@ -44,7 +44,11 @@ if tmux list-sessions >/dev/null 2>&1; then
   exit 0
 fi
 
-tmux new-session -d -s "$session" || { echo "tmux-boot: tmux new-session failed" >&2; exit 1; }
+# The snapshot holds this session too (autosave saves `main` like every other session), so continuum can restore it
+# before this command runs: new-session then fails with "duplicate session" while the server is up and restoring,
+# which is the outcome wanted, not a failure.
+tmux new-session -d -s "$session" || tmux has-session -t "=$session" 2>/dev/null \
+  || { echo "tmux-boot: tmux new-session failed" >&2; exit 1; }
 
 dir=$(resurrect_dir)
 if [ ! -e "$dir/last" ]; then

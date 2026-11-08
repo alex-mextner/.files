@@ -1,4 +1,4 @@
-description = "tmux sessions return after a reboot: a user unit starts the tmux server at boot so continuum restores the last snapshot (Linux counterpart of rig's launchd boot agent)"
+description = "tmux sessions return after a reboot: a user unit starts the tmux server at boot so continuum restores the last snapshot (Linux counterpart of rig's launchd boot agent), and a user timer fires continuum's autosave so the snapshot is current (Linux counterpart of rig's launchd autosave agent)"
 enabled = true
 order = 92   # after ctmux (90, which brings tmux and the clone); before autoheal (95)
 manual = "`sudo loginctl enable-linger $USER` once if linger is off (the unit then starts at login instead of at boot); tmux itself comes from packages.toml"
@@ -10,6 +10,12 @@ manual = "`sudo loginctl enable-linger $USER` once if linger is off (the unit th
 # screen. rig-cli's `tmux.boot.enabled` cannot be switched on here: `rig status` would then expect a launchd plist
 # that can never exist and the dotfiles-link module would report drift forever. Until rig grows a systemd boot
 # (https://git.hyperide.ai/ultrabricks/rig-cli/issues/755) this module is the Linux boot path.
+#
+# The autosave timer exists for the same reason, one level down (incident 2026-11-08, no snapshot for 16 days): rig forces
+# `tmux.autosave` off off-macOS, so the only autosave is continuum's own, whose trigger is a token in the global
+# `status-right`. The Moshi iOS client attaches with `tmux set -g status-right ''`, which removes the token for every
+# client until the server restarts, and a server without an attached client never evaluates it. tmux-autosave runs
+# continuum's save entry point from tmux-autosave.timer instead, so the trigger no longer depends on status-right.
 #
 # User level: writes $HOME and talks to the user's systemd, so it never runs as root. No options.
 [source]
@@ -32,3 +38,8 @@ reason = "written by the tmux-boot module"
 match = ["file:~/.config/autostart/tmux-boot.desktop"]
 class = "tracked"
 reason = "the tmux-boot module's failover entry when there is no user systemd bus"
+
+[[coverage]]
+match = ["unit:tmux-autosave.service", "unit:tmux-autosave.timer", "file:~/.local/bin/tmux-autosave"]
+class = "tracked"
+reason = "written by the tmux-boot module: the timer-driven tmux autosave"
