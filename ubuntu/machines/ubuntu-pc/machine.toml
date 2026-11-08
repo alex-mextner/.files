@@ -247,3 +247,10 @@ optional = true
 # has no effect now, so `capture` must not carry it into the shared settings (and `coverage` does not list it as untracked).
 [capture]
 exclude = ["/org/gnome/shell/extensions/dash-to-dock/dock-position"]
+
+# ChatGPT to this PC's local tools (profile module dc-mcp, issue #143): Desktop Commander behind an OAuth proxy and the Cloudflare
+# tunnel dc-local. ONE HOSTNAME PER MACHINE: a second machine must use its own hostname, never this one.
+[modules.dc-mcp]
+enabled = true
+hostname = "dc-mcp.mextner.com"
+tunnel = "dc-local"

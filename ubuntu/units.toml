@@ -11,6 +11,7 @@
 
 enable = [
   "media-inhibit.service",   # keeps the screen awake while a player plays; script files/.local/bin/media-inhibit.sh, playerctl in packages.toml
+  "dc-mcp-tool-log-prune.timer",   # daily retention of Desktop Commander's rotated tool-call logs (dc-mcp module, #143); a no-op where ~/.claude-server-commander does not exist
 ]
 
 # Global, not per machine: user units start at boot and survive logout (tg-ctl, the tmux server of tmux-boot, the guardian).

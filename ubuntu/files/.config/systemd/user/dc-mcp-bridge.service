@@ -1,0 +1,24 @@
+[Unit]
+Description=Desktop Commander MCP behind mcp-auth-proxy (OAuth 2.1 login for ChatGPT)
+Documentation=https://github.com/sigbit/mcp-auth-proxy
+# A crash loop must never exhaust systemd's start limit and leave the unit dead for good: with Restart=always it keeps trying
+# every RestartSec until the cause is gone.
+StartLimitIntervalSec=0
+
+# Owned by the dc-mcp module of the ubuntu profile (ubuntu/modules/dc-mcp). The module writes both environment files:
+#   dc-mcp.env       DC_MCP_HOSTNAME, DC_MCP_PORT, DC_MCP_PACKAGE from [modules.dc-mcp] (not secret)
+#   dc-mcp-auth.env  PASSWORD of the login page (secret, mode 600, generated locally, never in the repository)
+# Its stdout (an access line per request and supergateway's copy of every JSON-RPC message) is filtered by dc-mcp-quiet: see its
+# header. The proxy listens on loopback only. The way in from outside is the Cloudflare tunnel (dc-mcp-tunnel.service) through the shim
+# (dc-mcp-shim.service), which adds the WWW-Authenticate challenge ChatGPT's OAuth setup needs.
+
+[Service]
+Environment=PATH=%h/.local/bin:%h/.local/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/dc-mcp.env
+EnvironmentFile=%h/.config/dc-mcp-auth.env
+ExecStart=%h/.local/bin/dc-mcp-quiet %h/.local/bin/mcp-auth-proxy --external-url https://${DC_MCP_HOSTNAME} --no-auto-tls --listen 127.0.0.1:${DC_MCP_PORT} --data-path %h/.local/share/mcp-auth-proxy -- npx -y ${DC_MCP_PACKAGE}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

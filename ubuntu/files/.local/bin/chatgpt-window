@@ -1,0 +1,17 @@
+#!/bin/sh
+# ChatGPT in its own Chrome app window (the launcher entry is ~/.local/share/applications/chatgpt.desktop). Own profile
+# (~/.config/chatgpt-app) so its login never touches the daily Chrome. Chrome comes from the system package when there is one;
+# on a machine without root the rootless copy of the chatgpt-guardian module (chrome = "user") is used, which needs --no-sandbox
+# because unprivileged user namespaces are AppArmor-restricted there and there is no setuid sandbox helper.
+profile="$HOME/.config/chatgpt-app"
+for system_chrome in google-chrome-stable google-chrome; do
+  if command -v "$system_chrome" >/dev/null 2>&1 && [ "$(command -v "$system_chrome")" != "$HOME/.local/bin/google-chrome" ]; then
+    exec "$system_chrome" --app=https://chatgpt.com --class=ChatGPT --user-data-dir="$profile" "$@"
+  fi
+done
+user_chrome="$HOME/.local/opt/google-chrome/opt/google/chrome/chrome"
+if [ -x "$user_chrome" ]; then
+  exec "$user_chrome" --no-sandbox --app=https://chatgpt.com --class=ChatGPT --user-data-dir="$profile" "$@"
+fi
+echo "chatgpt-window: no Chrome found (install google-chrome-stable, or set [modules.chatgpt-guardian] chrome = \"user\")" >&2
+exit 1

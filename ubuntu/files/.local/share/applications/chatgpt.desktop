@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=ChatGPT
+Comment=ChatGPT in a standalone window
+# The shell, not the desktop file parser, expands $HOME (same two quoting layers as finish-setup.desktop). The launcher script
+# ~/.local/bin/chatgpt-window picks the Chrome and keeps the window's own profile in ~/.config/chatgpt-app.
+Exec=sh -c "exec \\"\\$HOME/.local/bin/chatgpt-window\\""
+# Icon: ~/.local/share/icons/hicolor/48x48/apps/chatgpt-window.png (the favicon; OpenAI's official icon URL answers 404).
+# Own name so it never shadows the icon of the ChatGPT desktop app package.
+Icon=chatgpt-window
+Terminal=false
+Categories=Network;
+StartupWMClass=ChatGPT

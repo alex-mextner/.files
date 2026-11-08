@@ -1,0 +1,8 @@
+# Pinned release binaries of the dc-mcp module. Columns (tab separated): name, version, machine (uname -m), sha256, url.
+# The sha256 values are the digests GitHub publishes for each release asset (`gh api repos/<owner>/<repo>/releases/tags/<tag>`,
+# field `digest`), and the x86_64 ones were also compared with the binaries already running on ubuntu-pc (equal). The installer
+# refuses any download whose sha256 differs. To bump a version: change the version, the url and the digest together.
+mcp-auth-proxy	v2.10.2	x86_64	1c76b230fdb6c536a0912c059232cba2229acbcf1f02a11a5d0664781326bcd6	https://github.com/sigbit/mcp-auth-proxy/releases/download/v2.10.2/mcp-auth-proxy-linux-amd64
+mcp-auth-proxy	v2.10.2	aarch64	924c5335e5f684eb22c681cca1daff86d96fa35f644950cbd8f4c8f3e290bc3d	https://github.com/sigbit/mcp-auth-proxy/releases/download/v2.10.2/mcp-auth-proxy-linux-arm64
+cloudflared	2026.10.7	x86_64	1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872	https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64
+cloudflared	2026.10.7	aarch64	3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775	https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-arm64

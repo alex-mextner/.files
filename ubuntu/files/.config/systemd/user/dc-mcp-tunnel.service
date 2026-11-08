@@ -1,0 +1,20 @@
+[Unit]
+Description=Cloudflare tunnel to the dc-mcp shim
+After=dc-mcp-shim.service
+Wants=dc-mcp-shim.service
+# See dc-mcp-shim.service: a crash loop or a network that is down at boot must never leave the unit dead for good.
+StartLimitIntervalSec=0
+
+# Owned by the dc-mcp module. Needs the Cloudflare login and tunnel credentials of ~/.cloudflared (secrets, created by
+# `finish-setup --step dc-mcp-cloudflare`); the tunnel name and the shim port come from ~/.config/dc-mcp.env. No
+# network-online.target here: it does not exist in the user manager, so such an ordering would do nothing. Without a network
+# cloudflared exits or keeps retrying its edge connection, and Restart=always covers the first case.
+
+[Service]
+EnvironmentFile=%h/.config/dc-mcp.env
+ExecStart=%h/.local/bin/cloudflared tunnel --no-autoupdate run --url http://127.0.0.1:${DC_MCP_SHIM_PORT} ${DC_MCP_TUNNEL}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

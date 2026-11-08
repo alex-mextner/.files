@@ -1,0 +1,58 @@
+#!/bin/sh
+# dc-mcp-log: read the access log of the dc-mcp shim (what reached this computer through the connector, never bodies or secrets).
+#
+#   dc-mcp-log [-n LINES] [--all] [--tool NAME] [--rpc METHOD] [--status CODE] [--client KIND] [--oauth]
+#
+#   -n LINES       last LINES lines of what is left after the filters (default 40)
+#   --all          include the rotated files (access.log.1, .2, ...), oldest first
+#   --tool NAME    only tools/call lines of that tool (tool=NAME)
+#   --rpc METHOD   only that JSON-RPC method (initialize, tools/list, tools/call, ...)
+#   --status CODE  only that HTTP status
+#   --client KIND  only that client kind (openai-mcp, browser, curl, other, ...)
+#   --oauth        only the OAuth steps (/.idp/*, /.auth/*)
+# The file is DC_MCP_LOG_FILE or ~/.local/state/dc-mcp/access.log. Line format: see the header of
+# ~/.local/share/dc-mcp-shim/shim.mjs.
+log=${DC_MCP_LOG_FILE:-$HOME/.local/state/dc-mcp/access.log}
+lines=40 all= pattern=
+usage() { echo "usage: dc-mcp-log [-n LINES] [--all] [--tool NAME] [--rpc METHOD] [--status CODE] [--client KIND] [--oauth]" >&2; exit 2; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) [ $# -ge 2 ] || usage; lines=$2; shift ;;
+    --all) all=1 ;;
+    --tool) [ $# -ge 2 ] || usage; pattern="$pattern tool=$2"; shift ;;
+    --rpc) [ $# -ge 2 ] || usage; pattern="$pattern rpc=$2"; shift ;;
+    --client) [ $# -ge 2 ] || usage; pattern="$pattern client=$2"; shift ;;
+    --status) [ $# -ge 2 ] || usage; pattern="$pattern STATUS:$2"; shift ;;
+    --oauth) pattern="$pattern OAUTH:" ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+  shift
+done
+case "$lines" in ''|*[!0-9]*) usage ;; esac
+if [ ! -e "$log" ]; then echo "dc-mcp-log: no log yet at $log" >&2; exit 1; fi
+{
+  if [ -n "$all" ]; then
+    n=0
+    for f in "$log".*; do [ -e "$f" ] && n=$((n + 1)); done
+    while [ "$n" -ge 1 ]; do [ -e "$log.$n" ] && cat "$log.$n"; n=$((n - 1)); done
+  fi
+  cat "$log"
+} | awk -v want="$pattern" '
+  BEGIN { n = split(want, w, " ") }
+  {
+    for (i = 1; i <= n; i++) {
+      if (w[i] ~ /^STATUS:/) { if ($2 != substr(w[i], 8)) next }
+      else if (w[i] == "OAUTH:") { if ($4 !~ /^\/\.(idp|auth)\//) next }
+      else {
+        split(w[i], kv, "="); found = 0
+        for (f = 6; f <= NF; f++) {
+          if (index($f, kv[1] "=") != 1) continue
+          m = split(substr($f, length(kv[1]) + 2), vals, ",")
+          for (v = 1; v <= m; v++) if (vals[v] == kv[2]) found = 1
+        }
+        if (!found) next
+      }
+    }
+    print
+  }' | tail -n "$lines"

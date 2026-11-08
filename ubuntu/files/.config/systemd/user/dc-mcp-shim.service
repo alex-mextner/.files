@@ -1,0 +1,21 @@
+[Unit]
+Description=dc-mcp shim (WWW-Authenticate challenge and protected-resource path rewrite) in front of mcp-auth-proxy
+After=dc-mcp-bridge.service
+Wants=dc-mcp-bridge.service
+# A crash loop must never exhaust systemd's start limit and leave the unit dead for good: with Restart=always it keeps trying
+# every RestartSec until the cause (a port still held, a missing file) is gone.
+StartLimitIntervalSec=0
+
+# Owned by the dc-mcp module. The tunnel points at this unit's port (DC_MCP_SHIM_PORT), this unit points at the proxy
+# (DC_MCP_PORT); the public URL of the challenge comes from DC_MCP_HOSTNAME. It also writes the rotated access log
+# ~/.local/state/dc-mcp/access.log (read it with dc-mcp-log). Behaviour: files/.local/share/dc-mcp-shim/shim.mjs.
+
+[Service]
+Environment=PATH=%h/.local/bin:%h/.local/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/dc-mcp.env
+ExecStart=/usr/bin/env EXTERNAL_URL=https://${DC_MCP_HOSTNAME} LISTEN_PORT=${DC_MCP_SHIM_PORT} UPSTREAM_PORT=${DC_MCP_PORT} LOG_FILE=%h/.local/state/dc-mcp/access.log LOG_MAX_KIB=${DC_MCP_LOG_MAX_KIB} LOG_KEEP=${DC_MCP_LOG_KEEP} node %h/.local/share/dc-mcp-shim/shim.mjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
