@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# tmux-boot-selfcheck: after a boot, verify that the PREVIOUS boot ended with a fresh save.
+#
+# The 2026-11-08 incident went unnoticed for 16 days because nothing looked at the result. This runs ~10 min after
+# boot (tmux-boot-selfcheck.timer) and compares what the shutdown save left behind with the moment the previous boot
+# stopped logging (the last journal entry of `journalctl -b -1`, a good stand-in for the power-off time):
+#   - the newest tmux-resurrect snapshot written BEFORE this boot began (snapshots of this boot are the restored
+#     server's own autosaves and say nothing about the shutdown), and
+#   - rig's omp session map (~/.config/rig/tmux/omp-sessions.map), checked only if it was not rewritten in this boot.
+# Both must be younger than TMUX_BOOT_SELFCHECK_MAX_MIN minutes at that moment, otherwise the sessions of the last boot
+# were not saved at shutdown: the script logs an ERROR line, calls tmux-alert (rate-limited there, key
+# tmux-boot-selfcheck) when it is on PATH, and exits 1 so the unit shows as failed.
+#
+# Nothing to compare is not a failure: no previous boot journal (first boot, volatile journal), no snapshot at all.
+#
+# Journal line to read afterwards:  journalctl --user -u tmux-boot-selfcheck -b 0
+#
+#   TMUX_BOOT_SELFCHECK_MAX_MIN       minutes of tolerated staleness at poweroff (default 20)
+#   TMUX_BOOT_SELFCHECK_JOURNALCTL    journalctl executable (tests)
+#   TMUX_BOOT_SELFCHECK_RESURRECT_DIR snapshot directory (default: tmux's @resurrect-dir, ~/.tmux/resurrect, XDG)
+#   TMUX_BOOT_SELFCHECK_OMP_MAP       omp map (default ~/.config/rig/tmux/omp-sessions.map)
+#   TMUX_BOOT_SELFCHECK_BOOT_START    epoch seconds this boot began (default now - uptime), tests set it
+set -u
+
+max_min=${TMUX_BOOT_SELFCHECK_MAX_MIN:-20}
+case $max_min in
+  ''|*[!0-9]*) echo "tmux-boot-selfcheck: TMUX_BOOT_SELFCHECK_MAX_MIN must be a whole number of minutes, got '$max_min'" >&2; exit 2 ;;
+esac
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+unset TMUX
+
+journalctl_bin=${TMUX_BOOT_SELFCHECK_JOURNALCTL:-journalctl}
+omp_map=${TMUX_BOOT_SELFCHECK_OMP_MAP:-$HOME/.config/rig/tmux/omp-sessions.map}
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+
+log() { echo "tmux-boot-selfcheck: $*"; }
+mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+resurrect_dir() {
+  local dir=${TMUX_BOOT_SELFCHECK_RESURRECT_DIR:-}
+  if [ -z "$dir" ]; then dir=$("$tmux_bin" show-option -gqv @resurrect-dir 2>/dev/null || true); fi
+  if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+  fi
+  dir=${dir//\$HOME/"$HOME"}
+  printf '%s\n' "${dir/#\~/"$HOME"}"
+}
+
+# when the previous boot stopped, in epoch seconds
+prev=
+json=$("$journalctl_bin" -b -1 -n 1 -o json 2>/dev/null | head -n 1)
+[[ $json =~ \"__REALTIME_TIMESTAMP\":\"([0-9]+)\" ]] && prev=${BASH_REMATCH[1]}
+[ -n "$prev" ] || { log "no journal of a previous boot, nothing to compare"; exit 0; }
+prev_s=$(( prev / 1000000 ))
+
+boot_start=${TMUX_BOOT_SELFCHECK_BOOT_START:-$(( $(date +%s) - $(cut -d. -f1 /proc/uptime) ))}
+limit=$(( max_min * 60 ))
+failed=0
+problems=
+
+# newest snapshot of the previous boot: the newest file that is older than this boot
+dir=$(resurrect_dir)
+snap=0
+for f in "$dir"/tmux_resurrect_*.txt; do
+  [ -e "$f" ] || continue
+  m=$(mtime "$f")
+  [ "$m" -lt "$boot_start" ] && [ "$m" -gt "$snap" ] && snap=$m
+done
+
+if [ "$snap" -eq 0 ]; then
+  log "no snapshot from before this boot in $dir, nothing to compare"
+  exit 0
+fi
+
+gap=$(( prev_s - snap ))
+if [ "$gap" -le "$limit" ]; then
+  [ "$gap" -ge 0 ] || gap=0
+  log "shutdown save landed (${gap}s before poweroff)"
+else
+  failed=1
+  problems="the newest snapshot is $((gap / 60)) min older than the end of the previous boot (limit ${max_min} min)"
+  echo "tmux-boot-selfcheck: ERROR: $problems: the shutdown save did NOT land, sessions changed since then were not saved" >&2
+fi
+
+if [ -e "$omp_map" ]; then
+  om=$(mtime "$omp_map")
+  if [ "$om" -ge "$boot_start" ]; then
+    log "omp map was rewritten in this boot, its shutdown state cannot be checked"
+  else
+    ogap=$(( prev_s - om ))
+    if [ "$ogap" -le "$limit" ]; then
+      [ "$ogap" -ge 0 ] || ogap=0
+      log "omp map was current at poweroff (${ogap}s before)"
+    else
+      failed=1
+      problems="${problems:+$problems; }the omp session map is $((ogap / 60)) min older than the end of the previous boot"
+      echo "tmux-boot-selfcheck: ERROR: the omp session map ($omp_map) is $((ogap / 60)) min older than the end of the previous boot (limit ${max_min} min): omp sessions would not be relaunched with --resume" >&2
+    fi
+  fi
+else
+  log "no omp session map ($omp_map), nothing to compare"
+fi
+
+if [ "$failed" -eq 1 ]; then
+  if command -v tmux-alert >/dev/null 2>&1; then
+    tmux-alert "tmux-boot-selfcheck on $(hostname): $problems" --key tmux-boot-selfcheck \
+      || echo "tmux-boot-selfcheck: tmux-alert failed" >&2
+  else
+    echo "tmux-boot-selfcheck: tmux-alert is not installed, alert goes to the journal only" >&2
+  fi
+  exit 1
+fi
+exit 0

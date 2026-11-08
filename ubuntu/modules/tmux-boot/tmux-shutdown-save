@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# tmux-shutdown-save: the one bounded "save before teardown" step shared by both shutdown paths.
+#
+#   tmux-shutdown-watch.service   calls it inside logind's shutdown delay (PrepareForShutdown), before any unit stops
+#   tmux-shutdown-save.service    runs it as ExecStop when the user manager stops, ordered before the tmux server and
+#                                 the pane scopes stop (second line of defence: `loginctl terminate-user`, a user
+#                                 manager restart, anything that tears the user manager down without PrepareForShutdown)
+#
+# It runs tmux-save-now (the guarded forced save: tmux-resurrect's real save script plus rig's post-save hooks that
+# write the omp/claude/codex resume-id maps) while the tmux server and the harness panes are still alive, and it is
+# built to never stand in the way of a shutdown: the save is bounded by a hard timeout and this script exits 0
+# whatever happened (the outcome is one journal line, and tmux-boot-selfcheck verifies after the next boot that a
+# save really landed).
+#
+# A save that ran in this boot for a shutdown is stamped, so the second path does not save again a moment later on a
+# half-torn-down server (a late save must never be able to overwrite the good one with a degenerate snapshot).
+#
+#   tmux-shutdown-save [--reason NAME] [--timeout SECONDS]
+#
+#   TMUX_SAVE_NOW            the forced-save entry (default ~/.local/bin/tmux-save-now); tests point it at a stub
+#   TMUX_AUTOSAVE_TMUX       tmux executable, one word (default tmux), shared with tmux-autosave / tmux-save-now
+#   TMUX_BOOT_STATE_DIR      where the stamp lives (default ${XDG_STATE_HOME:-~/.local/state}/tmux-boot)
+#   TMUX_SHUTDOWN_BOOT_ID    this boot's id (default /proc/sys/kernel/random/boot_id), tests set it
+#   TMUX_SHUTDOWN_STAMP_TTL  seconds a stamp makes later runs skip (default 300)
+set -u
+
+reason=shutdown
+timeout_s=60
+while [ $# -gt 0 ]; do
+  case $1 in
+    --reason) [ $# -ge 2 ] || { echo "tmux-shutdown-save: --reason needs a value" >&2; exit 2; }; reason=$2; shift 2 ;;
+    --timeout) [ $# -ge 2 ] || { echo "tmux-shutdown-save: --timeout needs a value" >&2; exit 2; }; timeout_s=$2; shift 2 ;;
+    *) echo "tmux-shutdown-save: unknown argument '$1' (usage: tmux-shutdown-save [--reason NAME] [--timeout SECONDS])" >&2; exit 2 ;;
+  esac
+done
+case $timeout_s in
+  ''|*[!0-9]*|0) echo "tmux-shutdown-save: --timeout must be a positive whole number of seconds, got '$timeout_s'" >&2; exit 2 ;;
+esac
+ttl=${TMUX_SHUTDOWN_STAMP_TTL:-300}
+case $ttl in
+  ''|*[!0-9]*) echo "tmux-shutdown-save: TMUX_SHUTDOWN_STAMP_TTL must be a whole number of seconds, got '$ttl'" >&2; exit 2 ;;
+esac
+
+# a systemd user manager hands out a minimal PATH: add the user's tool dirs after it (rig, tg, tmux from Linuxbrew)
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+# always the default socket (or the one TMUX_AUTOSAVE_TMUX names), never whichever server a calling pane belongs to
+unset TMUX
+
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+save_now=${TMUX_SAVE_NOW:-$HOME/.local/bin/tmux-save-now}
+state_dir=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+stamp=$state_dir/shutdown-save
+boot_id=${TMUX_SHUTDOWN_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)}
+
+log() { echo "tmux-shutdown-save: $*"; }
+
+# the stamp: "<boot id> <epoch> <reason>", written only by a save that succeeded in this boot
+if [ -r "$stamp" ]; then
+  read -r s_boot s_time s_reason < "$stamp" || true
+  case ${s_time:-} in ''|*[!0-9]*) s_time=0 ;; esac
+  age=$(( $(date +%s) - s_time ))
+  if [ "${s_boot:-}" = "$boot_id" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+    log "skipped ($reason): the '${s_reason:-?}' save ${age}s ago already covers this shutdown"
+    exit 0
+  fi
+fi
+
+if ! command -v "$tmux_bin" >/dev/null 2>&1 || ! "$tmux_bin" list-sessions >/dev/null 2>&1; then
+  # nothing to save is normal on a machine without a tmux server; at a shutdown it can also mean the server went down
+  # before this ran, which is exactly what the ordering of both paths exists to prevent
+  echo "tmux-shutdown-save: warning: no tmux server reachable ($reason), nothing saved" >&2
+  exit 0
+fi
+
+if [ ! -x "$save_now" ]; then
+  echo "tmux-shutdown-save: ERROR: $save_now is not installed, the sessions were NOT saved ($reason)" >&2
+  exit 0
+fi
+
+started=$(date +%s)
+timeout -k 2 "$timeout_s" "$save_now" --reason "$reason"
+rc=$?
+took=$(( $(date +%s) - started ))
+case $rc in
+  0)
+    mkdir -p "$state_dir" 2>/dev/null && printf '%s %s %s\n' "$boot_id" "$(date +%s)" "$reason" > "$stamp" 2>/dev/null
+    log "saved ($reason) in ${took}s"
+    ;;
+  124|137) echo "tmux-shutdown-save: ERROR: tmux-save-now ($reason) did not finish within ${timeout_s}s and was stopped, the sessions may NOT be saved" >&2 ;;
+  *) echo "tmux-shutdown-save: ERROR: tmux-save-now ($reason) failed with exit $rc after ${took}s, the sessions may NOT be saved" >&2 ;;
+esac
+# never block a shutdown on a failed save
+exit 0

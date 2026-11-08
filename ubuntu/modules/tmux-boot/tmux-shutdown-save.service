@@ -1,0 +1,24 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): save the tmux sessions when the user manager stops.
+# Second line of defence behind tmux-shutdown-watch.service (which saves inside logind's shutdown delay): this one
+# covers a user manager that is torn down without PrepareForShutdown (`loginctl terminate-user`, a user manager
+# restart). The unit does nothing while it runs; its ExecStop is the save. Units stop in the reverse order of their
+# start order, so After= puts this ExecStop BEFORE tmux-boot.service (which owns the tmux server's cgroup) and omp.slice
+# stop; the tmux-spawn-*.scope panes and omp-*.scope sessions are ordered before this unit by the drop-ins
+# tmux-spawn-.scope.d and omp-.scope.d (Before=tmux-shutdown-save.service), since a unit cannot name scopes that
+# do not exist yet.
+[Unit]
+Description=Save the tmux sessions (snapshot + omp/claude/codex resume ids) before the tmux server and the pane scopes stop
+After=tmux-boot.service omp.slice
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=%h/.local/bin/tmux-shutdown-save --reason user-manager-stop --timeout 60
+# the wrapper bounds the save itself and always exits 0; this only has to be longer than its timeout
+TimeoutStopSec=90
+# the tmux server is not ours to end
+KillMode=process
+
+[Install]
+WantedBy=default.target
