@@ -110,7 +110,8 @@ Every line must show an `i`.
 1. **User half, real, no mount touched** (already run, output in the ticket):
    `backups-user-gates selftest` makes a throw-away unit whose start is skipped for a missing mount, proves `retry`
    leaves it stopped, then points the condition at `/dev/shm` (always a mount point: "the disk came back") and proves
-   `retry` starts it. It removes the unit again.
+   `retry` starts it. `retry` is restricted to the test unit (unique name per run) and docker recovery is off, so no real
+   workload is touched. It changes real systemd state, so it has no `--dry-run`; it removes its unit again.
 2. **Empty-mountpoint behaviour, in a private mount namespace** (the host mounts are not affected; needs the root half applied):
    ```bash
    sudo unshare -m --propagation private bash -c '
@@ -159,5 +160,13 @@ Do each with `~/.local/bin/backups-user-gates list` before and after, and this c
 * Conditions are evaluated at start. Units already running are unaffected, and a unit whose disk disappears *while it
   runs* is not stopped (out of scope: needs `BindsTo`, which would stop everything on a USB glitch).
 * `errors=remount-ro` makes the disk (and every bind of it) read-only after a filesystem error: writes then fail loudly instead of corrupting more.
+* `--revert` restores what the first apply found, from the ledger in `/var/lib/harden-backups-mount`: the original
+  `x-systemd.device-timeout` (or none), `errors=remount-ro` removed only if the script added it, and `chattr -i` only on
+  the directories it made immutable (a flag that was already set stays). Without the ledger it leaves the fstab line
+  and the flags alone and says what to do by hand.
+* The retry service is bounded (`TimeoutStartSec=5min`, 8 s per docker call, the docker pass ends after 200 s). The attach service has no start timeout on
+  purpose: it waits for the mount job, which waits for `fsck`, and nothing would restart it after a kill.
+* fstab paths are decoded (`\040` space, `\011` tab) before they become mount-unit names; the disk line may use
+  `UUID=<uuid>` or `/dev/disk/by-uuid/<uuid>`, nothing else (the script stops before changing anything).
 * A tmux server started by something else (ssh `tmux`, a terminal) before the disk is up is not gated: its panes sit in the
   empty (immutable) directories; `tmux-boot` itself never restores into them.

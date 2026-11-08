@@ -32,7 +32,9 @@
 #     reported (those are files that were written while the disk was missing) and left alone.
 #
 # Every edited file is copied to <file>.bak-harden-<timestamp> first; created files carry the marker
-# "harden-backups-mount". --revert removes the created files, reverses the fstab edit and clears the flags.
+# "harden-backups-mount". A ledger in /var/lib/harden-backups-mount records what the first apply found (the original
+# device timeout, whether errors= was already there) and which directories it made immutable, so --revert removes
+# the created files, puts the ORIGINAL fstab options back and clears only the flags this script set.
 #
 # Test without a reboot, and the reboot checklist: README.md next to this script (.files repo).
 set -euo pipefail
@@ -48,13 +50,20 @@ for a in "$@"; do
   case $a in
     --dry-run) DRY=1 ;;
     --revert) REVERT=1 ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
     *) echo "unknown option: $a (use --dry-run, --revert)" >&2; exit 2 ;;
   esac
 done
 
 if [ "$DRY" = 0 ] && [ "$(id -u)" -ne 0 ]; then
   echo "run as root: sudo $0 ${*:-}   (add --dry-run to preview without root)" >&2; exit 1
+fi
+
+# one run at a time: the ledger records what the FIRST apply found, and two concurrent applies could capture the
+# already hardened state as the original
+if [ "$DRY" = 0 ]; then
+  exec 9> /run/lock/harden-backups-mount.lock
+  flock -n 9 || { echo "another harden-backups-mount.sh is running" >&2; exit 1; }
 fi
 
 say() { printf '%s\n' "$*"; }
@@ -71,14 +80,29 @@ ATTACH_UNIT=/etc/systemd/system/backups-attach.service
 DROPINS=("/etc/systemd/system/user@$USER_UID.service.d/backups-mounts.conf")
 if systemctl cat docker.service >/dev/null 2>&1; then DROPINS+=("/etc/systemd/system/docker.service.d/backups-mounts.conf"); fi
 
-# the disk's UUID and ext4 mount line come from fstab, not from this script
+# the disk's UUID and ext4 mount line come from fstab, not from this script; both UUID=<uuid> and
+# /dev/disk/by-uuid/<uuid> are accepted and normalised to the bare UUID (udev's ID_FS_UUID is the bare form)
 FSTAB_LINE=$(awk -v mp="$MP" '!/^[[:space:]]*#/ && NF>=4 && $2==mp && $3=="ext4" {print; exit}' /etc/fstab)
 [ -n "$FSTAB_LINE" ] || { echo "no ext4 line for $MP in /etc/fstab" >&2; exit 1; }
-FS_UUID=$(printf '%s\n' "$FSTAB_LINE" | awk '{print $1}' | sed 's/^UUID=//')
-case $FS_UUID in ??*-*-*-*-*) ;; *) echo "fstab line for $MP does not use UUID=...: $FSTAB_LINE" >&2; exit 1 ;; esac
+FSTAB_SRC=$(awk '{print $1}' <<< "$FSTAB_LINE")
+case $FSTAB_SRC in
+  UUID=*) FS_UUID=${FSTAB_SRC#UUID=} ;;
+  /dev/disk/by-uuid/*) FS_UUID=${FSTAB_SRC##*/} ;;
+  *) echo "fstab line for $MP must use UUID=... or /dev/disk/by-uuid/...: $FSTAB_LINE" >&2; exit 1 ;;
+esac
+case $FS_UUID in ??*-*-*-*-*) ;; *) echo "not a filesystem UUID: '$FS_UUID' (fstab line: $FSTAB_LINE)" >&2; exit 1 ;; esac
 
-# bind targets fstab keeps on this disk: every line whose source is under the mount point and has the bind option
-bind_targets() { awk -v mp="$MP/" '!/^[[:space:]]*#/ && NF>=4 && index($1, mp)==1 && $4 ~ /(^|,)bind(,|$)/ {print $2}' /etc/fstab; }
+# bind targets fstab keeps on this disk: every line whose source is under the mount point and has the bind option.
+# fstab escapes a space or tab in a path as \040 / \011; they are decoded here (the same awk is in the attach script)
+bind_targets() {
+  awk -v mp="$MP/" 'function dec(s) { gsub(/\\040/, " ", s); gsub(/\\011/, "\t", s); return s }
+    !/^[[:space:]]*#/ && NF>=4 && index(dec($1), mp)==1 && $4 ~ /(^|,)bind(,|$)/ {print dec($2)}' /etc/fstab
+}
+
+# what this script changed, so --revert puts back the original and nothing else
+STATE_DIR=/var/lib/harden-backups-mount
+STATE_FILE=$STATE_DIR/fstab-original      # ORIG_TIMEOUT='<value or empty>' ADDED_ERRORS=0|1
+CHATTR_LEDGER=$STATE_DIR/chattr-set       # one mountpoint per line: the directories this script made immutable
 
 # write $2 (content) to $1 with mode $3; back a differing file up; skip when identical
 install_file() {
@@ -101,14 +125,20 @@ remove_ours() {
 
 # ---- 1. fstab ---------------------------------------------------------------------------------------------------
 rewrite_fstab_line() { # $1 = apply|revert; prints the whole fstab with only the disk line rewritten
-  awk -v mp="$MP" -v mode="$1" '
+  # revert uses ORIG_TIMEOUT (empty = there was no option) and ADDED_ERRORS from the ledger written by the first apply
+  awk -v mp="$MP" -v mode="$1" -v ot="${ORIG_TIMEOUT:-}" -v ae="${ADDED_ERRORS:-0}" '
     /^[[:space:]]*#/ || NF < 4 { print; next }
     $2 == mp && $3 == "ext4" {
       n = split($4, o, ","); out = ""; havet = 0; havee = 0
       for (i = 1; i <= n; i++) {
         x = o[i]
-        if (x ~ /^x-systemd\.device-timeout=/) { havet = 1; x = (mode == "apply") ? "x-systemd.device-timeout=30s" : "x-systemd.device-timeout=10s" }
-        if (x ~ /^errors=/) { havee = 1; if (mode == "revert" && x == "errors=remount-ro") continue }
+        if (x ~ /^x-systemd\.device-timeout=/) {
+          havet = 1
+          if (mode == "apply") x = "x-systemd.device-timeout=30s"
+          else if (ot == "") continue
+          else x = "x-systemd.device-timeout=" ot
+        }
+        if (x ~ /^errors=/) { havee = 1; if (mode == "revert" && ae == 1 && x == "errors=remount-ro") continue }
         out = out (out == "" ? "" : ",") x
       }
       if (mode == "apply" && !havet) out = out ",x-systemd.device-timeout=30s"
@@ -118,25 +148,55 @@ rewrite_fstab_line() { # $1 = apply|revert; prints the whole fstab with only the
     { print }' /etc/fstab
 }
 
+# the disk line options as they are now
+disk_line_options() { awk -v mp="$MP" '!/^[[:space:]]*#/ && NF>=4 && $2==mp && $3=="ext4" {print $4; exit}' /etc/fstab; }
+
+# first apply only: remember the original timeout (if any) and whether errors= was already there
+record_fstab_original() {
+  [ ! -f "$STATE_FILE" ] || return 0
+  local opts ot ae=1
+  opts=$(disk_line_options)
+  ot=$(awk -F, '{for (i = 1; i <= NF; i++) if ($i ~ /^x-systemd\.device-timeout=/) {sub(/^[^=]*=/, "", $i); print $i; exit}}' <<< "$opts")
+  case ",$opts," in *,errors=*,*) ae=0 ;; esac
+  say "  ledger            $STATE_FILE (original timeout '${ot:-none}', errors= added by this script: $ae)"
+  if [ "$DRY" = 1 ]; then return 0; fi
+  mkdir -p "$STATE_DIR"
+  printf "ORIG_TIMEOUT='%s'\nADDED_ERRORS=%s\n" "$ot" "$ae" > "$STATE_FILE"
+}
+
 # parse errors + errors reported by `findmnt --verify` for a table file
 # `findmnt --verify` exits 1 when it finds errors, which is exactly the case being measured (a missing disk is one):
 # the status is ignored on purpose so `set -e` / pipefail do not end the script before the counts are compared
 fstab_errors() { { findmnt --verify --tab-file "$1" 2>&1 || true; } | awk '/ parse errors?, [0-9]+ errors?/ {print $1 + $4; found=1} END {if (!found) print 999}'; }
 
 do_fstab() {
-  local mode tmp
+  local mode tmp before after
   mode=apply; [ "$REVERT" = 1 ] && mode=revert
   step "1. /etc/fstab: disk line ($mode)"
+  if [ "$mode" = revert ]; then
+    if [ ! -f "$STATE_FILE" ]; then
+      say "  no ledger ($STATE_FILE): this script did not change the fstab line (or the ledger is gone); left alone."
+      say "  by hand if needed: put x-systemd.device-timeout back to your value, drop errors=remount-ro if it was not yours."
+      return 0
+    fi
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+    say "  ledger            original timeout '${ORIG_TIMEOUT:-none}', errors= added by this script: ${ADDED_ERRORS:-0}"
+  fi
   tmp=$(mktemp); rewrite_fstab_line "$mode" > "$tmp"
-  if cmp -s /etc/fstab "$tmp"; then say "  already in place  /etc/fstab"; rm -f "$tmp"; return 0; fi
+  if cmp -s /etc/fstab "$tmp"; then
+    say "  already in place  /etc/fstab"; rm -f "$tmp"
+    if [ "$mode" = revert ]; then run rm -f "$STATE_FILE"; fi
+    return 0
+  fi
   diff -u --label /etc/fstab --label /etc/fstab.new /etc/fstab "$tmp" | sed 's/^/      | /' || true
   # the rewritten table must not report more findmnt --verify errors than the live one does
-  local before after
   before=$(fstab_errors /etc/fstab); after=$(fstab_errors "$tmp")
   if [ "$after" -gt "$before" ]; then
     echo "  ABORT: findmnt --verify reports $after errors for the new fstab (live one: $before); nothing written" >&2; rm -f "$tmp"; exit 1
   fi
   say "  findmnt --verify  $after errors (live fstab: $before)"
+  if [ "$mode" = apply ]; then record_fstab_original; fi
   say "  backup            /etc/fstab -> /etc/fstab.bak-harden-$TS"
   run cp -p /etc/fstab "/etc/fstab.bak-harden-$TS"
   say "  write             /etc/fstab"
@@ -148,38 +208,48 @@ do_fstab() {
     say "  remount           $MP (picks up errors=remount-ro; failure is not fatal)"
     run mount -o remount "$MP" || say "  WARNING: remount failed, the options apply at the next mount"
   else
+    run rm -f "$STATE_FILE"
     say "  note: errors=remount-ro stays on the mounted disk until the next mount; nothing was remounted"
   fi
 }
 
 # ---- 2. udev rule + attach service ------------------------------------------------------------------------------
+# The body is a quoted heredoc (no escaping of $ or \) with @NAME@ placeholders filled in below.
 attach_script() {
-  cat <<EOF
+  local body
+  body=$(cat <<'EOF'
 #!/usr/bin/env bash
-# $MARK: installed by harden-backups-mount.sh (rig-cli ticket 858). Started by backups-attach.service, which the
-# udev rule $UDEV_RULE wants when the backups partition appears (late plug-in, slow spin-up, hot swap) and
+# @MARK@: installed by harden-backups-mount.sh (rig-cli ticket 858). Started by backups-attach.service, which the
+# udev rule @UDEV_RULE@ wants when the backups partition appears (late plug-in, slow spin-up, hot swap) and
 # which is harmless at boot: everything already mounted means nothing to do.
 set -u
-MP='$MP'
-USER_NAME='$USER_NAME'
-log() { echo "backups-attach: \$*"; }
+MP='@MP@'
+USER_NAME='@USER_NAME@'
+log() { echo "backups-attach: $*"; }
 rc=0
-systemctl start '$MP_UNIT' || { log "cannot mount \$MP"; exit 1; }
-mountpoint -q "\$MP" || { log "\$MP is not a mount point after start"; exit 1; }
-# every bind mount fstab keeps on this disk, read now so binds added later are covered without editing this file
-while read -r target; do
-  [ -n "\$target" ] || continue
-  mountpoint -q "\$target" && continue
-  unit=\$(systemd-escape -p --suffix=mount "\$target")
-  if systemctl start "\$unit"; then log "mounted \$target"; else log "FAILED to mount \$target"; rc=1; fi
-done < <(awk -v mp="\$MP/" '!/^[[:space:]]*#/ && NF>=4 && index(\$1, mp)==1 && \$4 ~ /(^|,)bind(,|\$)/ {print \$2}' /etc/fstab)
+systemctl start '@MP_UNIT@' || { log "cannot mount $MP"; exit 1; }
+mountpoint -q "$MP" || { log "$MP is not a mount point after start"; exit 1; }
+# every bind mount fstab keeps on this disk, read now so binds added later are covered without editing this file;
+# fstab writes a space or tab in a path as \040 / \011, decoded before the path is used
+while IFS= read -r target; do
+  [ -n "$target" ] || continue
+  mountpoint -q "$target" && continue
+  unit=$(systemd-escape -p --suffix=mount "$target")
+  if systemctl start "$unit"; then log "mounted $target"; else log "FAILED to mount $target"; rc=1; fi
+done < <(awk -v mp="$MP/" 'function dec(s) { gsub(/\\040/, " ", s); gsub(/\\011/, "\t", s); return s }
+  !/^[[:space:]]*#/ && NF>=4 && index(dec($1), mp)==1 && $4 ~ /(^|,)bind(,|$)/ {print dec($2)}' /etc/fstab)
 # start the user units whose start was skipped (ConditionPathIsMountPoint) while the mounts were missing
-uid=\$(id -u "\$USER_NAME")
-if [ -S "/run/user/\$uid/bus" ]; then
-  runuser -u "\$USER_NAME" -- env XDG_RUNTIME_DIR="/run/user/\$uid" systemctl --user start --no-block backups-mount-retry.service || true
+uid=$(id -u "$USER_NAME")
+if [ -S "/run/user/$uid/bus" ]; then
+  runuser -u "$USER_NAME" -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user start --no-block backups-mount-retry.service || true
 fi
-exit \$rc
+exit $rc
 EOF
+)
+  # the replacement operands are quoted: an unquoted & would be expanded by bash's pattern-substitution as the match
+  body=${body//@MARK@/"$MARK"}; body=${body//@UDEV_RULE@/"$UDEV_RULE"}; body=${body//@MP@/"$MP"}
+  body=${body//@USER_NAME@/"$USER_NAME"}; body=${body//@MP_UNIT@/"$MP_UNIT"}
+  printf '%s\n' "$body"
 }
 
 attach_unit() {
@@ -231,7 +301,7 @@ dropin_content() {
 [Unit]
 After=$MP_UNIT
 EOF
-  while read -r t; do
+  while IFS= read -r t; do
     [ -n "$t" ] || continue
     u=$(systemd-escape -p --suffix=mount "$t"); printf 'After=%s\n' "$u"
   done < <(bind_targets)
@@ -251,10 +321,18 @@ do_dropins() {
 do_chattr() {
   local flag=+i verb="protect"; [ "$REVERT" = 1 ] && { flag=-i; verb="release"; }
   step "4. chattr $flag on the mountpoint directories below the mounts ($verb)"
-  local targets; targets=$(bind_targets)
+  # apply: every bind target. revert: only the directories this script made immutable (ledger), so a flag that was
+  # already set before this script ran is left as it was
+  local targets
+  if [ "$REVERT" = 1 ]; then
+    targets=$(cat "$CHATTR_LEDGER" 2>/dev/null || true)
+    if [ -z "$targets" ]; then say "  nothing recorded in $CHATTR_LEDGER: no flag was set by this script, none is cleared"; return 0; fi
+  else
+    targets=$(bind_targets)
+  fi
   if [ "$DRY" = 1 ]; then
     local t
-    while read -r t; do say "  [dry-run] would chattr $flag  $t   (underlying dir checked empty at run time through 'mount --bind / <tmp>')"; done <<< "$targets"
+    while IFS= read -r t; do say "  [dry-run] would chattr $flag  $t   (underlying dir checked empty at run time through 'mount --bind / <tmp>')"; done <<< "$targets"
     return 0
   fi
   if [ "$(stat -c %d /)" != "$(stat -c %d "$HOME_DIR")" ]; then
@@ -265,7 +343,7 @@ do_chattr() {
   trap "umount '$rv' 2>/dev/null; rmdir '$rv' 2>/dev/null" EXIT
   mount --bind / "$rv"; mount --make-private "$rv"
   local t d n=0 skipped=0
-  while read -r t; do
+  while IFS= read -r t; do
     [ -n "$t" ] || continue
     d="$rv$t"
     if [ ! -d "$d" ]; then say "  skip (no such dir on the SSD)  $t"; skipped=$((skipped+1)); continue; fi
@@ -280,9 +358,13 @@ do_chattr() {
     if [[ $flags == *i* ]]; then
       if [ "$flag" = +i ]; then say "  already immutable  $t"; continue; fi
     elif [ "$flag" = -i ]; then say "  already mutable    $t"; continue; fi
-    chattr "$flag" "$d"; say "  chattr $flag         $t"; n=$((n+1))
+    # the ledger entry comes first: a crash between the two steps must leave a flag that --revert can still find
+    if [ "$flag" = +i ]; then mkdir -p "$STATE_DIR"; grep -qxF "$t" "$CHATTR_LEDGER" 2>/dev/null || printf '%s\n' "$t" >> "$CHATTR_LEDGER"; fi
+    chattr "$flag" "$d" || { say "  FAILED chattr $flag  $t"; skipped=$((skipped+1)); continue; }
+    say "  chattr $flag         $t"; n=$((n+1))
   done <<< "$targets"
   umount "$rv"; rmdir "$rv"; trap - EXIT
+  if [ "$REVERT" = 1 ]; then rm -f "$CHATTR_LEDGER"; rmdir --ignore-fail-on-non-empty "$STATE_DIR" 2>/dev/null || true; fi
   say "  $n changed, $skipped skipped"
 }
 

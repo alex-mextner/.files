@@ -99,6 +99,9 @@ Description=Start units that were skipped while the backups disk was missing
 
 [Service]
 Type=oneshot
+# bounded: a hung call must not leave this unit "activating" forever (then neither the timer nor the udev kick could
+# start another run); the docker calls inside have their own 8 s deadline and the docker pass ends after 200 s
+TimeoutStartSec=5min
 ExecStart=%h/.local/bin/backups-user-gates retry
 EOF
 }
@@ -178,6 +181,7 @@ gated_dropins() {
     [ -f "$f" ] || continue
     grep -q "$MARKER" "$f" || continue
     unit=$(basename "$(dirname "$f")"); unit=${unit%.d}
+    [ -z "${ONLY_UNIT:-}" ] || [ "$unit" = "$ONLY_UNIT" ] || continue   # selftest looks at its own unit only
     paths=$(sed -n 's/^ConditionPathIsMountPoint=//p' "$f" | sed "s|%h|$HOME|g" | tr '\n' ' ')
     printf '%s\t%s\n' "$unit" "${paths% }"
   done
@@ -229,20 +233,29 @@ cmd_retry() {
       do_it systemctl --user start --no-block "$cand"
     done
   done < <(gated_dropins)
-  retry_docker_containers "${!seen_tree[@]}"
+  # the selftest must not start real workloads or burn container retry attempts
+  [ -n "${ONLY_UNIT:-}" ] || retry_docker_containers "${!seen_tree[@]}"
 }
 
 # docker: containers with a restart policy whose start failed (a bind source in a gated tree was missing or
 # unwritable) are not retried by the daemon after a late plug-in. A container is started only when EVERY gated tree
 # it binds from is mounted (starting it earlier would only fail again), at most 3 times per boot (the list lives in
 # the runtime dir) so one that keeps failing for another reason is not restarted every two minutes.
+# every docker call is bounded: a stalled daemon must not hang the retry run
+docker() { timeout 8 /usr/bin/env docker "$@"; }
+
 retry_docker_containers() {
-  command -v docker >/dev/null 2>&1 || return 0
+  [ -n "$(type -P docker)" ] || return 0
   local tried_file="$STATE_DIR/backups-user-gates.docker-tried"
   local id policy err line src t attempts ready
   local -a needed
+  local deadline=$((SECONDS + 200))   # ends the pass well inside the service's 5 min TimeoutStartSec
   while read -r id; do
     [ -n "$id" ] || continue
+    # cheap checks first: a spent retry budget costs no docker call
+    attempts=$(grep -cx "$id" "$tried_file" 2>/dev/null || true)
+    [ "${attempts:-0}" -lt 3 ] || continue
+    if [ "$SECONDS" -ge "$deadline" ]; then say "backups-user-gates: docker pass out of time, the rest is left to the next run"; break; fi
     policy=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null) || continue
     case $policy in always|unless-stopped|on-failure) ;; *) continue ;; esac
     err=$(docker inspect -f '{{.State.Error}}' "$id" 2>/dev/null) || continue
@@ -257,8 +270,6 @@ retry_docker_containers() {
       done
     done < <(docker inspect -f '{{range .HostConfig.Binds}}{{println .}}{{end}}{{range .HostConfig.Mounts}}{{if eq .Type "bind"}}{{println .Source}}{{end}}{{end}}' "$id" 2>/dev/null || true)
     [ "${#needed[@]}" -gt 0 ] && [ "$ready" = 1 ] || continue
-    attempts=$(grep -cx "$id" "$tried_file" 2>/dev/null || true)
-    [ "${attempts:-0}" -lt 3 ] || continue
     say "backups-user-gates: mounts are back, starting container $(docker inspect -f '{{.Name}}' "$id") (start failed: $err)"
     if [ "$DRY" = 0 ]; then printf '%s\n' "$id" >> "$tried_file"; docker start "$id" >/dev/null || true; else say "  [dry-run] docker start $id"; fi
   done < <(docker ps -a --filter status=exited --filter status=created -q 2>/dev/null || true)
@@ -266,10 +277,14 @@ retry_docker_containers() {
 
 # Exercises the whole skip -> retry loop on a throw-away unit without touching any real mount: the drop-in first
 # points at a path that is not a mount point (the start is skipped), then at /dev/shm, which always is one (what
-# "the disk came back" looks like to the unit); `retry` must leave it alone in the first state and start it in the
-# second. The unit and its drop-in are removed again, also on failure.
+# "the disk came back" looks like to the unit); `retry` (restricted to that unit, docker recovery off) must leave it
+# alone in the first state and start it in the second. The unit has a name unique to this run and is removed again,
+# also on failure. It changes real systemd state, so there is no --dry-run.
 cmd_selftest() {
-  local unit=bgt-selftest.service dir="$UNIT_DIR/bgt-selftest.service.d" rc=0
+  [ "$DRY" = 0 ] || { echo "selftest starts and stops a real throw-away unit: no --dry-run" >&2; return 2; }
+  local unit="bgt-selftest-$$.service" rc=0
+  local dir="$UNIT_DIR/$unit.d"
+  ONLY_UNIT=$unit
   cleanup_selftest() { # $1 unit, $2 drop-in dir; also runs from the EXIT trap, after this function's locals are gone
     systemctl --user stop "$1" 2>/dev/null || true
     rm -f "$2/$DROPIN" "$UNIT_DIR/$1"; rmdir "$2" 2>/dev/null || true
