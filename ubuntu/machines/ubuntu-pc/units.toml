@@ -11,4 +11,11 @@
 # Once the two scripts are in files/, list the two units here. They keep running on this PC.
 # Tracked in https://github.com/alex-mextner/.files/issues/58.
 
-enable = []
+# dc-mcp (module of the same name, issue #143): the OAuth proxy and the Cloudflare tunnel of this PC's ChatGPT connector. Listed here, not
+# in the shared units.toml, because only a machine that already holds the Cloudflare credentials can run the tunnel unit; a new
+# machine's `finish-setup --step dc-mcp-cloudflare` enables and starts all three.
+enable = [
+  "dc-mcp-bridge.service",
+  "dc-mcp-shim.service",
+  "dc-mcp-tunnel.service",
+]

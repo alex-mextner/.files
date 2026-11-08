@@ -1,0 +1,21 @@
+#!/bin/bash
+# dc-mcp-quiet COMMAND [ARGS...]: run COMMAND with its stdout filtered down to what is worth a journal line (stderr untouched, the
+# exit status is the command's own, signals reach the command because it is exec'd).
+#
+# Why: mcp-auth-proxy writes one JSON access line per request to stdout, and the supergateway it starts for the stdio backend
+# writes a copy of EVERY JSON-RPC message (tool arguments and results included) plus about seven chatter lines per request. The
+# journal is no place for that (disk, privacy), and systemd's per-unit LogRateLimit*/LogFilterPatterns settings did not take
+# effect for these user units when tried (systemd 259, 8 Nov 2026). The shim's access log (dc-mcp-log) keeps the compact record.
+#   dropped: the proxy's INFO access lines; supergateway's message copies ("[supergateway] StreamableHttp ..." / "Child ...")
+#   dropped: other supergateway lines unless they mention error, warn, fail, exception, fatal, panic, refused or timeout
+#   kept:    everything else (startup problems, warnings, errors, panics)
+[ "$#" -gt 0 ] || { echo "usage: dc-mcp-quiet COMMAND [ARGS...]" >&2; exit 2; }
+exec "$@" > >(exec awk '
+  /"severity":"INFO"/ { next }
+  /^\[supergateway\] / {
+    if ($0 ~ /^\[supergateway\] (StreamableHttp|Child) /) next
+    if (tolower($0) ~ /error|warn|fail|exception|fatal|panic|refused|timeout/) { print; fflush() }
+    next
+  }
+  { print; fflush() }
+')
