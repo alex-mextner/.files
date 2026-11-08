@@ -588,6 +588,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.server.release_second_chunk.wait(5)
             return
+        if payload == "partial":
+            self.send_response(200)
+            self.send_header("Content-Type", "Text/Event-Stream; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"2\r\nda\r\n")
+            self.wfile.flush()
+            time.sleep(0.6)
+            self.wfile.write(b"7\r\nta: ok\n\r\n0\r\n\r\n")
+            return
         if payload == "stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -731,6 +741,34 @@ class Shim(ShimHarness, unittest.TestCase):
         res = conn.getresponse()  # raises a timeout when the shim holds the headers back
         self.assertLess(time.time() - started, 2)
         self.assertEqual((res.status, res.getheader("Content-Type")), (200, "text/event-stream"))
+        self.upstream.release_second_chunk.set()
+        conn.close()
+
+    def test_an_event_stream_that_speaks_first_is_not_given_a_comment_line(self):
+        self.upstream.routes["/mcp"] = (200, {}, "stream")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
+        res = conn.getresponse()
+        self.assertEqual(res.read1(6), b"first\n")
+        self.upstream.release_second_chunk.set()
+        self.assertEqual(res.read(), b"second\n")
+        conn.close()
+
+    def test_a_stream_that_has_started_is_not_given_a_comment_while_it_waits_for_the_rest_of_an_event(self):
+        self.upstream.routes["/mcp"] = (200, {}, "partial")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
+        res = conn.getresponse()
+        self.assertEqual(res.read(), b"data: ok\n")
+        conn.close()
+
+    def test_the_idle_event_stream_gets_a_comment_line_so_the_cloudflare_edge_releases_the_headers(self):
+        """Cloudflare holds response headers of an event stream until the first body byte (seen live: GET /mcp hung through the tunnel)."""
+        self.upstream.routes["/mcp"] = (200, {}, "idle")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
+        res = conn.getresponse()
+        self.assertEqual(res.read1(8), b": open\n\n")
         self.upstream.release_second_chunk.set()
         conn.close()
 

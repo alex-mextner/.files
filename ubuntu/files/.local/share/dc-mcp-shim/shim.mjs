@@ -55,6 +55,7 @@ const CHALLENGE = `Bearer resource_metadata="${EXTERNAL_URL}/.well-known/oauth-p
 const PRM = '/.well-known/oauth-protected-resource';
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 const PARSE_MAX_BYTES = 64 * 1024;
+const OPEN_COMMENT_MS = 250;
 const COLLAPSE_MS = 60 * 1000;
 const COLLAPSE_KEYS_MAX = 256;
 const ERROR_REPORT_MS = 60 * 1000;
@@ -297,6 +298,16 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(ures.statusCode, ures.statusMessage, headers);
     res.flushHeaders();
+    // Cloudflare's edge holds an event stream's response headers until the first body byte, so a client that opens the
+    // standalone stream (GET /mcp) of a server with nothing to say yet would wait for ever. When the upstream stays silent
+    // for OPEN_COMMENT_MS an SSE comment line (ignored by every client) makes the edge release the headers. A stream that
+    // speaks first is never touched, nor is a framed (Content-Length) or encoded one: the comment would corrupt them.
+    if (req.method === 'GET' && pathname === '/mcp' && String(headers['content-type'] || '').split(';')[0].trim().toLowerCase() === 'text/event-stream'
+        && !headers['content-length'] && !headers['content-encoding']) {
+      const timer = setTimeout(() => { if (!res.destroyed && !res.writableEnded) res.write(': open\n\n'); }, OPEN_COMMENT_MS);
+      ures.once('data', () => clearTimeout(timer));
+      res.once('close', () => clearTimeout(timer));
+    }
     ures.pipe(res);
     ures.on('error', () => res.destroy());
   });
