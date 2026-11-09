@@ -294,11 +294,11 @@ match = [
   "file:~/.local/share/ha-physical-desktop",
   "file:~/.local/share/chatgpt-native-ha",
   "file:~/.local/share/tinyprint-bridge",
-  "file:~/.local/share/aisis-yandex",
+  "file:~/.local/share/aisis",
   "file:~/.config/chatgpt-native-ha.env",
 ]
 class = "untracked"
-reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv, aisis-yandex adapter and STT bridge with its venv); the units are declared but not enabled until this lands"
+reason = "runtime state and venvs of user services whose code and units live in the aisis repo (services/yandex-station); physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy and tinyprint bridge venv are still deployed by hand"
 ticket = "alex-mextner/.files#58"
 
 # links and leftovers whose owner is declared elsewhere (packages.toml uv/npm lists) or that hold nothing to track
