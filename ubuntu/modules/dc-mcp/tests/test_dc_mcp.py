@@ -533,10 +533,14 @@ class Launcher(unittest.TestCase):
         self.assertEqual(self.run_script(argv).returncode, 0)
         self.assertIn("--app=https://chatgpt.com", self.argv())
 
-    def test_the_icon_the_entry_names_is_shipped_as_a_png(self):
-        icon = os.path.join(UBUNTU, "files", ".local", "share", "icons", "hicolor", "48x48", "apps", "chatgpt-window.png")
-        with open(icon, "rb") as fh:
-            self.assertEqual(fh.read(8), b"\x89PNG\r\n\x1a\n")
+    def test_the_icon_the_entry_names_is_shipped_as_png_in_the_sizes_the_theme_directories_claim(self):
+        import struct
+        base = os.path.join(UBUNTU, "files", ".local", "share", "icons", "hicolor")
+        for size in (48, 256):
+            with open(os.path.join(base, "%dx%d" % (size, size), "apps", "chatgpt-window.png"), "rb") as fh:
+                head = fh.read(24)
+            self.assertEqual(head[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(struct.unpack(">II", head[16:24]), (size, size))
         with open(self.DESKTOP) as fh:
             self.assertIn("\nIcon=chatgpt-window\n", fh.read())
 
