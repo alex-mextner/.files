@@ -56,7 +56,7 @@ Two halves, both idempotent, both with `--dry-run` and a revert:
 `~/.config/systemd/user/<unit>.d/backups-mount-gate.conf` (a dedicated file name, so an existing `mounts.conf` of
 someone else is never overwritten or deleted by revert; drop-in only, no unit file edited):
 
-* `xp`: `3d-printer-vision@`, `3d-printer-watch@` (templates, cover every instance), `agent-tv`,
+* `xp`: `3d-printer-vision@`, `3d-printer-watch@` (templates, cover every instance), `agent-tv-backend` (agent-tv is socket-activated: the socket and proxy stay up, only the backend that works in xp is gated),
   `agenttools-hsw-editor-hsw-editor`, `ai.hyperide.model-freshness`, `aisis-dashboard`, `autoheal`, `hcb-alert-watcher`,
   `hsw-heartbeat`, `hsw-heartbeat-20261021`, `hsw-observer-agent`, `hsw-review`, `router-discover`,
   `router-inventory-update`, `router-scan`, `snap-orca-sync`
@@ -141,7 +141,7 @@ Do each with `~/.local/bin/backups-user-gates list` before and after, and this c
 
 *Disk unplugged before boot.* Reboot (login takes ~30 s longer: the device timeout).
 - [ ] Desktop/ssh login works (`user@UID` is not hard-dependent on the disk).
-- [ ] `backups-user-gates list` shows `DOWN`; `systemctl --user is-active tmux-boot agent-tv aisis-dashboard conloca-watch` are `inactive`; `tmux ls` has no server.
+- [ ] `backups-user-gates list` shows `DOWN`; `systemctl --user is-active tmux-boot agent-tv-backend aisis-dashboard conloca-watch` are `inactive`; `tmux ls` has no server.
 - [ ] `journalctl --user -b | grep 'unmet condition check ConditionPathIsMountPoint'` lists the skipped units.
 - [ ] `touch ~/xp/x` fails with "Operation not permitted"; nothing exists under `~/xp ~/work` (`ls -A`).
 - [ ] `docker ps` works; a container with a bind under `xp` (`aisis-openclaw-gateway`) is not running and `~/xp` is still empty.

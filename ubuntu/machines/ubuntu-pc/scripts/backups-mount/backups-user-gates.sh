@@ -39,7 +39,7 @@ DRY=0
 GATES=(
   "3d-printer-vision@.service xp"
   "3d-printer-watch@.service xp"
-  "agent-tv.service xp"
+  "agent-tv-backend.service xp"
   "agenttools-harness-dashboard.service .npm"
   "agenttools-hsw-editor-hsw-editor.service xp"
   "ai.hyperide.model-freshness.service xp"
