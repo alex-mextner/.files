@@ -56,6 +56,24 @@ exit 0
 """
 
 
+NPM = """#!/bin/sh
+# stub npm: `ci --prefix P` installs what P/package.json names (a node_modules tree like npm's, and leaves package-lock.json alone);
+# $STUB/ci-error makes it fail with that text, $STUB/offline with a resolver error
+echo "npm $*" >> "$STUB/calls.log"
+[ "$1" = ci ] || exit 2
+shift; prefix=""
+while [ $# -gt 0 ]; do
+  case "$1" in --prefix) prefix=$2; shift ;; esac
+  shift
+done
+[ -e "$STUB/offline" ] && { echo "npm error code EAI_AGAIN" >&2; exit 1; }
+[ -e "$STUB/ci-error" ] && { cat "$STUB/ci-error" >&2; exit 1; }
+cmp -s "$prefix/package-lock.json" "$STUB/expected-lock" || { echo "npm error the lockfile is not the committed one" >&2; exit 1; }
+mkdir -p "$prefix/node_modules/@wonderwhy-er/desktop-commander/dist"
+echo "// server" > "$prefix/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"
+"""
+
+
 def write_exec(path, text):
     with open(path, "w") as fh:
         fh.write(text)
@@ -141,11 +159,13 @@ class Base(unittest.TestCase):
         with open(path) as fh:
             return fh.read().splitlines()
 
-    def fake_npx(self):
-        write_exec(os.path.join(self.fakebin, "npx"), "#!/bin/sh\nexit 0\n")
+    def fake_node(self):
+        write_exec(os.path.join(self.fakebin, "npm"), NPM)
+        write_exec(os.path.join(self.fakebin, "node"), "#!/bin/sh\nexit 0\n")
+        shutil.copy(os.path.join(MODULE, "locks", "0.3.1", "package-lock.json"), os.path.join(self.stub, "expected-lock"))
 
     def install_ok(self):
-        self.fake_npx()
+        self.fake_node()
         res = self.run_script("install.sh")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         return res
@@ -184,9 +204,8 @@ class Installer(Base):
         self.assertIn("DC_MCP_TUNNEL=dc-test\n", text)
         self.assertIn("DC_MCP_PORT=8766\n", text)
         self.assertIn("DC_MCP_SHIM_PORT=8767\n", text)
-        self.assertEqual(sorted(line.split("=")[0] for line in text.splitlines() if not line.startswith("#")), sorted(["DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP", "DC_MCP_TOOL_LOG_KEEP", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS", "DC_MCP_PACKAGE"]))
+        self.assertEqual(sorted(line.split("=")[0] for line in text.splitlines() if not line.startswith("#")), sorted(["DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP", "DC_MCP_TOOL_LOG_KEEP", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS"]))
         self.assertIn("DC_MCP_LOG_MAX_KIB=2048\nDC_MCP_LOG_KEEP=3\nDC_MCP_TOOL_LOG_KEEP=5\nDC_MCP_TOOL_LOG_MAX_AGE_DAYS=30\n", text)
-        self.assertIn("DC_MCP_PACKAGE=@wonderwhy-er/desktop-commander@latest\n", text)
         self.assertEqual(stat.S_IMODE(os.stat(self.auth).st_mode), 0o600)
         self.assertRegex(self.password(), r"^[A-Za-z0-9]{32}$")
         self.assertNotIn(self.password(), res.stdout + res.stderr)
@@ -210,7 +229,7 @@ class Installer(Base):
 
     def test_a_checksum_mismatch_is_refused_and_leaves_no_binary(self):
         self.serve("cloudflared-linux", b"tampered download\n")
-        self.fake_npx()
+        self.fake_node()
         res = self.run_script("install.sh")
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn("refusing cloudflared: sha256", res.stderr)
@@ -240,7 +259,7 @@ class Installer(Base):
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
     def test_a_network_failure_is_the_transient_exit_code(self):
-        self.fake_npx()
+        self.fake_node()
         open(os.path.join(self.stub, "offline"), "w").close()
         self.assertEqual(self.run_script("install.sh").returncode, 75)
 
@@ -269,7 +288,7 @@ class Installer(Base):
 
     def test_no_hostname_installs_the_binaries_and_asks_for_the_option(self):
         self.config = {}
-        self.fake_npx()
+        self.fake_node()
         res = self.run_script("install.sh")
         self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
         self.assertIn("needs manual: set [modules.dc-mcp] hostname", res.stderr)
@@ -278,27 +297,101 @@ class Installer(Base):
         # the settings file is never written without a hostname: a half-configured machine cannot serve a wrong name
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 10)
 
-    def test_missing_npx_is_a_manual_step_after_everything_else_is_in_place(self):
+    def test_missing_npm_is_a_manual_step_after_everything_else_is_in_place(self):
+        if os.path.exists("/usr/bin/npm") or os.path.exists("/bin/npm"):
+            self.skipTest("a system npm would reach the real registry")
         res = self.run_script("install.sh")
         self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
-        self.assertIn("npx (node) is not installed", res.stderr)
+        self.assertIn("npm or node is not installed", res.stderr)
         self.assertTrue(os.path.exists(self.auth))
         self.assertTrue(os.path.exists(self.settings))
 
     def test_invalid_options_are_refused(self):
-        for bad in ({"hostname": "Not A Host"}, {"port": 80}, {"port": "8766"}, {"shim_port": 8766}, {"shim_port": 70000}, {"log_keep": -1}, {"log_keep": 21}, {"log_max_kib": 1}, {"tool_log_keep": 0}, {"tool_log_max_age_days": 0}, {"tunnel": "bad name"}, {"package": "x y"}, {"nope": 1}):
+        for bad in ({"hostname": "Not A Host"}, {"port": 80}, {"port": "8766"}, {"shim_port": 8766}, {"shim_port": 70000}, {"log_keep": -1}, {"log_keep": 21}, {"log_max_kib": 1}, {"tool_log_keep": 0}, {"tool_log_max_age_days": 0}, {"tunnel": "bad name"}, {"package": "@scope/pkg@1"}, {"package_version": "latest"}, {"package_version": "^0.3.1"}, {"package_version": "0.3"}, {"nope": 1}):
             self.config = {"hostname": "dc.example.com", **bad}
             res = self.run_script("install.sh", "--check")
             self.assertEqual(res.returncode, 1, f"{bad}: {res.stdout}{res.stderr}")
             self.assertIn("[modules.dc-mcp]", res.stderr)
 
     def test_the_options_reach_the_settings_file(self):
-        self.config = {"hostname": "a.b.example.org", "tunnel": "t1", "port": 9001, "shim_port": 9002, "log_max_kib": 512, "log_keep": 0, "tool_log_keep": 2, "tool_log_max_age_days": 7, "package": "@scope/pkg@1.2.3"}
+        self.config = {"hostname": "a.b.example.org", "tunnel": "t1", "port": 9001, "shim_port": 9002, "log_max_kib": 512, "log_keep": 0, "tool_log_keep": 2, "tool_log_max_age_days": 7, "package_version": "0.3.1"}
         self.install_ok()
         with open(self.settings) as fh:
             text = fh.read()
-        for line in ("DC_MCP_HOSTNAME=a.b.example.org", "DC_MCP_TUNNEL=t1", "DC_MCP_PORT=9001", "DC_MCP_SHIM_PORT=9002", "DC_MCP_LOG_MAX_KIB=512", "DC_MCP_LOG_KEEP=0", "DC_MCP_TOOL_LOG_KEEP=2", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS=7", "DC_MCP_PACKAGE=@scope/pkg@1.2.3"):
+        for line in ("DC_MCP_HOSTNAME=a.b.example.org", "DC_MCP_TUNNEL=t1", "DC_MCP_PORT=9001", "DC_MCP_SHIM_PORT=9002", "DC_MCP_LOG_MAX_KIB=512", "DC_MCP_LOG_KEEP=0", "DC_MCP_TOOL_LOG_KEEP=2", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS=7"):
             self.assertIn(line, text)
+
+    def dc_dir(self):
+        return os.path.join(self.home, ".local", "lib", "dc-mcp", "node_modules", "@wonderwhy-er", "desktop-commander")
+
+    def test_install_puts_desktop_commander_in_its_prefix_from_the_committed_lockfile_once(self):
+        res = self.install_ok()
+        self.assertTrue(os.path.exists(os.path.join(self.dc_dir(), "dist", "index.js")))
+        installs = [c for c in self.calls() if c.startswith("npm ")]
+        self.assertEqual(len(installs), 1)
+        self.assertRegex(installs[0], r"^npm ci --prefix \S+ --ignore-scripts")
+        self.assertIn("systemctl --user daemon-reload && systemctl --user restart dc-mcp-bridge", res.stdout)
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+        self.install_ok()
+        self.assertEqual(len([c for c in self.calls() if c.startswith("npm ")]), 1)
+        self.assertEqual([n for n in os.listdir(os.path.join(self.home, ".local", "lib")) if n.startswith(".dc-mcp")], [])
+
+    def test_a_version_without_a_committed_lockfile_is_refused(self):
+        self.config = {**self.config, "package_version": "9.9.9"}
+        self.fake_node()
+        for args in ((), ("--check",), ("--plan",)):
+            res = self.run_script("install.sh", *args)
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            self.assertIn("no committed lockfile", res.stderr)
+
+    def test_the_shipped_lockfile_pins_exactly_the_default_version_with_an_integrity(self):
+        lock = json.loads(slurp(os.path.join(MODULE, "locks", "0.3.1", "package-lock.json")))
+        pkg = json.loads(slurp(os.path.join(MODULE, "locks", "0.3.1", "package.json")))
+        self.assertEqual(pkg["dependencies"], {"@wonderwhy-er/desktop-commander": "0.3.1"})
+        entry = lock["packages"]["node_modules/@wonderwhy-er/desktop-commander"]
+        self.assertEqual(entry["version"], "0.3.1")
+        self.assertRegex(entry["integrity"], r"^sha512-")
+        for path, dep in lock["packages"].items():
+            if path and not dep.get("link") and not dep.get("inBundle"):
+                self.assertIn("integrity", dep, path)
+
+    def test_a_lockfile_that_differs_from_the_installed_one_is_drift(self):
+        self.install_ok()
+        with open(os.path.join(self.home, ".local", "lib", "dc-mcp", "package-lock.json"), "a") as fh:
+            fh.write(" ")
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+        self.install_ok()
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_a_permanent_npm_failure_is_final_and_installs_nothing(self):
+        self.fake_node()
+        with open(os.path.join(self.stub, "ci-error"), "w") as fh:
+            fh.write("npm error code EINTEGRITY\n")
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("EINTEGRITY", res.stderr)
+        self.assertFalse(os.path.exists(self.dc_dir()))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+
+    def test_a_network_failure_of_npm_is_the_transient_exit_code_and_keeps_the_installed_copy(self):
+        self.install_ok()
+        with open(os.path.join(self.home, ".local", "lib", "dc-mcp", "package-lock.json"), "a") as fh:
+            fh.write(" ")
+        open(os.path.join(self.stub, "offline"), "w").close()
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 75, res.stdout + res.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.dc_dir(), "dist", "index.js")))
+
+    def test_without_npm_check_and_plan_ask_for_node_and_never_report_drift_apply_cannot_fix(self):
+        if os.path.exists("/usr/bin/npm") or os.path.exists("/bin/npm"):
+            self.skipTest("a system npm would reach the real registry")
+        check = self.run_script("install.sh", "--check")
+        self.assertNotIn("desktop-commander", check.stdout)
+        plan = self.run_script("install.sh", "--plan")
+        self.assertNotIn("npm ci", plan.stdout)
+        self.assertIn("needs manual: npm or node is not installed", plan.stdout)
+        self.run_script("install.sh")
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 10)
 
     def test_the_repository_tree_is_never_written_by_install(self):
         before = tree_state(UBUNTU)
@@ -329,7 +422,7 @@ class Units(unittest.TestCase):
             return fh.read()
 
     def test_every_variable_a_unit_expands_is_written_by_the_settings_file(self):
-        provided = {"DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP", "DC_MCP_PACKAGE"}
+        provided = {"DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP"}
         for name in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
             exec_start = re.search(r"^ExecStart=(.*)$", self.read(name), re.M).group(1)
             self.assertLessEqual(set(re.findall(r"\$\{(\w+)\}", exec_start)), provided, name)
@@ -368,6 +461,11 @@ class Units(unittest.TestCase):
             self.assertNotIn("/home/", text, path)
             self.assertNotIn("ultra", text, path)
             self.assertNotIn("mextner", text, path)
+
+    def test_the_bridge_runs_the_installed_copy_with_node_not_npx(self):
+        exec_start = re.search(r"^ExecStart=(.*)$", self.read("dc-mcp-bridge.service"), re.M).group(1)
+        self.assertTrue(exec_start.endswith(" -- node %h/.local/lib/dc-mcp/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"), exec_start)
+        self.assertNotIn("npx", exec_start)
 
     def test_the_bridge_keeps_the_password_out_of_its_command_line(self):
         text = self.read("dc-mcp-bridge.service")
