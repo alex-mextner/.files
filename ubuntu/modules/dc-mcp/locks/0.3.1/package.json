@@ -1,0 +1,8 @@
+{
+  "name": "dc-mcp-desktop-commander",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@wonderwhy-er/desktop-commander": "0.3.1"
+  }
+}

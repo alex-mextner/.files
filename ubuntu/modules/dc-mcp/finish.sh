@@ -38,6 +38,7 @@ esac
 
 [ -n "$opt_hostname" ] || die "set [modules.dc-mcp] hostname in machines/<host>/machine.toml first, then run: ubuntu-tweak apply --commit"
 [ -x "$cf" ] && [ -x "$HOME/.local/bin/mcp-auth-proxy" ] || die "the binaries are not installed yet: run ubuntu-tweak apply --commit first"
+[ -f "$HOME/.local/lib/dc-mcp/node_modules/@wonderwhy-er/desktop-commander/dist/index.js" ] || die "Desktop Commander is not installed yet (needs node and npm): run ubuntu-tweak apply --commit first"
 for u in "${units[@]}"; do
   [ -e "$HOME/.config/systemd/user/$u" ] || die "$u is not linked yet: run ubuntu-tweak apply --commit first"
 done

@@ -6,7 +6,7 @@
 #   opt_shim_port loopback port of the shim the tunnel points at (default 8767)
 #   opt_log_max_kib / opt_log_keep   size cap (KiB) and number of rotated files of the shim access log (2048, 3)
 #   opt_tool_log_keep / opt_tool_log_max_age_days   retention of Desktop Commander's rotated tool-call logs (5 files, 30 days)
-#   opt_package   npm package the proxy launches over stdio (default @wonderwhy-er/desktop-commander@latest)
+#   opt_package_version   exact version of @wonderwhy-er/desktop-commander that install.sh installs once and the proxy runs (default 0.3.1; needs locks/<version>/ in the module)
 # An invalid value is `die`d (exit 1). A missing hostname is NOT an error here: callers decide (manual step).
 
 load_options() {
@@ -17,7 +17,7 @@ import json, os, re, shlex, socket, sys
 
 known = {"hostname": "", "tunnel": "dc-" + socket.gethostname().split(".")[0], "port": 8766, "shim_port": 8767,
          "log_max_kib": 2048, "log_keep": 3, "tool_log_keep": 5, "tool_log_max_age_days": 30,
-         "package": "@wonderwhy-er/desktop-commander@latest"}
+         "package_version": "0.3.1"}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -30,7 +30,7 @@ extra = sorted(set(config) - set(known))
 if extra:
     fail("unknown option(s): " + " ".join(extra))
 opt = {**known, **config}
-for key in ("hostname", "tunnel", "package"):
+for key in ("hostname", "tunnel", "package_version"):
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
 if opt["hostname"] and not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+", opt["hostname"]):
@@ -45,9 +45,9 @@ for key, low, high in (("log_max_kib", 64, 1048576), ("log_keep", 0, 20), ("tool
         fail("%s must be a number from %d to %d: %s" % (key, low, high, opt[key]))
 if opt["port"] == opt["shim_port"]:
     fail("port and shim_port must differ: %s" % opt["port"])
-if not re.fullmatch(r"(@[A-Za-z0-9._~-]+/)?[A-Za-z0-9._~-]+(@[A-Za-z0-9._~-]+)?", opt["package"]):
-    fail("package must be an npm package spec such as @scope/name@1.2.3: %s" % opt["package"])
-for key in ("hostname", "tunnel", "port", "shim_port", "log_max_kib", "log_keep", "tool_log_keep", "tool_log_max_age_days", "package"):
+if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", opt["package_version"]):
+    fail("package_version must be one exact version such as 0.3.1 (major.minor.patch), never a tag or a range: %s" % opt["package_version"])
+for key in ("hostname", "tunnel", "port", "shim_port", "log_max_kib", "log_keep", "tool_log_keep", "tool_log_max_age_days", "package_version"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 PY
   ) || exit 1
