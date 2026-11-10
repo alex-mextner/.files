@@ -1,7 +1,7 @@
 # Coverage rules for systemd USER units (`ubuntu-tweak coverage`, adapter `units`). The user's own services are tracked by
 # files/ (their unit files are adopted) and units.toml; what is below is what another tool writes or what is not
 # configuration. Units of the PROFILE's modules are claimed in those modules' own module.toml (chatgpt-guardian, tg-cli,
-# sendspin-player, tmux-boot).
+# sendspin-player, tmux-boot, aisis: the voice stack's units live in the aisis repository).
 
 # Engine modules: each writes and enables its own units; the engine modules carry no coverage rule of their own yet.
 [[coverage]]
@@ -44,17 +44,3 @@ reason = "a one-off finite timer whose last OnCalendar was 2026-10-22 06:00 UTC;
 match = ["unit:remotemouse.service"]
 class = "excluded"
 reason = "disabled on both machines and the RemoteMouse app (~/.local/share/RemoteMouse) was never part of the profile; install the app first, then adopt the unit"
-
-# The whole AISIS voice stack (adapter/STT/PM/embed/kit/lan-proxy/ha-cli/clipfeed/dashboard/failover/
-# whisper-prompt and wyoming-whisper + drop-ins) is versioned in alex-mextner/aisis
-# (services/yandex-station/systemd); its unit files are installed from there, not from this profile.
-[[coverage]]
-match = [
-  "unit:aisis-station-adapter.service", "unit:aisis-station-stt.service", "unit:aisis-station-pm.service",
-  "unit:aisis-station-embed.service", "unit:aisis-station-kit.service", "unit:aisis-station-lan-proxy.service",
-  "unit:aisis-ha-cli.service", "unit:aisis-clipfeed.service", "unit:aisis-dashboard.service",
-  "unit:aisis-failover.service", "unit:aisis-whisper-prompt.service", "unit:aisis-whisper-prompt.timer",
-  "unit:wyoming-whisper.service",
-]
-class = "tracked"
-reason = "unit files ship from the aisis repo (services/yandex-station/systemd) and are copied into ~/.config/systemd/user by its README runbook; the old aisis-yandex-* names and the .files copies were removed with that move"
