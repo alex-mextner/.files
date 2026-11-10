@@ -1,0 +1,28 @@
+description = "aisis: checkout of alex-mextner/aisis in ~/xp/aisis and the AISIS voice-stack systemd user units (adapter, STT, PM, embed, kit, lan-proxy, ha-cli, clipfeed, dashboard, failover, whisper-prompt timer, wyoming-whisper), installed and enabled by the checkout's own scripts/install-systemd-units.sh"
+enabled = false   # opt in per machine: [modules.aisis] enabled = true in machines/<host>/machine.toml (the units carry this PC's drop-ins: a CUDA Whisper, the %h/xp mount gate)
+order = 170       # after the other profile modules; it needs only git and a user systemd session
+manual = "runtime state of the voice stack is not in either repository: restore ~/.local/share/aisis (venvs, models), ~/.config/aisis (runtime.env and the other secret files) from backup, then run apply again; a unit that lacks it fails to start and systemd retries it"
+
+# User level: the installer writes only ~/.config/systemd/user and talks to the user's systemd, so it never runs as root.
+# The units are versioned in the aisis repository (services/yandex-station/systemd), NOT here; this module only
+# makes sure the repository is checked out and runs its installer (copy, daemon-reload, enable, start what is not
+# running, never restart a running unit). An existing checkout is the user's working copy: never pulled, never reset.
+# Option ([modules.aisis] in profile.toml / machine.toml): repo (see install.sh). There is no `dir`: the units name
+# %h/xp/aisis in WorkingDirectory= and ExecStart=, so the checkout lives there or the units cannot run.
+[source]
+kind = "system"
+root = false
+install = "install.sh"
+check = "install.sh --check"
+preview = "install.sh --plan"
+
+[[coverage]]
+match = [
+  "unit:aisis-station-adapter.service", "unit:aisis-station-stt.service", "unit:aisis-station-pm.service",
+  "unit:aisis-station-embed.service", "unit:aisis-station-kit.service", "unit:aisis-station-lan-proxy.service",
+  "unit:aisis-ha-cli.service", "unit:aisis-clipfeed.service", "unit:aisis-dashboard.service",
+  "unit:aisis-failover.service", "unit:aisis-whisper-prompt.service", "unit:aisis-whisper-prompt.timer",
+  "unit:wyoming-whisper.service",
+]
+class = "tracked"
+reason = "unit files and drop-ins are owned by the aisis repository (services/yandex-station/systemd) and installed by this module through the checkout's scripts/install-systemd-units.sh; nothing of them is kept in this repository"

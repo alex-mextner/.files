@@ -248,6 +248,13 @@ optional = true
 [capture]
 exclude = ["/org/gnome/shell/extensions/dash-to-dock/dock-position"]
 
+# AISIS voice stack (profile module aisis, repository alex-mextner/aisis): the Yandex Station adapter and its STT/PM/embed/kit
+# sidecars, dashboard, failover and the CUDA Whisper of this PC. Opt-in: the aisis drop-ins are this PC's (95-pc.conf forces
+# CUDA, backups-mount-gate.conf requires ~/xp to be the backups mount), so no other machine takes the units by default.
+[modules.aisis]
+enabled = true
+require_mount = "~/xp"   # a bind mount of the backups disk: never clone onto the root disk underneath it
+
 # ChatGPT to this PC's local tools (profile module dc-mcp, issue #143): Desktop Commander behind an OAuth proxy and the Cloudflare
 # tunnel dc-local. ONE HOSTNAME PER MACHINE: a second machine must use its own hostname, never this one.
 [modules.dc-mcp]
