@@ -6,6 +6,12 @@
 **empty directory on the SSD**: a service that starts there works on, and writes into, the wrong place, and the output is
 hidden once the disk comes back.
 
+**Current layout (2026-11-11):** `move-from-backups.sh` brought all 25 bound trees back to the SSD as plain directories and
+commented their fstab lines out (`# [move-from-backups ...]`); the disk itself is still mounted at
+`/run/media/<user>/backups` and holds the old copies as a reserve. Nothing is bound now, so no unit is gated, the retry
+timer is disabled and the `chattr +i` flags are off. Everything below describes what applies **while fstab binds a
+tree** (the user half reads the fstab when `install` runs, see "Which units are gated").
+
 Two halves, both idempotent, both with `--dry-run` and a revert:
 
 | half | script | needs root |
@@ -52,9 +58,25 @@ Two halves, both idempotent, both with `--dry-run` and a revert:
 
 ## Which units are gated
 
-`backups-user-gates list` prints the live table. Each unit below got
-`~/.config/systemd/user/<unit>.d/backups-mount-gate.conf` (a dedicated file name, so an existing `mounts.conf` of
-someone else is never overwritten or deleted by revert; drop-in only, no unit file edited):
+A tree is gated only while `/etc/fstab` has an **active** (not commented out) `bind` line for it under `$HOME`:
+`backups-user-gates install` reads the fstab and writes a gate per unit for the still-bound trees only, removes the
+gate (when it carries this script's marker) of a unit whose trees are all plain directories again, and enables
+`backups-mount-retry.timer` only while at least one gate is left (otherwise it disables it; `retry` does nothing
+without a gated tree). A gate on a plain directory would be an unmet `ConditionPathIsMountPoint` on **every** start:
+the unit would never run. `backups-user-gates list` prints the live gates, or `no gated units`.
+
+`install` changes nothing and exits non-zero when it cannot tell what is bound: the fstab is unreadable or has no
+active line, or the user systemd cannot be reached (run it from the login session, not via `sudo -u`/cron). It also
+leaves the gate of a mapped unit that cannot be loaded on the host alone (it may only be missing because its file lives on the unplugged disk), and, after the gates are gone, starts every
+installed unit whose last start was skipped for a mount condition (a skipped start is retried by nothing without a
+gate; a second run finishes an interrupted first one). Timer-driven units and the supervised 3d-printer workers are
+left to their own schedule.
+
+`GATES` in `backups-user-gates.sh` is the unit -> tree **map**, kept as it was so that a tree bound again
+(`move-to-backups.sh`, then `sudo ./harden-backups-mount.sh` and `./backups-user-gates.sh install`) is gated again.
+Each unit below gets `~/.config/systemd/user/<unit>.d/backups-mount-gate.conf` when its tree is bound (a dedicated file
+name, so an existing `mounts.conf` of someone else is never overwritten or deleted by revert; drop-in only, no unit
+file edited):
 
 * `xp`: `3d-printer-vision@`, `3d-printer-watch@` (templates, cover every instance), `agent-tv-backend` (agent-tv is socket-activated: the socket and proxy stay up, only the backend that works in xp is gated),
   `agenttools-hsw-editor-hsw-editor`, `ai.hyperide.model-freshness`, `aisis-dashboard`, `autoheal`, `hcb-alert-watcher`,
@@ -83,7 +105,7 @@ cd <path of this directory>   # .files: ubuntu/machines/ubuntu-pc/scripts/backup
 ./harden-backups-mount.sh --dry-run          # no root needed: shows every change
 sudo ./harden-backups-mount.sh               # apply (one run, idempotent)
 sudo ./harden-backups-mount.sh --revert      # undo
-# user half is already installed; to (re)apply or undo:
+# user half: install = converge the gates to the fstab (safe to re-run after a move), revert = remove everything it wrote
 ./backups-user-gates.sh install | revert [--dry-run]
 ```
 
@@ -111,7 +133,12 @@ Every line must show an `i`.
    `backups-user-gates selftest` makes a throw-away unit whose start is skipped for a missing mount, proves `retry`
    leaves it stopped, then points the condition at `/dev/shm` (always a mount point: "the disk came back") and proves
    `retry` starts it. `retry` is restricted to the test unit (unique name per run) and docker recovery is off, so no real
-   workload is touched. It changes real systemd state, so it has no `--dry-run`; it removes its unit again.
+   workload is touched. It changes real systemd state, so it has no `--dry-run`; it removes its unit again. It first
+   checks the fstab logic on a throw-away fstab and unit dir, with no systemd call (commented, non-bind and unknown trees
+   are not gated, trailing and doubled slashes and `\040` are normalised, a stale gate of ours is removed and the unit
+   listed for a start, a foreign drop-in stays, only the bound tree is written, an unreadable fstab or one without an
+   active line aborts `install` before it changes anything, the retry timer follows the gate count). The live part
+   then proves that a unit skipped by a stale gate is started once the gate is gone, also on a second run.
 2. **Empty-mountpoint behaviour, in a private mount namespace** (the host mounts are not affected; needs the root half applied):
    ```bash
    sudo unshare -m --propagation private bash -c '
@@ -131,8 +158,8 @@ Every line must show an `i`.
 
 ## Reboot-test checklist
 
-Do each with `~/.local/bin/backups-user-gates list` before and after, and this check for the binds:
-`awk '$4 ~ /bind/ {print $2}' /etc/fstab | while read -r m; do mountpoint -q "$m" || echo "NOT MOUNTED $m"; done` (prints nothing when all are up).
+Only meaningful while fstab binds trees (see "Current layout"). Do each with `~/.local/bin/backups-user-gates list` before and after, and this check for the binds:
+`awk '$4 ~ /bind/ && $1 !~ /^#/ {print $2}' /etc/fstab | while read -r m; do mountpoint -q "$m" || echo "NOT MOUNTED $m"; done` (prints nothing when all are up).
 
 *Disk attached.* Reboot, wait for login.
 - [ ] `findmnt /run/media/$USER/backups` is mounted and the bind check above prints nothing.
@@ -152,6 +179,11 @@ Do each with `~/.local/bin/backups-user-gates list` before and after, and this c
 
 ## Interplay and caveats
 
+* **After every move of a tree, in either direction, run `./backups-user-gates.sh install`** (it converges the gates to
+  the fstab; nothing does it on its own: `retry` and the timer never read the fstab). Skipping it after
+  `move-to-backups.sh` leaves the newly bound tree ungated (units start in the empty directory when the disk is missing);
+  skipping it after `move-from-backups.sh` leaves the old gate on a plain directory (the unit is skipped on every
+  start; `install` removes the gate and starts the units whose start was skipped).
 * `move-to-backups.sh` adds new bind targets: re-run `sudo ./harden-backups-mount.sh` afterwards (it re-reads fstab; the
   drop-ins and flags for the new targets are added, everything else reports "already in place"). To remove or merge an
   existing bind (`move` with nested binds, whole-tree merges) release the flag first: `sudo ./harden-backups-mount.sh --revert`, change, re-apply.
