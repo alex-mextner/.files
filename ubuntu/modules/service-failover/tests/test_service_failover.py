@@ -68,6 +68,22 @@ LAUNCHER = r"""#!/bin/bash
 echo "launcher $1 $3" >> "$STUB/calls"
 cp "$2" "$STUB/brief-sent"
 """
+# notify-send: records "title | body" per call; $STUB/notify-down makes it fail the way it does while no notification
+# daemon is running yet (early in the login).
+NOTIFIER = r"""#!/bin/bash
+[ -e "$STUB/notify-down" ] && { echo "Could not connect: No such file or directory" >&2; exit 1; }
+args=("$@"); n=${#args[@]}
+printf '%s | %s\n' "${args[n-2]}" "${args[n-1]}" >> "$STUB/notifications"
+"""
+# wireplumber.service on 2026-11-11 01:36:49: a distribution unit, refused its next start after five fast restarts.
+WIREPLUMBER_STATE = ("InvocationID=old\nActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=5\nUnitFileState=enabled\n"
+                     "FragmentPath=/usr/lib/systemd/user/wireplumber.service\nTransient=no\nExecMainStatus=78\n")
+WIREPLUMBER_JOURNAL = (
+    "2026-11-11T01:36:44+01:00 pc wireplumber[8331]: failed to load components: failed to load component 'support.xdg-desktop-portal "
+    "[module: libxdg-desktop-portal]' (required by policy.xdg-desktop-portal [virtual]): Failed to locate module libxdg-desktop-portal\n"
+    "2026-11-11T01:36:44+01:00 pc systemd[2103]: wireplumber.service: Main process exited, code=exited, status=78/CONFIG\n"
+    "2026-11-11T01:36:49+01:00 pc systemd[2103]: wireplumber.service: Start request repeated too quickly.\n"
+    "2026-11-11T01:36:49+01:00 pc systemd[2103]: Failed to start wireplumber.service - Multimedia Service Session Manager.\n")
 FAILED_STATE = "InvocationID=old\nActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=9\nUnitFileState=enabled\nFragmentPath=/home/u/.config/systemd/user/foo.service\nTransient=no\n"
 
 # Fake secrets, assembled at run time so no secret-shaped literal sits in the source.
@@ -93,8 +109,12 @@ class Base(unittest.TestCase):
         launcher = self.root / "launcher"
         launcher.write_text(LAUNCHER)
         launcher.chmod(0o755)
+        notifier = self.root / "notify-send"
+        notifier.write_text(NOTIFIER)
+        notifier.chmod(0o755)
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB": str(self.stub), "HOME": str(self.root / "home"),
                     "SERVICE_FAILOVER_STATE": str(self.root / "state"), "SERVICE_FAILOVER_LAUNCHER": str(launcher),
+                    "SERVICE_FAILOVER_NOTIFY": str(notifier),
                     "SERVICE_FAILOVER_SETTLE_S": "0", "RIG_AGENT_LOG_DIR": str(self.root / "agent-logs")}
         self.env.pop("UBUNTU_TWEAK_MODULE_CONFIG", None)
         (self.root / "home").mkdir()
@@ -105,6 +125,10 @@ class Base(unittest.TestCase):
 
     def launches(self):
         return [c for c in self.calls() if c.startswith("launcher ")]
+
+    def notifications(self):
+        path = self.stub / "notifications"
+        return path.read_text().splitlines() if path.exists() else []
 
     def set_state(self, text=FAILED_STATE):
         (self.stub / "state").write_text(text)
@@ -171,15 +195,110 @@ class RepairTest(Base):
         self.assertIn("back up after reset-failed and restart", result.stdout)
         self.assertEqual(self.launches(), [])
 
-    def test_a_healthy_transient_or_vendor_unit_is_left_alone(self):
+    def test_a_healthy_or_transient_unit_is_left_alone(self):
         self.set_state("ActiveState=active\nSubState=running\nFragmentPath=/x\nTransient=no\n")
         self.assertIn("healthy again", self.repair("foo.service").stdout)
         self.set_state(FAILED_STATE.replace("Transient=no", "Transient=yes"))
         self.assertIn("transient unit", self.repair("app-firefox.service").stdout)
-        self.set_state(FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", "/usr/lib/systemd/user/gnome-shell.service"))
-        self.assertIn("vendor or generated unit", self.repair("gnome-shell.service").stdout)
         self.assertEqual(self.launches(), [])
+        self.assertEqual(self.notifications(), [])
         self.assertNotIn("systemctl --user restart --no-block foo.service", self.calls())
+
+    def test_a_failed_vendor_unit_is_not_dropped_it_gets_first_aid_a_session_and_a_notification(self):
+        # wireplumber.service (the distribution's unit) failed with status 78 and stayed down for days: the repair script
+        # used to log "vendor or generated unit, not repaired" and exit, with no first aid, no session and no message.
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "journal").write_text(WIREPLUMBER_JOURNAL)
+        result = self.repair("wireplumber.service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("not repaired", result.stdout)
+        self.assertIn("systemctl --user restart --no-block wireplumber.service", self.calls())
+        self.assertEqual(len(self.launches()), 1)
+        brief = (self.stub / "brief-sent").read_text()
+        for needle in ("Unit: wireplumber.service", "/usr/lib/systemd/user/wireplumber.service", "vendor unit", "do NOT edit", "libxdg-desktop-portal"):
+            self.assertIn(needle, brief)
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("wireplumber.service", notes[0])
+        self.assertIn("Failed to locate module libxdg-desktop-portal", notes[0])  # the unit's own error, not systemd's bookkeeping line
+        self.assertNotIn("Start request repeated too quickly", notes[0])
+        self.assertIn("repair session", notes[0])
+
+    def test_a_failed_unit_that_first_aid_brings_back_sends_no_notification(self):
+        self.set_state()
+        (self.stub / "heals").write_text("")
+        self.repair("foo.service")
+        self.assertEqual(self.notifications(), [])
+
+    def test_a_notification_names_the_unit_and_keeps_secrets_out(self):
+        self.set_state()
+        (self.stub / "journal").write_text(f"Nov 10 foo[1]: connect failed password={PASSWORD_VALUE} api_key: {LONG_VALUE}\n")
+        self.repair("foo.service")
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("foo.service", notes[0])
+        self.assertIn("connect failed", notes[0])
+        for secret in (PASSWORD_VALUE, LONG_VALUE[:16]):
+            self.assertNotIn(secret, notes[0])
+
+    def test_a_session_that_cannot_start_still_notifies_and_says_why(self):
+        self.set_state()
+        (self.root / "state").mkdir(parents=True)
+        with open(self.root / "state" / "lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.repair("foo.service")
+        self.assertEqual(self.launches(), [])
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("foo.service", notes[0])
+        self.assertIn("another repair session is running", notes[0])
+
+    def test_the_daily_cap_does_not_hide_a_failed_unit_from_the_user(self):
+        self.set_state()
+        launches = self.root / "state" / "launches"
+        launches.mkdir(parents=True)
+        (launches / "1-old").write_text("")
+        self.repair("foo.service", SERVICE_FAILOVER_DAILY_CAP="1")
+        self.assertEqual(self.launches(), [])
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("daily cap", notes[0])
+
+    def test_a_unit_is_announced_once_per_notify_window(self):
+        self.set_state()
+        self.repair("foo.service", SERVICE_FAILOVER_COOLDOWN_MIN="0")
+        self.set_state()
+        self.repair("foo.service", SERVICE_FAILOVER_COOLDOWN_MIN="0")
+        self.assertEqual(len(self.notifications()), 1)
+        self.set_state()
+        self.repair("foo.service", SERVICE_FAILOVER_COOLDOWN_MIN="0", SERVICE_FAILOVER_NOTIFY_MIN="0")
+        self.assertEqual(len(self.notifications()), 2)
+        self.set_state()
+        self.repair("bar.service", SERVICE_FAILOVER_COOLDOWN_MIN="0")
+        self.assertEqual(len(self.notifications()), 3)  # another unit is its own announcement
+
+    def test_a_notification_that_cannot_be_delivered_waits_and_is_delivered_by_the_next_flush(self):
+        # early in the login no notification daemon runs: the message must survive until one does
+        self.set_state()
+        (self.stub / "notify-down").write_text("")
+        result = self.repair("foo.service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("notification pending", result.stdout)
+        self.assertEqual(self.notifications(), [])
+        (self.stub / "notify-down").unlink()
+        flushed = subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(flushed.returncode, 0, flushed.stderr)
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("foo.service", notes[0])
+        subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(len(self.notifications()), 1)  # delivered once
+
+    def test_a_dry_run_notifies_nobody(self):
+        self.set_state()
+        result = self.repair("foo.service", SERVICE_FAILOVER_DRY_RUN="1")
+        self.assertIn("DRY RUN: would notify", result.stdout)
+        self.assertEqual(self.notifications(), [])
 
     def test_a_unit_still_inside_its_restart_budget_or_stopped_on_purpose_is_left_to_systemd(self):
         # OnFailure= fires on every crash of a unit that systemd is still restarting: only the end of the budget is a failure.
@@ -240,7 +359,7 @@ class RepairTest(Base):
         self.assertEqual(self.launches(), [])
         self.assertNotIn("systemctl --user restart --no-block service-failover-scan.service", self.calls())
 
-    def test_a_unit_gets_one_session_per_cooldown_and_a_remote_vendor_unit_none(self):
+    def test_a_unit_gets_one_session_per_cooldown_also_when_it_is_a_remote_vendor_unit(self):
         self.set_state()
         self.repair("foo.service")
         self.assertEqual(len(self.launches()), 1)
@@ -249,8 +368,9 @@ class RepairTest(Base):
         self.assertIn("already launched", self.repair("foo.service").stdout)
         self.assertEqual(len(self.launches()), 1)
         self.set_state(FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", "/lib/systemd/system/vendor.service"))
-        self.assertIn("vendor or generated unit", self.repair("odroidn2:system:vendor.service").stdout)
-        self.assertEqual(len(self.launches()), 1)
+        self.repair("odroidn2:system:vendor.service")
+        self.assertEqual(len(self.launches()), 2)
+        self.assertIn("vendor unit", (self.stub / "brief-sent").read_text())
 
     def test_escaped_unit_names_are_accepted(self):
         self.set_state()
@@ -353,6 +473,15 @@ class ScanTest(Base):
         self.scan()
         self.assertEqual(self.started(), [])
 
+    def test_a_scan_delivers_the_notifications_that_waited_for_the_desktop(self):
+        self.set_state(FAILED_STATE)
+        (self.stub / "notify-down").write_text("")
+        subprocess.run(["bash", str(REPAIR), "foo.service"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(self.notifications(), [])
+        (self.stub / "notify-down").unlink()
+        self.assertEqual(self.scan().returncode, 0)
+        self.assertEqual(len(self.notifications()), 1)
+
 
 class FilesTest(unittest.TestCase):
     def read(self, rel):
@@ -370,7 +499,11 @@ class FilesTest(unittest.TestCase):
         self.assertIn("OnFailure=service-failover-repair@%n.service", self.read("service.d/15-failover-repair.conf"))
         limits = self.read("units/service-failover-repair@.service.d/20-limits.conf")
         self.assertRegex(limits, r"(?m)^OnFailure=$")
-        self.assertNotRegex(limits, r"(?m)^StartLimit")  # a limit on an instance is lost when systemd unloads it
+        # systemd's start counter of an instance is lost when it is unloaded, so the script limits sessions; the instance itself
+        # must never be refused: a fast crash loop of the unit fires OnFailure= on every crash, and the start that reports
+        # the final failure was refused on 2026-11-10 22:55:09 ("Start request repeated too quickly")
+        self.assertRegex(limits, r"(?m)^StartLimitIntervalSec=0$")
+        self.assertNotRegex(limits, r"(?m)^StartLimitBurst")
         self.assertGreater("20-limits.conf", "15-failover-repair.conf")  # drop-ins apply in file name order
 
 
@@ -384,8 +517,8 @@ class InstallTest(Base):
         (skill / "rig-detached-omp").write_text("#!/bin/sh\n")
         (skill / "rig-detached-omp").chmod(0o755)
 
-    def run_install(self, *args, config=None):
-        env = {**self.env, **self.dirs}
+    def run_install(self, *args, config=None, **extra_env):
+        env = {**self.env, **self.dirs, **extra_env}
         if config is not None:
             env["UBUNTU_TWEAK_MODULE_CONFIG"] = config
         return subprocess.run(["bash", str(INSTALL), *args], capture_output=True, text=True, env=env)
@@ -414,6 +547,26 @@ class InstallTest(Base):
         self.assertEqual(result.returncode, 3)
         self.assertIn("differs:", result.stdout)
         self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_a_drop_in_nobody_declared_in_the_repair_template_is_drift_and_is_removed(self):
+        # a leftover smoke-test drop-in set SERVICE_FAILOVER_DRY_RUN=1 on the live machine: every repair was a dry run
+        self.run_install()
+        smoke = self.root / "u" / "service-failover-repair@.service.d" / "90-smoke-dry.conf"
+        smoke.write_text("[Service]\nEnvironment=SERVICE_FAILOVER_DRY_RUN=1\n")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        self.assertIn(f"stale: {smoke}", check.stdout)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(smoke.exists())
+        self.assertEqual(self.run_install("--check").returncode, 0)
+        self.assertTrue((self.root / "u" / "service-failover-repair@.service.d" / "20-limits.conf").is_file())
+
+    def test_a_missing_desktop_notifier_is_drift_because_the_repair_stack_could_not_tell_the_user(self):
+        self.run_install()
+        check = self.run_install("--check", SERVICE_FAILOVER_NOTIFY="no-such-notifier")
+        self.assertEqual(check.returncode, 3)
+        self.assertIn("missing: no-such-notifier", check.stdout)
         self.assertEqual(self.run_install("--check").returncode, 0)
 
     def test_restart_only_installs_no_repair_stack(self):
