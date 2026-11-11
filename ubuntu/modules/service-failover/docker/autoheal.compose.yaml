@@ -1,0 +1,18 @@
+# Restarts any container whose HEALTHCHECK reports `unhealthy` (Docker's restart policy only reacts to an exit; with
+# restart: unless-stopped it already backs off and never gives up on a container that exits). Containers without a
+# HEALTHCHECK are not touched. The docker socket is mounted: autoheal can restart any container on the host.
+# The image is pinned by digest, not by tag: a re-pushed tag would run as root on the host (the socket is mounted).
+name: service-failover-autoheal
+services:
+  autoheal:
+    image: willfarrell/autoheal:1.2.0@sha256:31f580ef0279eaced5b38d631b08c474d70d8403c1c2fdd6ddcf2e879d5f3f7c
+    container_name: autoheal
+    restart: always
+    network_mode: none
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: all
+      AUTOHEAL_INTERVAL: "10"
+      AUTOHEAL_START_PERIOD: "120"
+      AUTOHEAL_DEFAULT_STOP_TIMEOUT: "10"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

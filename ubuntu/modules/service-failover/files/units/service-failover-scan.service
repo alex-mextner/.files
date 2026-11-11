@@ -1,0 +1,8 @@
+[Unit]
+Description=service-failover: find failed or restart-looping services on this and the listed hosts
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/service-failover-scan
+TimeoutStartSec=180
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

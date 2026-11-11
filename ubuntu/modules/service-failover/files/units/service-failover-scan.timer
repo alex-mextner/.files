@@ -1,0 +1,10 @@
+[Unit]
+Description=service-failover: periodic scan for failed services
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
