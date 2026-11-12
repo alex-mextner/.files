@@ -7,6 +7,7 @@ out of install.sh and run against a temp HOME; the real ./relogin asks a DevTool
 
 import os
 import subprocess
+import time
 
 from test_control_audit_install import between, harness
 from test_install import fake_bin, home  # noqa: F401  (fixtures)
@@ -17,10 +18,15 @@ DISPLAY_HINT = "needs the desktop session's DISPLAY"
 HOME_UNIT = "chatgpt-guardian-home"
 
 
-def down_hint(home, *, port, domain, units=(HOME_UNIT,)):
+def down_hint(home, *, port, domain, units=(HOME_UNIT,), fast=True):
+    """What apply prints for `units` that stayed down; `fast` gives relogin the tests' own short waits instead of apply's bounds."""
     body = f"home_domain={domain!r}\nhome_port={port}\n{HINT_FUNCTIONS}\ndown_hint {' '.join(units)}"
-    env = {**os.environ, "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_ACCOUNT_TIMEOUT": "0.5", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
+    env = {**os.environ, "UBUNTU_TWEAK_LANG": "en"}
     env.pop("UBUNTU_TWEAK_MODULE_CONFIG", None)
+    for name in ("CHATGPT_RELOGIN_ACCOUNT_TIMEOUT", "CHATGPT_RELOGIN_PROBE_TIMEOUT"):
+        env.pop(name, None)
+    if fast:
+        env.update(CHATGPT_RELOGIN_ACCOUNT_TIMEOUT="0.5", CHATGPT_RELOGIN_PROBE_TIMEOUT="1")
     done = subprocess.run(["bash", "-c", harness(home, body)], env=env, capture_output=True, text=True, timeout=60, check=False)
     assert done.returncode == 0, done.stderr
     return done.stdout
@@ -53,3 +59,9 @@ def test_units_other_than_the_home_guardian_keep_the_display_hint(home, devtools
     server = devtools([CHATGPT_TAB], session("app.glide.vc"))
     text = down_hint(home, port=server.port, domain="gmail.com", units=("chatgpt-guardian-glide", "chatgpt-guardian-home-browser"))
     assert DISPLAY_HINT in text and "refuses" not in text
+
+
+def test_the_hint_never_waits_for_a_silent_browser_as_long_as_the_guardians_own_start_check(home):
+    started = time.monotonic()
+    assert DISPLAY_HINT in down_hint(home, port=1, domain="gmail.com", fast=False)
+    assert time.monotonic() - started < 20  # relogin's own default waits 30 s for an answer
