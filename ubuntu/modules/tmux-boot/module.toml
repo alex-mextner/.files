@@ -30,16 +30,17 @@ preview = "install.sh --plan"
 # starts at graphical login instead of at boot. Once the bus is there the unit is the only start path.
 
 [[coverage]]
-match = ["unit:tmux-boot.service", "file:~/.local/bin/tmux-boot"]
+match = [
+  "unit:tmux-autosave.service", "unit:tmux-autosave.timer", "unit:tmux-boot.service",
+  "unit:tmux-watchdog.service", "unit:tmux-watchdog.timer",
+  "file:~/.local/bin/tmux-alert", "file:~/.local/bin/tmux-autosave", "file:~/.local/bin/tmux-boot",
+  "file:~/.local/bin/tmux-lib", "file:~/.local/bin/tmux-recover", "file:~/.local/bin/tmux-resurrect-save",
+  "file:~/.local/bin/tmux-save-debounce", "file:~/.local/bin/tmux-save-now", "file:~/.local/bin/tmux-watchdog",
+]
 class = "tracked"
-reason = "written by the tmux-boot module"
+reason = "written by the tmux-boot module: install.sh installs exactly these named scripts and units (tests/test_install.py keeps this list equal to what the module ships), so a leftover copy of an asset the module dropped, or an unrelated tmux-* file, shows up as untracked instead of being claimed by a glob"
 
 [[coverage]]
 match = ["file:~/.config/autostart/tmux-boot.desktop"]
 class = "tracked"
 reason = "the tmux-boot module's failover entry when there is no user systemd bus"
-
-[[coverage]]
-match = ["unit:tmux-autosave.service", "unit:tmux-autosave.timer", "file:~/.local/bin/tmux-autosave"]
-class = "tracked"
-reason = "written by the tmux-boot module: the timer-driven tmux autosave"

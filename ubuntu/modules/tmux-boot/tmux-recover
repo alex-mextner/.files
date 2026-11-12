@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# tmux-recover: the boot script `rig omp watchdog --boot-script` runs when the tmux server is CONFIRMED dead (its saved
+# identity is gone and no process owns the socket). rig gives a boot script 15 seconds, and tmux-boot may wait up to
+# TMUX_BOOT_WAIT for continuum, so this starts tmux-boot detached and returns as soon as the server answers; the
+# restore finishes on its own, through tmux-boot's restore-loop guard and its choice of the newest non-degenerate
+# snapshot. Exit 0: a server answers. Exit 1: none did within 12 seconds (tmux-boot.log under the state dir says why).
+set -u
+
+dir=$(dirname "$(readlink -f "$0")")
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+state=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+mkdir -p "$state" 2>/dev/null || { echo "tmux-recover: cannot create $state" >&2; exit 1; }
+unset TMUX
+
+setsid -f "$dir/tmux-boot" >> "$state/recover.log" 2>&1 < /dev/null
+for _ in $(seq 1 12); do
+  if "$tmux_bin" list-sessions >/dev/null 2>&1; then echo "tmux-recover: a tmux server is up again"; exit 0; fi
+  sleep 1
+done
+echo "tmux-recover: no tmux server within 12s, see $state/recover.log" >&2
+exit 1

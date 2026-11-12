@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# tmux-resurrect-save: the thin wrapper @resurrect-save-script-path points at (set by tmux-autosave and tmux-watchdog), so
+# that tmux-continuum's own trigger, which starts `$(@resurrect-save-script-path) quiet` in the background, goes through
+# tmux-save-now's guard too: single flight, the degenerate-snapshot check, retention. The path of tmux-resurrect's real
+# save script stays in the server option @tmux-boot-resurrect-save-script (tmux-save-now calls it from there).
+exec "$(dirname "$(readlink -f "$0")")/tmux-save-now" --reason continuum "$@"

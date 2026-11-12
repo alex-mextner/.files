@@ -1,0 +1,367 @@
+#!/usr/bin/env bash
+# tmux-lib: functions shared by the tmux-boot module's scripts. It is SOURCED (`. "$(dirname "$(readlink -f "$0")")/tmux-lib"`),
+# never run, and installed next to them so one copy of each rule serves tmux-boot, tmux-autosave and the guard scripts.
+#
+# `tmux_bin` (default tmux) names the tmux executable every function talks to; the tests point it at a throwaway socket.
+
+tl_option() { "${tmux_bin:-tmux}" show-option -gqv "$1" 2>/dev/null; }
+
+# A whole number the way bash arithmetic wants it: decimal, so a leading zero ("08", which tmux options and
+# environment variables may carry) is never read as an invalid octal literal. Only digits pass; the caller decides
+# what an empty or non-numeric value means. tmux-autosave and tmux-watchdog share this one normalisation.
+tl_number() { case $1 in ''|*[!0-9]*) return 1 ;; esac; printf '%s\n' "$((10#$1))"; }
+
+# The snapshot directory exactly as tmux-resurrect's helpers.sh resolves it: @resurrect-dir, else ~/.tmux/resurrect when
+# that exists, else $XDG_DATA_HOME/tmux/resurrect; then `$HOME`, `$HOSTNAME` (hostname's output) and every `~` are
+# expanded, in that order (helpers.sh pipes the value through sed "s,\$HOME,..,g; s,\$HOSTNAME,..,g; s,\~,..,g").
+tl_resurrect_dir() {
+  local dir host
+  dir=$(tl_option @resurrect-dir)
+  if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+  fi
+  dir=${dir//\$HOME/"$HOME"}
+  # one hostname call, and only when the value can use it
+  # shellcheck disable=SC2016  # $HOSTNAME stays literal: it is the marker being searched for, not an expansion
+  if [[ $dir == *'$HOSTNAME'* ]]; then
+    host=$(hostname 2>/dev/null || uname -n)
+    dir=${dir//\$HOSTNAME/"$host"}
+  fi
+  dir=${dir//\~/"$HOME"}
+  printf '%s\n' "$dir"
+}
+
+# A fingerprint of what a tmux-resurrect save leaves in its directory: the directory's own modification time (a snapshot
+# is created or replaced there, even the identical one resurrect writes and deletes again), the pane-contents archive's
+# (rewritten in place, which does not touch the directory) and where `last` points. Nanosecond resolution, and `stat -L`
+# because the directory itself may be a symlink (stat without -L reports the link, which never changes). Two
+# fingerprints taken around a save differ if and only if the save wrote something; a mere timestamp comparison with the
+# start second cannot tell a save from a directory that was created in that same second.
+tl_save_signature() {
+  local d=$1
+  printf '%s|%s|%s' \
+    "$(stat -L -c %.9Y -- "$d" 2>/dev/null)" \
+    "$(stat -L -c %.9Y -- "$d/pane_contents.tar.gz" 2>/dev/null)" \
+    "$(readlink -- "$d/last" 2>/dev/null)"
+}
+
+# ── paths and state ────────────────────────────────────────────────────────────────────────────────────────────────
+
+# the directory the scripts (and so the wrapper, the debouncer, tmux-alert) were installed to
+tl_dir() { dirname "$(readlink -f "${BASH_SOURCE[0]}")"; }
+tl_state_dir() { printf '%s\n' "${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}"; }
+tl_set_option() { "${tmux_bin:-tmux}" set-option -g "$1" "$2" 2>/dev/null; }
+
+# tmux-alert is the one place that rate-limits and sends; a missing or failing alerter never fails the caller
+tl_alert() { # tl_alert MESSAGE KEY
+  local alert
+  alert=$(tl_dir)/tmux-alert
+  [ -x "$alert" ] || alert=$(command -v tmux-alert 2>/dev/null || true)
+  [ -n "$alert" ] || return 0
+  "$alert" "$1" --key "$2" >&2 || true
+}
+
+# ── the saver: every save path goes through tmux-save-now ───────────────────────────────────────────────────────────
+
+# tmux-resurrect's own save script, whichever way the server names it: @resurrect-save-script-path unless that is our
+# wrapper, else the copy stashed in @tmux-boot-resurrect-save-script when the wrapper was put in place, else the plugin's
+# default location
+tl_real_saver() {
+  local cur stash default
+  cur=$(tl_option @resurrect-save-script-path)
+  stash=$(tl_option @tmux-boot-resurrect-save-script)
+  default=$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh
+  if [ -n "$cur" ] && [ "$(basename "$cur")" != tmux-resurrect-save ] && [ -x "$cur" ]; then printf '%s\n'  "$cur"
+  elif [ -n "$stash" ] && [ -x "$stash" ]; then printf '%s\n' "$stash"
+  elif [ -x "$default" ]; then printf '%s\n' "$default"
+  fi
+}
+
+# Point @resurrect-save-script-path at tmux-resurrect-save (so tmux-continuum's own status-right trigger is guarded too),
+# keeping resurrect's path in @tmux-boot-resurrect-save-script. Idempotent; prints what it changed, nothing otherwise.
+# Re-sourcing tmux.conf or a plugin update makes resurrect set its own path again: the next run puts the wrapper back.
+tl_assert_saver() {
+  local wrapper cur
+  wrapper=$(tl_dir)/tmux-resurrect-save
+  [ -x "$wrapper" ] || return 0
+  cur=$(tl_option @resurrect-save-script-path)
+  [ "$cur" != "$wrapper" ] || return 0
+  if [ -n "$cur" ] && [ "$(basename "$cur")" != tmux-resurrect-save ]; then
+    tl_set_option @tmux-boot-resurrect-save-script "$cur"
+  elif [ -z "$(tl_option @tmux-boot-resurrect-save-script)" ]; then
+    return 0 # nothing to wrap: tmux-resurrect is not loaded in this server
+  fi
+  tl_set_option @resurrect-save-script-path "$wrapper"
+  echo "@resurrect-save-script-path now points at $wrapper (was '$cur')"
+}
+
+# ── snapshots ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+# "PANES WINDOWS AGENTS SESSIONS" of a tmux-resurrect snapshot; AGENTS are panes running omp, claude or codex
+tl_snapshot_stats() {
+  [ -r "$1" ] || { echo "0 0 0 0"; return 0; }
+  awk -F'\t' '
+    $1 == "pane" { p++; s[$2] = 1; if ($10 ~ /^(omp|claude|codex)$/ || $11 ~ /(^|[ \/:])(omp|claude|codex)( |$)/) h++ }
+    $1 == "window" { w++ }
+    END { n = 0; for (k in s) n++; print p + 0, w + 0, h + 0, n }' "$1"
+}
+
+# tl_degenerate_reason PREVIOUS CURRENT: prints why CURRENT must not replace PREVIOUS and returns 0, or returns 1 when
+# it is a legitimate successor. The percentage rules (TMUX_SAVE_NOW_TOLERANCE, default 50) apply from
+# TMUX_SAVE_NOW_MIN_PANES (default 4) panes/windows in PREVIOUS, so closing a pane or two of a small layout is never
+# held back.
+tl_degenerate_reason() {
+  local tol=$((10#${TMUX_SAVE_NOW_TOLERANCE:-50})) min=$((10#${TMUX_SAVE_NOW_MIN_PANES:-4}))
+  local pp pw ph np nw nh
+  read -r pp pw ph _ <<<"$(tl_snapshot_stats "$1")"
+  read -r np nw nh _ <<<"$(tl_snapshot_stats "$2")"
+  if [ "$np" -eq 0 ]; then echo "the snapshot holds no pane"; return 0; fi
+  if [ "$ph" -gt 0 ] && [ "$nh" -eq 0 ]; then
+    echo "no omp/claude/codex pane, the previous snapshot had $ph"; return 0
+  fi
+  if [ "$pw" -ge 3 ] && [ "$nw" -le 1 ]; then
+    echo "a bare single window after $pw windows"; return 0
+  fi
+  if [ "$pp" -ge "$min" ] && [ $(((pp - np) * 100)) -gt $((pp * tol)) ]; then
+    echo "panes fell from $pp to $np (more than $tol%)"; return 0
+  fi
+  if [ "$pw" -ge "$min" ] && [ $(((pw - nw) * 100)) -gt $((pw * tol)) ]; then
+    echo "windows fell from $pw to $nw (more than $tol%)"; return 0
+  fi
+  return 1
+}
+
+# tl_point_symlink LINK TARGET: atomically (re)point a symlink
+tl_point_symlink() {
+  local tmp="$1.tmp.$$"
+  ln -s -- "$2" "$tmp" && mv -T -- "$tmp" "$1"
+}
+
+# keep the newest N files of DIR (names sort by time)
+tl_prune_dir_count() {
+  local files=() n i
+  files=("$1"/*)
+  [ -e "${files[0]}" ] || return 0
+  n=${#files[@]}
+  for ((i = 0; i < n - $2; i++)); do rm -f -- "${files[i]}"; done
+}
+
+# Retention for the snapshots in RDIR: the newest KEEP, plus the newest of each of the last DAYS days; never the target
+# of `last`, `last-with-harness` or `last-guarded`. A snapshot's pane archive (pane_contents_<stamp>.tar.gz) and session
+# maps (maps/<stamp>/) go with it.
+tl_prune_snapshots() {
+  local rdir=$1 keep=$2 days=$3
+  local files=() n i f name stamp day cutoff seen=" " protect_last protect_harness protect_guarded
+  files=("$rdir"/tmux_resurrect_*.txt)
+  [ -e "${files[0]}" ] || return 0
+  n=${#files[@]}
+  protect_last=$(readlink -f -- "$rdir/last" 2>/dev/null || true)
+  protect_harness=$(readlink -f -- "$rdir/last-with-harness" 2>/dev/null || true)
+  protect_guarded=$(readlink -f -- "$rdir/last-guarded" 2>/dev/null || true)
+  cutoff=$(date -d "-$days days" +%Y%m%d)
+  for ((i = n - 1; i >= 0; i--)); do
+    f=${files[i]}
+    name=${f##*/}
+    stamp=${name#tmux_resurrect_}
+    stamp=${stamp%.txt}
+    day=${stamp:0:8}
+    if [ $((n - 1 - i)) -lt "$keep" ]; then seen+="$day "; continue; fi
+    if { [[ $day > $cutoff ]] || [[ $day == "$cutoff" ]]; } && [[ $seen != *" $day "* ]]; then seen+="$day "; continue; fi
+    if [ "$(readlink -f -- "$f")" = "$protect_last" ] || [ "$(readlink -f -- "$f")" = "$protect_harness" ] || [ "$(readlink -f -- "$f")" = "$protect_guarded" ]; then continue; fi
+    rm -f -- "$f" "$rdir/pane_contents_$stamp.tar.gz"
+    rm -rf -- "${rdir:?}/maps/$stamp"
+  done
+}
+
+# ── event hooks: the trigger that no status line, client or `set -g status-right` can wipe ──────────────────────────
+
+# Session-level hooks (`set-hook -g`) and window-level hooks (`set-hook -gw`) that fire when the layout changes, chosen
+# from tmux 3.6's lists (`tmux show-hooks -g` / `-gw`): sessions and windows appearing and going away, panes going
+# away. `window-renamed` is deliberately NOT hooked: tmux fires it for automatic renames too, and automatic-rename
+# is on by default, so it would follow nearly every shell command with a save; a deliberate rename (rig and the user
+# name windows after tickets) is state worth saving, and the next snapshot the 5-minute timer takes holds it.
+TL_SESSION_HOOKS="session-created session-closed window-linked window-unlinked after-new-window after-split-window after-kill-pane"
+TL_WINDOW_HOOKS="pane-exited"
+# Every hook array index this module owns lies in 940-959 and its command contains the debouncer's name: that is how the
+# module recognises its own entries, and why it never touches anyone else's.
+TL_HOOK_MARK=tmux-save-debounce
+TL_HOOK_FIRST=940
+TL_HOOK_LAST=959
+
+# tl_assert_hook HOOK SCOPE(-g|-gw): HOOK runs the debouncer from exactly one array slot of ours. Prints a line for what it
+# changed; a hook that is already right prints nothing and writes nothing. tmux prints a hook's entries as
+# `name[index] command` (a hook without entries as the bare name) and strips the quotes of the command.
+tl_assert_hook() {
+  local hook=$1 scope=$2 line idx slot="" current="" used=" " cmd want
+  cmd="$(tl_dir)/$TL_HOOK_MARK"
+  want="run-shell -b '$cmd'"
+  while IFS= read -r line; do
+    case $line in "${hook}["*"] "*) ;; *) continue ;; esac
+    idx=${line#"$hook"[}
+    idx=${idx%%]*}
+    case $idx in ''|*[!0-9]*) continue ;; esac
+    used+="$idx "
+    [ "$idx" -ge "$TL_HOOK_FIRST" ] && [ "$idx" -le "$TL_HOOK_LAST" ] || continue
+    case $line in *"$TL_HOOK_MARK"*) ;; *) continue ;; esac
+    if [ -z "$slot" ]; then
+      slot=$idx
+      current=${line#*"] "}
+    else
+      "${tmux_bin:-tmux}" set-hook "$scope" -u "${hook}[$idx]" 2>/dev/null && echo "removed the duplicate ${hook}[$idx]"
+    fi
+  done < <("${tmux_bin:-tmux}" show-hooks "$scope" "$hook" 2>/dev/null)
+  [ "$current" != "run-shell -b $cmd" ] || return 0
+  if [ -z "$slot" ]; then
+    for ((idx = TL_HOOK_FIRST; idx <= TL_HOOK_LAST; idx++)); do
+      case $used in *" $idx "*) ;; *) slot=$idx; break ;; esac
+    done
+    [ -n "$slot" ] || return 0 # all 20 slots taken by somebody else: leave the hook alone
+  fi
+  "${tmux_bin:-tmux}" set-hook "$scope" "${hook}[$slot]" "$want" 2>/dev/null && echo "hook ${hook}[$slot] set"
+  return 0
+}
+
+tl_assert_hooks() {
+  local h
+  for h in $TL_SESSION_HOOKS; do tl_assert_hook "$h" -g; done
+  for h in $TL_WINDOW_HOOKS; do tl_assert_hook "$h" -gw; done
+}
+
+# ── choosing what a boot restores ───────────────────────────────────────────────────────────────────────────────────
+
+# The newest snapshot of RDIR that tmux-save-now's rules would have accepted, as a basename (nothing when there is none):
+# the snapshots are replayed oldest to newest against the same degeneracy rules (tl_degenerate_reason), a degenerate one
+# is skipped, and a smaller state that persisted TMUX_SAVE_NOW_ACCEPT_AFTER seconds counts as the new reality. `last` is
+# normally exactly this; it differs when something wrote a snapshot behind the guard's back (resurrect's own key binding,
+# an older module version) or the pointer was lost.
+tl_good_snapshot() {
+  local rdir=$1 f baseline="" chosen="" since=0 mt np accept=${TMUX_SAVE_NOW_ACCEPT_AFTER:-21600}
+  local files=() cur guarded
+  # the guard's own acceptance beats the replay: when `last` names the snapshot tmux-save-now last accepted (--force
+  # or the 6-hour rule; the symlink is written on every accept), a boot must not "fall back" from it to the older,
+  # richer layout the user deliberately left. Rejected snapshots live in degenerate/, so the replay below would
+  # otherwise judge the accepted one against that older baseline and start its 6-hour clock at its own mtime.
+  cur=$(basename "$(readlink -f -- "$rdir/last" 2>/dev/null)" 2>/dev/null || true)
+  guarded=$(basename "$(readlink -f -- "$rdir/last-guarded" 2>/dev/null)" 2>/dev/null || true)
+  if [ -n "$cur" ] && [ "$cur" = "$guarded" ] && [ -f "$rdir/$cur" ]; then printf '%s\n' "$cur"; return 0; fi
+  files=("$rdir"/tmux_resurrect_*.txt)
+  [ -e "${files[0]}" ] || return 0
+  for f in "${files[@]}"; do
+    read -r np _ <<<"$(tl_snapshot_stats "$f")"
+    [ "$np" -gt 0 ] || continue
+    mt=$(stat -L -c %Y -- "$f" 2>/dev/null || echo 0)
+    if [ -z "$baseline" ]; then baseline=$f; chosen=$f; continue; fi
+    if tl_degenerate_reason "$baseline" "$f" >/dev/null; then
+      [ "$since" -ne 0 ] || since=$mt
+      if [ $((mt - since)) -ge "$accept" ]; then baseline=$f; chosen=$f; since=0; fi
+    else
+      baseline=$f; chosen=$f; since=0
+    fi
+  done
+  [ -z "$chosen" ] || basename "$chosen"
+}
+
+# Make `last` point at the snapshot a restore should use (tl_good_snapshot; when that finds nothing, last-with-harness),
+# with that snapshot's own pane archive and session maps put back beside it. Prints one line when it changed `last`.
+tl_prepare_restore() {
+  local rdir=$1 map_dir=${2:-$HOME/.config/rig/tmux} good cur stamp m
+  good=$(tl_good_snapshot "$rdir")
+  if [ -z "$good" ] && [ -e "$rdir/last-with-harness" ]; then good=$(basename "$(readlink -f "$rdir/last-with-harness")"); fi
+  [ -n "$good" ] && [ -f "$rdir/$good" ] || return 0
+  cur=$(basename "$(readlink -f "$rdir/last" 2>/dev/null)" 2>/dev/null || true)
+  [ "$cur" != "$good" ] || return 0
+  tl_point_symlink "$rdir/last" "$good"
+  stamp=${good#tmux_resurrect_}; stamp=${stamp%.txt}
+  [ ! -f "$rdir/pane_contents_$stamp.tar.gz" ] || cp -p -- "$rdir/pane_contents_$stamp.tar.gz" "$rdir/pane_contents.tar.gz"
+  for m in "$rdir/maps/$stamp"/*-sessions.map; do [ ! -f "$m" ] || cp -p -- "$m" "$map_dir/"; done
+  echo "last pointed at ${cur:-nothing}, which is not a snapshot to restore; restoring $good"
+}
+
+# Restore-loop guard: tl_restore_attempts STATE prints how many restore attempts the last hour holds (older lines are
+# dropped); tl_record_restore STATE adds one. A server that keeps dying during or after a restore must not be restored
+# again and again.
+tl_restore_attempts() {
+  local file="$1/restore-attempts" now n=0 t recent=()
+  now=$(date +%s)
+  [ -f "$file" ] || { echo 0; return 0; }
+  while IFS= read -r t; do
+    case $t in ''|*[!0-9]*) continue ;; esac
+    [ $((now - t)) -lt 3600 ] || continue
+    recent+=("$t"); n=$((n + 1))
+  done < "$file"
+  if [ "${#recent[@]}" -gt 0 ]; then printf '%s\n' "${recent[@]}" > "$file"; else : > "$file"; fi
+  echo "$n"
+}
+tl_record_restore() { date +%s >> "$1/restore-attempts"; }
+
+# ── which agents run in the server's panes ──────────────────────────────────────────────────────────────────────────
+
+# The agent kinds (omp, claude, codex) that run in a pane of the server, one per line, found the way rig's generated save
+# scripts and riglib/omp_recovery.py find them, so "a pane runs an agent" here means "rig writes a map line for it":
+#   omp     the pane's #{pane_current_command} is `omp`; or the pane's process or a descendant is an interactive omp: argv[0]
+#           `omp`/`*/omp`, or `bun`/`node` running exactly one argument that ends in the coding-agent source entrypoint
+#           (packages/coding-agent/src/cli.ts), and neither a subcommand (omp ps, omp read, ...), nor -p/--print/--help/
+#           --version, nor --mode other than text, nor a __omp_worker_ process (omp_recovery.is_interactive_omp)
+#   claude  a DESCENDANT of the pane's shell has argv[0] `claude`, `*/claude` or `*/claude/versions/*`: Claude Code shows
+#           up as its VERSION in #{pane_current_command}, so the pane's command never says `claude` (cc-save.sh)
+#   codex   a descendant with argv[0] `codex` or `*/codex` (codex-save.sh)
+# Only argv[0] decides what a process is: a `grep x .../claude/versions/` or `vim claude.md` in a pane is not an agent.
+tl_pane_agents() {
+  local panes procs
+  panes=$("${tmux_bin:-tmux}" list-panes -a -F '#{pane_pid}	#{pane_current_command}' 2>/dev/null) || return 0
+  procs=$(ps -eo pid=,ppid=,args= 2>/dev/null) || procs=""
+  {
+    printf '%s\n' "$panes" | sed 's/^/P\t/'
+    printf '%s\n' "$procs" | sed 's/^/S /'
+  } | awk '
+    BEGIN {
+      n = split("acp agents auth-broker collab compress config dry-balance gallery gc images install join models plugin ps read render say search setup share shell ssh stats tiny-models token ttsr help version", c, " ")
+      for (i = 1; i <= n; i++) command[c[i]] = 1
+    }
+    function interactive(t, nt, start,   i, a) {
+      if (start <= nt && (t[start] in command)) return 0
+      for (i = start; i <= nt; i++) {
+        a = t[i]
+        if (a ~ /^__omp_worker_/) return 0
+        if (a == "-p" || a == "--print" || a == "--help" || a == "-h" || a == "--version" || a == "-V") return 0
+        if (a ~ /^--mode=/ && a != "--mode=text") return 0
+        if (a == "--mode" && t[i + 1] != "text") return 0
+      }
+      return 1
+    }
+    function kind(line,   t, nt, e, b, i, hits, at) {
+      nt = split(line, t, " ")
+      e = t[4]
+      if (e == "claude" || e ~ /\/claude$/ || e ~ /\/claude\/versions\//) return "claude"
+      if (e == "codex" || e ~ /\/codex$/) return "codex"
+      b = e; sub(/.*\//, "", b)
+      if (b == "omp") return interactive(t, nt, 5) ? "omp" : "omp-no"
+      if (b == "bun" || b == "node") {
+        hits = 0
+        for (i = 5; i <= nt; i++) if (t[i] ~ /\/packages\/coding-agent\/src\/cli\.ts$/ || t[i] ~ /\/packages\/coding-agent\/scripts\/\.\.\/src\/cli\.ts$/) { hits++; at = i }
+        if (hits == 1) return interactive(t, nt, at + 1) ? "omp" : "omp-no"
+      }
+      return ""
+    }
+    $1 == "P" { split($0, f, "\t"); roots[++nr] = f[2]; cmd[nr] = f[3]; next }
+    $1 == "S" { line[$2] = $0; kids[$3] = kids[$3] " " $2 }
+    END {
+      for (i = 1; i <= nr; i++) {
+        sp = 1; stack[1] = roots[i]; saw = 0; inter = 0
+        while (sp > 0) {
+          cur = stack[sp--]
+          if (cur in line) {
+            k = kind(line[cur])
+            if (k == "omp") inter = 1
+            else if (k == "omp-no") saw = 1
+            else if (k != "") found[k] = 1
+          }
+          m = split(kids[cur], c2, " ")
+          for (j = 1; j <= m; j++) stack[++sp] = c2[j]
+        }
+        # the pane command `omp` stands for itself only when the process table says nothing against it
+        if (inter || (cmd[i] == "omp" && !saw)) found["omp"] = 1
+      }
+      for (k in found) print k
+    }'
+}

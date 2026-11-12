@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# tmux-watchdog: every few minutes (tmux-watchdog.timer) assert, from OUTSIDE the tmux server, that the save/restore
+# chain is intact; repair what can be repaired; tell the phone (tmux-alert, rate limited) about the rest.
+#
+# Why: the autosave died for 16 days (incident 2026-11-08) and nothing noticed. The Moshi iOS client runs
+# `set -g status-right` with no value on every attach, which empties continuum's status-line trigger for good. Every
+# invariant below is one whose silent failure costs the workspace; each is checked by something that does not depend
+# on that trigger.
+#
+# Invariants (a violation is a PROBLEM unless the line says report only):
+#   server        a tmux server runs (see "recovery" for when it does not)
+#   saver         @resurrect-save-script-path is tmux-resurrect-save, so continuum's own trigger is guarded;
+#                 self-heal: point it back, keep resurrect's path in @tmux-boot-resurrect-save-script
+#   hooks         the layout hooks that run the debounced save are in the server's hook table; self-heal: set them
+#   rig hooks     @resurrect-hook-post-save-all / -post-restore-all are set in the server (they write and replay the
+#                 omp/claude/codex session maps); self-heal: set them from rig's generated rig.tmux.conf
+#   rig conf      ~/.config/rig/tmux/rig.tmux.conf still holds both hooks and the scripts they name exist: loud, no
+#                 self-heal (`rig apply` rewrites that file wholesale, so a rig that forgets the hooks must be fixed in rig)
+#   interval      @continuum-save-interval is a number > 0; self-heal: from rig.tmux.conf when it names one
+#   timer         tmux-autosave.timer is enabled and active; tmux-boot.service and the shutdown units
+#                 (tmux-shutdown-save.service, tmux-shutdown-watch.service) are enabled and loaded when their unit files
+#                 exist; self-heal: `systemctl --user enable --now`
+#   fresh         while panes exist, a save ran within 2x the continuum interval (a snapshot written, an identical one
+#                 left alone, or a degenerate one held back all count: tmux-save-now's status says so); self-heal: force
+#                 `tmux-save-now --reason watchdog`
+#   maps          while omp/claude/codex panes exist, rig's omp/cc/codex session map exists, is not empty and is as
+#                 fresh; self-heal: the same forced save (rig's post-save hook writes the maps)
+#   status-right  (report only) continuum's token is missing from status-right: clients such as Moshi wipe it on every
+#                 attach and the timer and the layout hooks do not depend on it, so this never alerts or heals
+#
+# It never restarts or kills a tmux server and never touches a session. Self-healing an invariant also alerts (once per
+# 6 h per kind): somebody should know the chain broke, even when it mended itself.
+#
+# Recovery (OFF by default): when the server is gone although tmux-boot started one earlier in THIS boot, the server
+# died unexpectedly. With recovery on, `rig omp watchdog` (identity-checked: it never starts a second server while any
+# process still owns the socket) runs tmux-recover, i.e. tmux-boot: a new server restored from the newest non-degenerate
+# snapshot, the harnesses relaunched by rig's hooks, under tmux-boot's restore-loop guard.
+#   tmux-watchdog recovery on|off|status       (state file recover-enabled in the state dir; TMUX_WATCHDOG_RECOVER=1 forces on)
+#
+# Exit 0: every invariant holds or was healed. Exit 1: a problem remains (the unit shows failed, the reason is in
+# `journalctl --user -u tmux-watchdog`). Exit 2: usage.
+#
+#   TMUX_AUTOSAVE_TMUX      tmux executable, one word (default tmux)
+#   TMUX_BOOT_STATE_DIR     state directory (default ~/.local/state/tmux-boot)
+#   TMUX_SAVE_NOW_MAP_DIR   rig's session maps (default ~/.config/rig/tmux)
+#   TMUX_WATCHDOG_RIG_CONF  rig's generated tmux config (default ~/.config/rig/tmux/rig.tmux.conf)
+#   TMUX_WATCHDOG_UNIT_DIR  where the user units live (default ~/.config/systemd/user)
+#   TMUX_WATCHDOG_SOCKET    the tmux socket recovery guards (default ${TMUX_TMPDIR:-/tmp}/tmux-UID/default)
+#   TMUX_WATCHDOG_RIG       the rig executable (default rig)
+set -u
+
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+unset TMUX
+
+dir=$(dirname "$(readlink -f "$0")")
+# shellcheck source=tmux-lib
+. "$dir/tmux-lib" || { echo "tmux-watchdog: cannot load $dir/tmux-lib" >&2; exit 1; }
+# a helper that is missing or was renamed would make "no agent runs in any pane" read as healthy: refuse to run instead
+for fn in tl_pane_agents tl_assert_saver tl_assert_hooks tl_resurrect_dir tl_number tl_alert; do
+  type "$fn" >/dev/null 2>&1 || {
+    echo "tmux-watchdog: PROBLEM: $dir/tmux-lib lacks $fn, so the invariants cannot be checked" >&2
+    "$dir/tmux-alert" "tmux-watchdog cannot run: tmux-lib lacks $fn (a partial or mismatched install)" --key tmux-problem-lib >&2 || true
+    exit 1
+  }
+done
+
+state=$(tl_state_dir)
+map_dir=${TMUX_SAVE_NOW_MAP_DIR:-$HOME/.config/rig/tmux}
+rig_conf=${TMUX_WATCHDOG_RIG_CONF:-$HOME/.config/rig/tmux/rig.tmux.conf}
+unit_dir=${TMUX_WATCHDOG_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}
+socket=${TMUX_WATCHDOG_SOCKET:-${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default}
+rig=${TMUX_WATCHDOG_RIG:-rig}
+mkdir -p "$state" 2>/dev/null || { echo "tmux-watchdog: cannot create $state" >&2; exit 1; }
+
+recovery_on() { [ "${TMUX_WATCHDOG_RECOVER:-0}" = 1 ] || [ -e "$state/recover-enabled" ]; }
+
+case "${1:-}" in
+  "") ;;
+  recovery)
+    case "${2:-status}" in
+      on) : > "$state/recover-enabled"; echo "tmux-watchdog: automatic server recovery is ON" ;;
+      off) rm -f "$state/recover-enabled"; echo "tmux-watchdog: automatic server recovery is OFF" ;;
+      status) if recovery_on; then echo "tmux-watchdog: automatic server recovery is ON"; else echo "tmux-watchdog: automatic server recovery is OFF"; fi ;;
+      *) echo "usage: tmux-watchdog [recovery on|off|status]" >&2; exit 2 ;;
+    esac
+    exit 0 ;;
+  *) echo "usage: tmux-watchdog [recovery on|off|status]" >&2; exit 2 ;;
+esac
+
+exec 6>"$state/watchdog.lock"
+flock -n 6 || { echo "tmux-watchdog: another run is in progress"; exit 0; }
+
+problems=() # "KEY|message"
+healed=()   # "KEY|message"
+problem() { problems+=("$1|$2"); echo "tmux-watchdog: PROBLEM: $2" >&2; }
+heal() { healed+=("$1|$2"); echo "tmux-watchdog: healed: $2"; }
+sc() { systemctl --user "$@"; }
+server_up() { "$tmux_bin" list-sessions >/dev/null 2>&1; }
+# a value of rig's generated config: `set -g NAME 'value'` or "value"
+rig_value() {
+  local line
+  line=$(grep -m1 -E "^set(-option)? -g $1 " "$rig_conf" 2>/dev/null) || return 1
+  line=${line#*"$1" }
+  line=${line#[\"\']}
+  line=${line%[\"\']}
+  printf '%s\n' "$line"
+}
+boot_id() { cat "${TMUX_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null; }
+# `rig omp watchdog` for the default socket (or TMUX_WATCHDOG_SOCKET). rig treats ANY stderr of its lsof socket-owner probe
+# as "inspection unavailable" and then refuses to start a server, and lsof prints warnings on stderr on hosts with
+# docker overlay mounts ("can't stat() overlay file system ..."): this host's lsof does, which makes rig's recovery
+# permanently blocked. So rig gets an lsof that runs `lsof -w` (warnings off), from a shim dir ahead of PATH.
+rig_watchdog() { # rig_watchdog TIMEOUT_SECONDS
+  local shim="$state/rig-shim" real
+  real=$(command -v lsof 2>/dev/null) || real=""
+  if [ -n "$real" ]; then
+    mkdir -p "$shim" && printf '#!/bin/sh\nexec "%s" -w "$@"\n' "$real" > "$shim/lsof.new" && chmod 755 "$shim/lsof.new" && mv -f "$shim/lsof.new" "$shim/lsof"
+  fi
+  PATH="$shim:$PATH" timeout "$1" "$rig" omp watchdog --socket "$socket" --boot-script "$dir/tmux-recover" --tmux-bin "$(command -v "$tmux_bin")" --json
+}
+
+finish() {
+  local item key msg rc=0
+  for item in "${healed[@]}"; do
+    key=${item%%|*}; msg=${item#*|}
+    tl_alert "tmux-watchdog repaired: $msg" "tmux-healed-$key"
+  done
+  for item in "${problems[@]}"; do
+    key=${item%%|*}; msg=${item#*|}
+    tl_alert "tmux-watchdog: $msg" "tmux-problem-$key"
+    rc=1
+  done
+  [ "$rc" -ne 0 ] || echo "tmux-watchdog: ok${healed[0]:+ (healed ${#healed[@]})}"
+  exit "$rc"
+}
+
+command -v "$tmux_bin" >/dev/null 2>&1 || { problem tmux-missing "tmux is not installed"; finish; }
+
+# ── server / recovery ───────────────────────────────────────────────────────────────────────────────────────────────
+if ! server_up; then
+  ours=no
+  [ -n "$(boot_id)" ] && [ "$(cat "$state/boot-id" 2>/dev/null)" = "$(boot_id)" ] && ours=yes
+  if recovery_on && [ "$ours" = yes ]; then
+    if ! command -v "$rig" >/dev/null 2>&1; then
+      problem recovery "the tmux server is gone and automatic recovery is on, but rig is not installed"
+    else
+      out=$(rig_watchdog 90 2>&1 | cut -c1-300)
+      echo "tmux-watchdog: rig omp watchdog: $out"
+      if server_up; then
+        heal server "the tmux server had died; it was started again and restored from the newest non-degenerate snapshot (rig omp watchdog: $out)"
+      else
+        problem server "the tmux server is gone and automatic recovery did not start one (rig omp watchdog: $out)"
+      fi
+    fi
+  elif [ "$ours" = yes ]; then
+    problem server "the tmux server died after tmux-boot started it this boot, and automatic recovery is off (tmux-watchdog recovery on, or run tmux-boot by hand)"
+  else
+    problem server "no tmux server is running and tmux-boot has not started one this boot (systemctl --user status tmux-boot)"
+  fi
+  server_up || finish
+fi
+# the server's identity is recorded by rig for the day it dies; cheap, and only when recovery is armed
+if recovery_on && command -v "$rig" >/dev/null 2>&1; then
+  rig_watchdog 30 >/dev/null 2>&1 || true
+fi
+
+# ── the pointers and hooks inside the server ────────────────────────────────────────────────────────────────────────
+out=$(tl_assert_saver); [ -z "$out" ] || heal saver "$out"
+while IFS= read -r line; do [ -z "$line" ] || heal hooks "$line"; done < <(tl_assert_hooks)
+case $(tl_option @resurrect-delete-backup-after) in
+  ''|*[!0-9]*) tl_set_option @resurrect-delete-backup-after 3650 ;;
+  *) [ "$(tl_option @resurrect-delete-backup-after)" -ge 3650 ] || tl_set_option @resurrect-delete-backup-after 3650 ;;
+esac
+
+for name in @resurrect-hook-post-save-all @resurrect-hook-post-restore-all; do
+  [ -z "$(tl_option "$name")" ] || continue
+  if value=$(rig_value "$name") && [ -n "$value" ]; then
+    tl_set_option "$name" "$value"
+    heal rig-hooks "$name was empty in the server, set from $rig_conf"
+  else
+    problem rig-hooks "$name is empty in the server and $rig_conf does not hold it, so the omp/claude/codex session maps are not written or replayed"
+  fi
+done
+
+if [ -r "$rig_conf" ]; then
+  for name in @resurrect-hook-post-save-all @resurrect-hook-post-restore-all; do
+    if ! value=$(rig_value "$name") || [ -z "$value" ]; then
+      problem rig-conf "$rig_conf no longer sets $name (a rig apply rewrote it wholesale): the session maps stop being written or replayed after the next server start"
+      continue
+    fi
+    IFS=';' read -ra cmds <<<"$value"
+    for c in "${cmds[@]}"; do
+      c=${c#"${c%%[![:space:]]*}"}
+      c=${c%"${c##*[![:space:]]}"}
+      [ -z "$c" ] || [ -x "${c%% *}" ] || problem rig-scripts "$name names $c, which does not exist or is not executable"
+    done
+  done
+else
+  problem rig-conf "$rig_conf is missing: a rig apply removed rig's tmux config, so the next server start has no resurrect hooks"
+fi
+
+interval=$(tl_option @continuum-save-interval)
+interval=${interval:-15}
+# decimal, never octal: "08" must not kill the limit arithmetic below (tmux-lib's one normalisation)
+if ! norm=$(tl_number "$interval"); then
+  problem interval "@continuum-save-interval is '$interval', not a whole number of minutes"
+  norm=15
+fi
+interval=$norm
+if [ "$interval" -eq 0 ]; then
+  if value=$(rig_value @continuum-save-interval) && norm=$(tl_number "$value") && [ "$norm" -gt 0 ]; then
+    tl_set_option @continuum-save-interval "$norm"
+    heal interval "@continuum-save-interval was 0 (autosave off), set to $norm from $rig_conf"
+    interval=$norm
+  else
+    problem interval "@continuum-save-interval is 0: continuum's autosave and tmux-autosave are switched off"
+    interval=15
+  fi
+fi
+
+if [ -n "$(tl_option @tmux-boot-resurrect-save-script)" ] || [ -n "$(tl_option @resurrect-save-script-path)" ]; then
+  case $("$tmux_bin" show-option -gqv status-right 2>/dev/null) in
+    *continuum_save.sh*) ;;
+    *) echo "tmux-watchdog: note: status-right carries no continuum token (a client such as Moshi emptied it); the timer and the layout hooks do not need it" ;;
+  esac
+fi
+
+# ── units ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+if sc show-environment >/dev/null 2>&1; then
+  check_unit() { # check_unit UNIT [--now]: enabled (and loaded, and for a timer active) or healed
+    local u=$1 now=${2:-} ok=1
+    [ "$(sc is-enabled "$u" 2>/dev/null)" = enabled ] || ok=0
+    [ "$(sc show -p LoadState --value "$u" 2>/dev/null)" = loaded ] || ok=0
+    if [[ $u == *.timer ]]; then sc is-active --quiet "$u" || ok=0; fi
+    [ "$ok" -eq 0 ] || return 0
+    if sc enable ${now:+--now} "$u" >/dev/null 2>&1 && [ "$(sc is-enabled "$u" 2>/dev/null)" = enabled ] \
+       && [ "$(sc show -p LoadState --value "$u" 2>/dev/null)" = loaded ]; then
+      heal "unit-$u" "$u was not enabled/loaded/active, ran systemctl --user enable ${now:+--now }$u"
+    else
+      problem "unit-$u" "$u is not enabled and loaded and systemctl --user enable $u did not fix it"
+    fi
+  }
+  check_unit tmux-autosave.timer --now
+  for u in tmux-boot.service tmux-shutdown-save.service tmux-shutdown-watch.service; do
+    [ ! -f "$unit_dir/$u" ] || check_unit "$u" --now
+  done
+else
+  echo "tmux-watchdog: note: no user systemd bus here, the unit checks are skipped"
+fi
+
+# ── freshness of the saves and of the maps ──────────────────────────────────────────────────────────────────────────
+rdir=$(tl_resurrect_dir)
+panes=$("$tmux_bin" list-panes -a 2>/dev/null | wc -l)
+limit=$((interval * 120))
+newest_save() { # epoch of the newest sign that a save ran: a snapshot, a held-back one, or tmux-save-now's own status
+  local best=0 f t status_epoch
+  for f in "$rdir"/tmux_resurrect_*.txt "$rdir"/degenerate/*.txt; do
+    [ -f "$f" ] || continue
+    t=$(stat -L -c %Y -- "$f" 2>/dev/null || echo 0)
+    [ "$t" -le "$best" ] || best=$t
+  done
+  status_epoch=$(sed -n 's/^epoch=\([0-9]*\) result=\(ok\|unchanged\|degenerate\) .*/\1/p' "$state/save-status" 2>/dev/null)
+  [ -z "$status_epoch" ] || [ "$status_epoch" -le "$best" ] || best=$status_epoch
+  echo "$best"
+}
+want_maps() { # the maps that must exist because an agent runs in a pane (tl_pane_agents: the detection rig's save scripts use)
+  local kind
+  for kind in $(tl_pane_agents); do
+    case $kind in omp) echo omp-sessions.map ;; claude) echo cc-sessions.map ;; codex) echo codex-sessions.map ;; esac
+  done
+}
+stale_maps() {
+  local m t now held
+  now=$(date +%s)
+  # while the guard holds a smaller layout back, the maps are `last`'s on purpose (they are put back with cp -p,
+  # keeping their time): a fresh result=degenerate verdict means the saver ran and decided, which is as fresh as
+  # the maps can be during a hold -- that is not a failure of rig's map writing
+  held=$(sed -n 's/^epoch=\([0-9]*\) result=degenerate .*/\1/p' "$state/save-status" 2>/dev/null | tail -1)
+  case $held in ''|*[!0-9]*) held=0 ;; esac
+  for m in $(want_maps); do
+    t=$(stat -L -c %Y -- "$map_dir/$m" 2>/dev/null || echo 0)
+    if [ ! -s "$map_dir/$m" ]; then echo "$m is missing or empty"
+    elif [ $((now - t)) -gt "$limit" ] && ! { [ "$held" -gt 0 ] && [ $((now - held)) -le "$limit" ]; }; then
+      echo "$m was last written $(((now - t) / 60)) minutes ago"
+    fi
+  done
+}
+
+if [ "$panes" -gt 0 ]; then
+  age=$(( $(date +%s) - $(newest_save) ))
+  forced=0
+  if [ "$age" -gt "$limit" ]; then
+    echo "tmux-watchdog: the newest save is $((age / 60)) minutes old (limit $((limit / 60))), forcing one"
+    "$dir/tmux-save-now" --reason watchdog >/dev/null 2>&1 || true
+    forced=1
+    age=$(( $(date +%s) - $(newest_save) ))
+    if [ "$age" -gt "$limit" ]; then
+      problem fresh "no save ran for $((age / 60)) minutes while $panes panes exist (limit $((limit / 60))) and a forced tmux-save-now did not fix it: see journalctl --user -u tmux-watchdog"
+    else
+      heal fresh "no save had run for over $((limit / 60)) minutes while $panes panes existed; tmux-save-now --reason watchdog saved"
+    fi
+  fi
+  maps=$(stale_maps)
+  if [ -n "$maps" ] && [ "$forced" -eq 0 ]; then
+    echo "tmux-watchdog: stale session maps ($maps), forcing a save"
+    "$dir/tmux-save-now" --reason watchdog >/dev/null 2>&1 || true
+    maps=$(stale_maps)
+    [ -n "$maps" ] || heal maps "the session maps were stale; a forced save rewrote them"
+  fi
+  [ -z "$maps" ] || problem maps "agent panes run but rig's session map is not usable: $(tr '\n' ';' <<<"$maps") (rig omp save-panes writes it all-or-nothing, rig-cli#854)"
+fi
+
+finish
