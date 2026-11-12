@@ -1,0 +1,134 @@
+# service-failover
+
+A service that crashes is restarted with growing delays; a service that is failed or keeps restarting gets a repair
+session instead of silence. Machine-level, generic: no service is named in the mechanism. Ticket
+[#160](https://github.com/alex-mextner/.files/issues/160).
+
+## Why it exists
+
+On 2026-11-09 the odroid's `ha-host-actions.service` (system unit) failed after five fast restarts with
+`Start request repeated too quickly` and stayed down for about 18 hours before anyone noticed. The unit file said
+`Restart=always`, `RestartSec=3` and `StartLimitIntervalSec=infinity`. Two things combined:
+
+1. **`infinity` is not "no limit".** The start counter of a unit with an infinite window never forgets a start. The unit
+   had been started once at boot (2026-11-08); another user unit of the same name held port 8787
+   (`OSError: Address already in use`), so four restarts on the evening of the 9th made five starts in total and the
+   sixth was refused. The same unit would have died after any five restarts spread over weeks. A limit of `0` is the
+   only way to switch the limit off, and then the unit never reaches `failed`, so nothing could escalate either.
+2. **Nothing noticed.** `failed` is a quiet state: no log line is repeated, no alert is sent.
+
+The module does not touch `StartLimitIntervalSec=`/`StartLimitBurst=`. systemd counts every start against them (timer
+runs and socket activations too), so a global value would throttle every timer-driven one-shot and would override the limits
+that units set in their own files. The scan finds a unit that turned `failed` (whatever its limit was) within 5 minutes,
+and first aid clears the counter, which is what would have saved `ha-host-actions.service` on the evening of the 9th.
+
+## What is installed
+
+| Piece | Where | What it does |
+|---|---|---|
+| `service.d/10-failover.conf` | user manager (every user service of the PC and the odroid) and, with sudo, `/etc/systemd/system/service.d/` | `RestartSteps=8`, `RestartMaxDelaySec=5min`: the delay between restarts grows from the unit's own `RestartSec` to 5 minutes over 8 steps. systemd counts the steps in `NRestarts`, which only a manual start or `reset-failed` clears, so a service that crashes rarely drifts toward the 5 minute delay over weeks |
+| `service.d/15-failover-repair.conf` | user manager of the PC only (needs omp) | `OnFailure=service-failover-repair@%n.service`. systemd fires it on every crash, also while it is still restarting the unit; the script below decides |
+| `service-failover-repair@.service` + `.d/20-limits.conf` | PC | oneshot template; `OnFailure=` reset (checked with `systemctl --user show`) so a failing repair cannot start a repair of the repair; `StartLimitIntervalSec=0`, because a fast crash loop of the watched unit starts its repair instance once per crash and systemd's default limit (5 starts in 10 s) refused the start that reports the final `failed` state (2026-11-10 22:55:09, `wireplumber.service`). The script ignores `service-failover-*` units as well. The template's drop-in directory belongs to the module: `install.sh --check` lists a drop-in it did not install as `stale` and an install removes it (a leftover smoke-test drop-in set `SERVICE_FAILOVER_DRY_RUN=1` and made every repair on the PC a dry run) |
+| `bin/service-failover-repair` | PC | leaves a unit alone that is healthy (running, or a one-shot that finished with `Result=success`), still inside its restart backoff, stopped on purpose, transient, or one that exited with a status it declares final (`RestartPreventExitStatus=`) (only `failed`, or 10 or more restarts in `auto-restart`, counts as a failure); a vendor or generated unit (the distribution's, or from a generator) is handled like any other, and its brief tells the session not to edit the vendor file; first aid at most once per hour per unit (`restart --no-block`; `reset-failed` first only when `Result=start-limit-hit`, or after a restart that started nothing: same invocation, still `failed`, and the restart added a "Start request repeated too quickly" journal line (the original failure's line does not count; a failed dependency refuses a start the same way and must not trigger `reset-failed`), because `--no-block` exits 0 for it and the limit keeps `Result=exit-code`; `reset-failed` would otherwise hide a failure the restart cannot undo; wait 20 s; a start still in progress is left to systemd; a unit that ends `inactive` with `Result=success` after the restart counts as finished only with exit status 0, a clean stop signal (SIGHUP, SIGINT, SIGPIPE, SIGTERM) or a status the unit lists in SuccessExitStatus=, because a crashed service whose failed state was cleared keeps its crash status; one-shot jobs are left untouched because re-running them may repeat a side effect); if still down, writes a brief (host, scope, unit file, what was tried, last 50 journal lines with secrets masked and fenced as untrusted data, instructions to diagnose, fix at the source, verify for 5 minutes, look for an existing ticket, report) and starts the sanctioned launcher `~/.agents/skills/rig-detached-omp/rig-detached-omp`. One session at a time (`flock`, inherited by the session), one per unit per 12 hours and 4 per 24 hours in total (stamp files in `~/.local/state/service-failover/launches`: systemd forgets a unit's counters once it unloads, so it cannot carry the limit). A session that hangs holds the lock until it ends: later repairs are deferred (the launcher gives the session no time limit), and the user is told so by the notification below. Units stopped on purpose whose stop ended `failed` (a stop timeout) look like failures and are restarted once by first aid. **Tells the user** (see *What the user sees*) |
+| `service-failover-scan.timer` / `.service` / `bin/service-failover-scan` | PC, every 5 minutes | finds failed units and units in `auto-restart` with 10 or more restarts (a unit that never reaches `failed`, such as one with `StartLimitIntervalSec=0`, or any unit under the backoff) on this host and on each host of `~/.config/service-failover/hosts`, over ssh with no sudo, user and system units, and starts the repair template for each; at the end of every run it delivers the notifications that were waiting for the desktop (`service-failover-repair --flush-notifications`) |
+| `docker/autoheal.compose.yaml` | both hosts, option `autoheal` | `willfarrell/autoheal` restarts a container whose healthcheck is `unhealthy` |
+
+`Restart=` is deliberately **not** in the global drop-in: it would override `Restart=always` of units that have it,
+and `Restart=always` is refused for `Type=oneshot` units (the unit would not load). Units that lack a `Restart=`
+get `Restart=on-failure` from the module option `restart_units` (`<unit>.d/30-failover-restart.conf`).
+
+The PC's `wyoming-whisper.service` (`StartLimitIntervalSec=0`) never reaches `failed`; the scan catches it as a restart
+loop instead. Turning an option off removes what it installed: `--check` lists such files as `stale` and an install removes
+them (and disables the scan timer when `repair = false`).
+
+## What the user sees
+
+A failed service used to be silent: every outcome of the repair script was one journal line. When a unit is still down after the first
+aid, `service-failover-repair` now sends a desktop notification (`notify-send`, urgency critical) titled `Service down: <unit>` whose body
+says what became of it (a repair session was launched, another session is running so this one is deferred, the daily cap of sessions is
+reached, the launcher is missing or failed) and gives the unit's own last error line from its journal: only real entries (the `-o short-iso`
+timestamp is stripped; `-- No entries --`, ssh errors and hints are no log line, and then the text is `(no log line)`), secrets masked,
+control characters dropped, 300 bytes at most with a split UTF-8 character removed (the notifier refuses invalid UTF-8, and a refused message
+would stay pending for ever), the program's line and not `systemd[...]` bookkeeping. A unit is announced once per `NOTIFY_MIN` minutes
+(default 720, the same window as the session cooldown): a stamp file in `~/.local/state/service-failover/notify/sent`. A message the
+notifier cannot show (no notification daemon runs early in the login) stays in `notify/pending` and leaves no stamp; the scan delivers it
+within 5 minutes, unless it is older than `NOTIFY_MIN` (it would announce, hours late, a unit that has had its chance to be fixed since:
+it is dropped). Runs overlap (one repair instance per failed unit, plus the scan), so a delivery first claims a message by renaming it to
+`NAME.sending.PID`: one run shows it, the others skip it. A unit that first aid brings back is not announced. `install.sh --check` reports a
+missing `notify-send` (package `libnotify-bin`) as drift; an install says `needs manual` and exits 10 because the module cannot tell you
+anything without it.
+
+`install.sh --check` also reports as `stale` (an install removes it) any file or symlink in a drop-in directory named after a module unit
+(`service-failover-*.d/`: the repair template's, the scan's, one for a single instance) that the module did not install, and a
+`SERVICE_FAILOVER_*` variable in the user manager's environment (`systemctl --user set-environment`; an install unsets it): each one can turn
+every repair into a dry run, and a file or a variable nobody declared is exactly what the module exists to find.
+
+### Incident: wireplumber.service, 2026-10-31 to 2026-11-11
+
+`wireplumber.service` exited with status 78 on every start (a hand-installed `/usr/local` portal configuration named a module the
+distribution's wireplumber does not search), the unit hit its start limit and no audio device existed. The module was installed on
+2026-11-10 16:11, so nothing before that date could have caught it; after that:
+
+1. The repair script saw the unit `failed` (2026-11-11 01:36:50) and logged `vendor or generated unit (/usr/lib/systemd/user/wireplumber.service),
+   not repaired`: no first aid, no session, no message. The vendor rule is gone.
+2. On 2026-11-10 22:55:09 systemd refused to start the repair instance for `wireplumber.service` itself (`Start request repeated too quickly`):
+   the instance had the default start limit. It has none now.
+3. The live repair template carried a drop-in `90-smoke-dry.conf` (`SERVICE_FAILOVER_DRY_RUN=1`) that this module never installed: every
+   session the scan requested on the PC was a dry run (`DRY RUN: would launch`). The installer now owns the template's drop-in directory.
+4. Nothing reached the user. See above.
+
+Known gap: the failed state of `wireplumber.service` was gone three seconds after it appeared (`StateChangeTimestamp` 01:36:52, now
+`ActiveState=inactive`, `Result=success`, `ExecMainStatus=78`). The unit has `BindsTo=pipewire.service`, so a stop of pipewire would do that;
+what did it was not established. The scan lists only `failed` units, so a failure whose state is erased before the next scan is seen only by the
+`OnFailure=` run at the moment of failure, which is why that run sends the notification itself. The `audio-health` module of ubuntu-tweaks is the
+independent check for this loss: it asks PipeWire, not systemd, whether a card exists.
+
+## Why odroidn2 is scanned from the PC
+
+The odroid has no omp, no `tg` and no launcher, and no ssh key to the PC. `OnFailure=` there could not start a
+session, so the odroid gets only the restart backoff (`--restart-only`), and the PC's scan reads its failed units over
+ssh every 5 minutes. The repair session runs on the PC and reaches the odroid with `ssh odroidn2`. It has no sudo
+there: whatever needs root goes into a ticket with the exact command.
+
+## Install
+
+PC (profile module, `[modules.service-failover] enabled = true` in `machines/ubuntu-pc/machine.toml`):
+`ubuntu-tweak apply --commit`, or by hand `bash install.sh` (`--plan`, `--check` are read-only). It writes user files,
+runs `daemon-reload` and enables the scan timer. It restarts nothing: a unit takes the new backoff at its next start.
+
+Odroid, user level, once (no repository checkout there, so copy the module):
+
+```sh
+rsync -a --delete ubuntu/modules/service-failover/ odroidn2:.local/share/service-failover/
+ssh odroidn2 'bash ~/.local/share/service-failover/install.sh --restart-only --autoheal'
+```
+
+### What the owner must run with sudo (odroid, once)
+
+The system units live in `/etc/systemd/system`, owned by root. This installs the same backoff for every system
+service and `Restart=on-failure` for `caddy.service` (it has no `Restart=`); nothing is restarted:
+
+```sh
+ssh odroidn2
+sudo bash ~/.local/share/service-failover/install.sh --system caddy.service
+```
+
+Afterwards `systemctl cat ha-host-actions.service` lists `service.d/10-failover.conf`. A unit that is already `failed` is cleared with `sudo systemctl reset-failed <unit>`; the odroid's system
+`ha-host-actions.service` is such a unit (it fails against the user unit that holds port 8787: decide which of the two is
+canonical and disable the other).
+
+## Docker
+
+Every container on both hosts already has `restart: unless-stopped` (it backs off and never gives up on an exiting
+container); `ut-sd` on the PC is a one-shot with `no`. `autoheal` adds the missing half, an `unhealthy` healthcheck.
+Containers without a healthcheck are not covered by it. Gap: there is no escalation to a repair session for a
+container; docker publishes no event that a unit can hang an `OnFailure=` on without a long-running watcher process.
+Containers without a healthcheck on the odroid: home-lan (dhcp, dns-relay, tls-voice), and most of the HA compose
+project (music-assistant, avahi-reflector, bgutil-pot, go2rtc, hga-postgres, printer-proxy, ssh-server,
+u1-camera-proxy); on the PC: both switches, tls-voice, dns-relay, ha-cli-stage, dozzle, anisette.
+
+## Tests
+
+`python3 -m unittest discover -s ubuntu/modules/service-failover/tests` runs the installer, the drop-in contents, the
+repair script and the scan against stand-in `systemctl`, `journalctl`, `ssh` and a launcher stub: no real systemd,
+ssh or omp.

@@ -1,0 +1,12 @@
+[Unit]
+Description=service-failover: repair session for %i
+# Wanted by nothing: started by OnFailure= of a failed service and by service-failover-scan.
+
+[Service]
+Type=oneshot
+# The omp launcher detaches the session (omp puts it in its own scope), so this unit ends in seconds and the session
+# outlives it. KillMode=process keeps a stray child of the launcher alive when the unit stops.
+ExecStart=%h/.local/bin/service-failover-repair %i
+KillMode=process
+TimeoutStartSec=120
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin

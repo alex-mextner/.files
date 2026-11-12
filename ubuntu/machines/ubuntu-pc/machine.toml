@@ -264,3 +264,13 @@ require_mount = "~/xp"   # a bind mount of the backups disk: never clone onto th
 enabled = true
 hostname = "dc-mcp.mextner.com"
 tunnel = "dc-local"
+
+# service-failover (profile module, issue #160): every user service of this PC gets a growing restart backoff, a service
+# that ends up failed (or restart-looping) gets a detached omp repair session, and failed services of the listed hosts are read over
+# ssh every 5 minutes. odroidn2 has no omp: it gets the restart backoff only (install.sh --restart-only there, plus one sudo step for its
+# system units, see the module README) and this PC does the watching and repairing. aisis-dashboard.service has no Restart= of its own.
+[modules.service-failover]
+enabled = true
+hosts = ["odroidn2"]
+restart_units = ["aisis-dashboard.service"]
+autoheal = true

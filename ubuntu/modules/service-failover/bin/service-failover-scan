@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# service-failover-scan: find services that are failed or stuck in a restart loop and ask for a repair session.
+#
+# Runs from service-failover-scan.timer. It is the safety net behind OnFailure=: it finds a unit that failed before
+# the watchdog existed, one whose repair request was deferred, a unit whose own StartLimitIntervalSec=0 means it never
+# fails (it is looked for as "auto-restart with MIN_RESTARTS or more restarts"), and every unit of a host that has no
+# omp of its own (odroidn2: OnFailure= cannot reach a launcher there).
+#
+# Hosts: ~/.config/service-failover/hosts, one per line, `#` comments. `local` = the user manager of this host. Any
+# other word is an ssh host name (BatchMode, no sudo): its user and its system units are scanned, read-only. No file =
+# `local` only. SERVICE_FAILOVER_HOSTS names another file; SERVICE_FAILOVER_MIN_RESTARTS (default 10) the loop size.
+#
+# Each finding becomes `systemctl --user start --no-block service-failover-repair@<instance>.service`; the repair script
+# rate limits itself (one session per unit per 12 hours, 4 per day), so a persistent failure is not re-reported every run.
+# At the end of every run it also delivers the desktop notifications the repair script could not show yet (no
+# notification daemon runs early in the login): `service-failover-repair --flush-notifications`.
+set -uo pipefail
+
+hosts_file=${SERVICE_FAILOVER_HOSTS:-${XDG_CONFIG_HOME:-$HOME/.config}/service-failover/hosts}
+min_restarts=${SERVICE_FAILOVER_MIN_RESTARTS:-10}
+hosts=(local)
+[ -f "$hosts_file" ] && mapfile -t hosts < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$hosts_file")
+[ "${#hosts[@]}" -gt 0 ] || hosts=(local)
+
+# Printed on the managed host: one unit name per line, failed or in a long auto-restart loop. It fails (non-zero) when
+# systemctl cannot be queried, so an unreachable user bus is reported instead of read as "nothing failed".
+probe='set -o pipefail; flag=; [ "$1" = user ] && flag=--user
+failed=$(systemctl $flag list-units --type=service --state=failed --plain --no-legend) || exit 1
+printf "%s\n" "$failed" | awk "NF {print \$1}"
+looping=$(systemctl $flag list-units --type=service --state=activating --plain --no-legend) || exit 1
+for u in $(printf "%s\n" "$looping" | awk "\$4==\"auto-restart\" {print \$1}"); do
+  n=$(systemctl $flag show -p NRestarts --value "$u") || exit 1; [ "${n:-0}" -ge "$2" ] && echo "$u"
+done; exit 0'
+
+scan() { # scan HOST SCOPE
+  if [ "$1" = local ]; then bash -c "$probe" _ "$2" "$min_restarts"
+  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(printf '%q ' bash -c "$probe" _ "$2" "$min_restarts")"; fi
+}
+
+errs=$(mktemp); trap 'rm -f "$errs"' EXIT
+status=0
+for host in "${hosts[@]}"; do
+  scopes=(user); [ "$host" != local ] && scopes=(user system)
+  for scope in "${scopes[@]}"; do
+    # stderr (ssh banners, locale warnings, systemctl errors) is kept apart from the unit list.
+    if ! found=$(scan "$host" "$scope" 2>"$errs"); then
+      echo "service-failover-scan: $host $scope: scan failed ($(tr -cd '[:print:]' <"$errs" | cut -c1-160))"; status=1; continue
+    fi
+    while IFS= read -r unit; do
+      case "$unit" in service-failover-*) continue ;; esac
+      # only a plain unit name is a unit: anything else on stdout is not trusted into a unit instance
+      [[ "$unit" =~ ^[A-Za-z0-9:_.@\\-]+\.service$ ]] || continue
+      inst=$unit; [ "$host" != local ] && inst="$host:$scope:$unit"
+      repair="service-failover-repair@$inst.service"
+      case "$(systemctl --user show -p ActiveState --value "$repair" 2>/dev/null)" in active|activating) continue ;; esac
+      echo "service-failover-scan: $host $scope $unit is failed or restart-looping: requesting $repair"
+      systemctl --user start --no-block "$repair" || status=1
+    done <<<"$found"
+  done
+done
+"$(dirname "$0")/service-failover-repair" --flush-notifications >/dev/null || status=1
+exit "$status"
