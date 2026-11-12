@@ -43,8 +43,10 @@ prefix kind (v10 / v11 / plain).
        glide: the email domain must be the glide account's (module option glide_email_domain, e.g. app.glide.vc; the
               guardian unit starts only for it, so --expect-domain may only repeat it; the relogin marker is written on
               success like after `relogin run`);
-       home:  a VISIBLE email domain, and it must NOT be the glide account's (a mix-up guard); --expect-domain DOMAIN
-              requires exactly that domain instead;
+       home:  the module option home_email_domain when the machine declares one (the home guardian unit starts only for it:
+              `relogin check --refuse-other` is its ExecStartPre, so --expect-domain may only repeat it); else a VISIBLE
+              email domain that is NOT the glide account's (a mix-up guard), and --expect-domain DOMAIN requires exactly
+              that domain instead;
      then the three units are waited for with the guardian's health line (relogin's wait_stack);
   6. when step 5 does not confirm it, or the command is interrupted from step 2 on, the backup is restored (stop all
      three units, restore, start all three: relogin's order) and the command fails; signals are ignored from then on.
@@ -145,6 +147,7 @@ TEXT = {
         "stopping": "Stopping the {workspace} guardian units: {units}",
         "starting_browser": "Starting the browser alone first: {unit}",
         "glide_domain_fixed": "the glide guardian unit starts only for the email domain {domain} (module option glide_email_domain): --expect-domain cannot change that for glide",
+        "home_domain_fixed": "the home guardian unit starts only for the email domain {domain} (module option home_email_domain): --expect-domain cannot change that for home",
         "backing_up": "Backing up the target Cookies to {path}",
         "copied": "Replaced {replaced} target rows with {count} rows from the source",
         "schema_differs": "the two Cookies databases differ ({what}); both profiles must be written by the same Chrome",
@@ -193,6 +196,7 @@ TEXT = {
         "stopping": "Останавливаю юниты стража {workspace}: {units}",
         "starting_browser": "Сначала запускаю один браузер: {unit}",
         "glide_domain_fixed": "юнит стража glide стартует только для домена почты {domain} (опция модуля glide_email_domain): --expect-domain для glide его не меняет",
+        "home_domain_fixed": "юнит стража home стартует только для домена почты {domain} (опция модуля home_email_domain): --expect-domain для home его не меняет",
         "backing_up": "Сохраняю Cookies цели в {path}",
         "copied": "Заменено строк цели: {replaced}, взято из источника: {count}",
         "schema_differs": "базы Cookies различаются ({what}); оба профиля должны быть записаны одним Chrome",
@@ -456,6 +460,17 @@ def workspace_settings(ctx: Context, workspace: Workspace):
     return relogin.load_settings(scoped)
 
 
+def required_domain(ctx: Context, workspace: Workspace, settings) -> str | None:
+    """The email domain the workspace's guardian unit starts for, or None when none is declared: glide's glide_email_domain (its
+    ExecStartPre is `relogin check --live`), home's home_email_domain (`relogin check --refuse-other`) when the machine sets one."""
+    if workspace.name == "glide":
+        return settings.domain
+    declared = ctx.options.get("home_email_domain") or ""
+    if not isinstance(declared, str) or (declared and not re.fullmatch(relogin.DOMAIN_PATTERN, declared)):
+        raise relogin.ConfigError(relogin.TEXT[ctx.lang]["bad_option"].format(name="home_email_domain", why="must be empty or a domain name such as gmail.com"))
+    return declared.lstrip("@").lower() or None
+
+
 def source_dir(ctx: Context, given: str | None) -> Path:
     chosen = given or ctx.env.get("CHATGPT_PROFILE_SYNC_SOURCE")
     return (Path(chosen).expanduser() if chosen else ctx.home / ".config/google-chrome").absolute()
@@ -509,10 +524,10 @@ def ask_account(settings):
     return relogin.await_account(settings)
 
 
-def judge(settings, workspace: Workspace, expected: str | None, lang: str):
+def judge(settings, expected: str | None, lang: str):
     """(answer, confirmed, reason) for the browser's answer after the copy: the semantics of `relogin check --live`, the
-    browser's answer only. glide: the domain of glide_email_domain (`expected` is that or None); home: `expected`, else
-    any visible domain but the glide account's."""
+    browser's answer only. `expected` is the domain the guardian unit starts for (required_domain) or the one asked for with
+    --expect-domain; with none, home takes any visible domain but the glide account's."""
     answer = ask_account(settings)
     if answer.kind == "unavailable":
         return answer, False, say(lang, "unreadable", reason=settings.say(answer.reason, port=settings.port))
@@ -520,11 +535,10 @@ def judge(settings, workspace: Workspace, expected: str | None, lang: str):
         return answer, False, say(lang, "signed_out")
     if not answer.domain:
         return answer, False, say(lang, "domain_unknown")
-    want = expected or (settings.domain if workspace.name == "glide" else None)
-    if want is not None:
-        if answer.domain == want:
+    if expected is not None:
+        if answer.domain == expected:
             return answer, True, ""
-        return answer, False, say(lang, "wrong_domain", domain=answer.domain, want=want)
+        return answer, False, say(lang, "wrong_domain", domain=answer.domain, want=expected)
     if answer.domain == settings.domain:
         return answer, False, say(lang, "is_glide_domain", domain=answer.domain)
     return answer, True, ""
@@ -585,16 +599,18 @@ def cmd_pull(ctx: Context, args) -> int:
     workspace = WORKSPACES[args.workspace]
     settings = workspace_settings(ctx, workspace)
     lang = ctx.lang
+    required = required_domain(ctx, workspace, settings)
     expected = None
     if args.expect_domain:
         if not re.fullmatch(relogin.DOMAIN_PATTERN, args.expect_domain):
             tell(say(lang, "bad_domain", domain=args.expect_domain), error=True)
             return 2
         expected = args.expect_domain.lstrip("@").lower()
-        if workspace.name == "glide" and expected != settings.domain:
-            # the glide guardian unit only starts for glide_email_domain (relogin check --live is its ExecStartPre)
-            tell(say(lang, "glide_domain_fixed", domain=settings.domain), error=True)
+        if required and expected != required:
+            # the guardian unit only starts for that domain (its ExecStartPre refuses another one)
+            tell(say(lang, f"{workspace.name}_domain_fixed", domain=required), error=True)
             return 2
+    expected = expected or required
     source = source_dir(ctx, args.source)
     target = settings.profile
     try:
@@ -620,7 +636,7 @@ def cmd_pull(ctx: Context, args) -> int:
 
     units, back = stack_units(settings)
     destination = backup_dir(ctx, workspace)
-    rule = say(lang, "rule_domain", domain=expected or settings.domain) if expected or workspace.name == "glide" else say(lang, "rule_home", domain=settings.domain)
+    rule = say(lang, "rule_domain", domain=expected) if expected else say(lang, "rule_home", domain=settings.domain)
     hosts = ", ".join(f"{host} {count}" for host, count in sorted(snapshot.hosts().items()))
     kinds = ", ".join(f"{kind} {count}" for kind, count in sorted(snapshot.prefixes().items())) or "-"
     tell(say(lang, "plan_source", path=source_db, count=len(snapshot.rows), hosts=hosts, kinds=kinds))
@@ -674,7 +690,7 @@ def run_pull(ctx: Context, settings, workspace: Workspace, expected: str | None,
             started = relogin.start_unit(settings, settings.browser)
             if started:
                 tell(started, error=True)
-            answer, accepted, why = judge(settings, workspace, expected, lang)
+            answer, accepted, why = judge(settings, expected, lang)
             if not accepted:
                 failure, code = say(lang, "not_confirmed", what=why), 4
             else:

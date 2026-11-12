@@ -34,6 +34,9 @@ home_memory_max = "8G"
 # The ChatGPT account that works for the glide guardian is chatgpt@app.glide.vc, so its exact email domain is app.glide.vc
 # (the module default glide.vc does not match it; the check stays an exact comparison).
 glide_email_domain = "app.glide.vc"
+# The home account lives on gmail.com: the home guardian does not start while its browser shows another account (2026-11-12 the two
+# profiles held each other's logins and the home account had no required domain at all, so the wrong one was accepted).
+home_email_domain = "gmail.com"
 # The home browser runs on its own private Xvfb :112 (unit chatgpt-guardian-home-display), not on the desktop: a visible window
 # cannot be safely probed or focused by the guardian, and Chrome throttles the frames of a background tab. The home guardian is
 # then told --private-display; a profile that is signed in stays signed in.

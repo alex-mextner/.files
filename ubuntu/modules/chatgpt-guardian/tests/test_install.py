@@ -17,7 +17,7 @@ MODULE = Path(__file__).resolve().parents[1]
 INSTALL = MODULE / "install.sh"
 UNITS = sorted((MODULE / "units").glob("*.service"))
 RENDER_TOKENS = {"@CHROME@", "@HOME_PORT@", "@GLIDE_PORT@", "@XVFB@", "@HOME_MEMORY_HIGH@", "@HOME_MEMORY_MAX@", "@GLIDE_DOMAIN@", "@RELOGIN@",
-                 "@HOME_DISPLAY_UNIT@", "@HOME_DISPLAY_SERVICE@", "@HOME_PRIVATE_FLAG@", "@HOME_PRIVATE_GUARD@", "@REVIVE@"}  # the keys install.sh's render_unit passes
+                 "@HOME_DISPLAY_UNIT@", "@HOME_DISPLAY_SERVICE@", "@HOME_PRIVATE_FLAG@", "@HOME_PRIVATE_GUARD@", "@HOME_RELOGIN_ENV@", "@HOME_RELOGIN_GUARD@", "@REVIVE@"}  # the keys install.sh's render_unit passes
 GATED = {  # unit -> workspace whose deployment file gates it
     "chatgpt-guardian-home": "home",
     "chatgpt-guardian-home-browser": "home",
@@ -82,6 +82,8 @@ def test_unknown_option_is_refused(home, fake_bin):
         ({"chats_home": ["https://example.com/c/x"]}, "chats_home must be a list"),
         ({"glide_email_domain": 5}, "glide_email_domain must be a domain name"),
         ({"glide_email_domain": "-x"}, "glide_email_domain must be a domain name"),
+        ({"home_email_domain": 5}, "home_email_domain must be empty or a domain name"),
+        ({"home_email_domain": "-x"}, "home_email_domain must be empty or a domain name"),
         ({"home_memory_high": "infinity"}, "home_memory_high must look like"),
         ({"home_memory_max": "infinity"}, "home_memory_max must look like"),
         ({"home_memory_high": 3}, "home_memory_high must look like"),
@@ -251,6 +253,7 @@ chrome=/c; home_port=9226; glide_port=9223; xvfb=/x
 home_memory_high={config.get("high", "3G")}; home_memory_max={config.get("max", "4G")}
 home_private_display={private}; home_display_unit={display_unit}
 glide_domain=glide.vc
+home_domain={config.get("domain", "")}
 {script[start:end]}
 render_unit {unit}
 """
@@ -423,6 +426,42 @@ def test_private_home_guardian_cannot_start_without_a_client_on_the_private_disp
     assert "ExecStartPre" not in rendered(home, fake_bin, "chatgpt-guardian-home")
 
 
+def test_home_guardian_without_a_domain_declares_nothing(home, fake_bin):
+    text = rendered(home, fake_bin, "chatgpt-guardian-home")
+    assert "RELOGIN" not in text and "relogin" not in text
+    assert "Environment" not in text
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_home_guardian_with_a_domain_refuses_another_account_before_starting(home, fake_bin, private):
+    text = rendered(home, fake_bin, "chatgpt-guardian-home", domain="gmail.com", private=private)
+    assert unit_lines(text, "Environment") == ["CHATGPT_RELOGIN_DEVTOOLS_PORT=9226", "CHATGPT_RELOGIN_DOMAIN=gmail.com"]
+    # the tolerant check, never glide's `check --live`: a restarted home browser has no chatgpt.com tab and revive opens one for glide only
+    assert unit_lines(text, "ExecStartPre")[-1] == f"{MODULE}/relogin check --refuse-other"
+    assert "--live" not in text
+    assert len(unit_lines(text, "ExecStartPre")) == (2 if private else 1)
+    assert text.rindex("ExecStartPre=") < text.index("ExecStart=%h")
+    assert not re.search(r"\n\n(?!\[)", text)
+
+
+def test_home_domain_option_is_normalized_and_shown_in_the_plan(home, fake_bin):
+    on = run(home, fake_bin, "--plan", config={"home_email_domain": "@GMail.com"})
+    assert on.returncode == 0, on.stderr
+    assert "home domain gmail.com" in on.stdout
+    assert "home domain not declared" in run(home, fake_bin, "--plan").stdout
+
+
+def test_home_domain_must_differ_from_the_glide_domain(home, fake_bin):
+    done = run(home, fake_bin, "--plan", config={"home_email_domain": "@App.Glide.vc", "glide_email_domain": "app.glide.vc"})
+    assert done.returncode == 1
+    assert "home_email_domain must differ from glide_email_domain" in done.stderr + done.stdout
+
+
+def test_ubuntu_pc_home_guardian_requires_the_gmail_account():
+    machine = tomllib.loads((MODULE.parents[1] / "machines/ubuntu-pc/machine.toml").read_text(encoding="utf-8"))
+    assert machine["modules"]["chatgpt-guardian"]["home_email_domain"] == "gmail.com"
+
+
 
 def test_private_home_browser_runs_on_its_own_display(home, fake_bin):
     text = rendered(home, fake_bin, "chatgpt-guardian-home-browser", private=True)
@@ -499,7 +538,7 @@ def test_the_wrapper_hands_profile_sync_the_options_of_the_machine(home, fake_bi
     wrapper.write_text(done.stdout, encoding="utf-8")
     wrapper.chmod(0o755)
     config = re.search(r"UBUNTU_TWEAK_MODULE_CONFIG='(.*)'", done.stdout).group(1)
-    assert json.loads(config) == {"home_port": 9300, "glide_port": 9301, "glide_email_domain": "app.glide.vc"}
+    assert json.loads(config) == {"home_port": 9300, "glide_port": 9301, "glide_email_domain": "app.glide.vc", "home_email_domain": ""}
     # run it: `status` asks the two DevTools ports of this machine and reads nothing else (a temp HOME has no profiles)
     env = {**os.environ, "HOME": str(home), "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
     env.pop("UBUNTU_TWEAK_MODULE_CONFIG", None)
@@ -507,6 +546,14 @@ def test_the_wrapper_hands_profile_sync_the_options_of_the_machine(home, fake_bi
     assert status.returncode == 0, status.stderr
     assert "home: cannot be asked (no DevTools answer on port 9300)" in status.stdout
     assert "glide: cannot be asked (no DevTools answer on port 9301)" in status.stdout
+
+
+def test_the_wrapper_hands_profile_sync_the_required_home_domain(home, fake_bin):
+    """Without it `profile-sync pull home` would accept any account but the glide one and the home guardian's start check would then refuse it."""
+    done = run(home, fake_bin, "--print-sync-wrapper", config={"glide_email_domain": "app.glide.vc", "home_email_domain": "@GMail.com"})
+    assert done.returncode == 0, done.stderr
+    config = re.search(r"UBUNTU_TWEAK_MODULE_CONFIG='(.*)'", done.stdout).group(1)
+    assert json.loads(config)["home_email_domain"] == "gmail.com"
 
 
 def test_the_module_ships_profile_sync_next_to_relogin():
