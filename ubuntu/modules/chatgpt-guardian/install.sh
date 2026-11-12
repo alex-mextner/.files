@@ -39,6 +39,11 @@
 #  10. audit_timers (option, opt-in): pm-chatgpt-audit-home and pm-chatgpt-audit-glide (service + timer each, from units/audit): `pm chatgpt
 #      audit --workspace <account>` every 4 h (home at :10, glide.vc at :40), niced and CPU-capped, started only when ./audit-gate says the
 #      account's sender and browser run and no 429 cooldown, global stop or quota latch is live; the timers are enabled
+#  11. login_assist (option, opt-in): pm-chatgpt-login-assist@.service/.timer (the templates `pm chatgpt unit` ships, from units/login-assist) and the
+#      instance timers pm-chatgpt-login-assist@home and pm-chatgpt-login-assist@glide.vc, enabled: every 2 min `pm chatgpt login-assist --account X`
+#      asks whether the account's guardian browser is signed out of ChatGPT; if so it stops that account's guardian units (no restart loop), opens
+#      its profile in a window, notifies the owner (desktop notification + Telegram, once per cooldown), waits for the login, says 'login accepted'
+#      and starts the units again. Nothing happens for a signed-in account. Needs pm >= 0.13.1 (see pm_package)
 #
 # Options ([modules.chatgpt-guardian] of profile.toml / machine.toml, JSON in UBUNTU_TWEAK_MODULE_CONFIG):
 #   repo        git URL of agent-tools   (default https://git.hyperide.ai/ultrabricks/agent-tools.git)
@@ -68,6 +73,9 @@
 #                      pass is not managed by this module); the units' paths follow it
 #   audit_timers       true / false (default false): install the per-account pm audit timers of fact 10; needs a pm that merges a
 #                      single account's audit into last-report.json (pm >= 0.10.3, see pm_package)
+#   login_assist       true / false (default false): install the login-assist service template and enable its two instance timers (fact 11);
+#                      needs pm >= 0.13.1 (pm chatgpt login-assist), see pm_package, and the default home_port/glide_port. Setting it back to false does
+#                      NOT disable timers already enabled: systemctl --user disable --now pm-chatgpt-login-assist@home.timer pm-chatgpt-login-assist@glide.vc.timer
 set -euo pipefail
 
 usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
@@ -97,7 +105,7 @@ import json, os, re, shlex, sys
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "", "pm_package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
          "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
-         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False}
+         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False, "login_assist": False}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -127,6 +135,8 @@ if not isinstance(opt["home_private_display"], bool):
     fail("home_private_display must be true or false: %s" % opt["home_private_display"])
 if not isinstance(opt["audit_timers"], bool):
     fail("audit_timers must be true or false: %s" % opt["audit_timers"])
+if not isinstance(opt["login_assist"], bool):
+    fail("login_assist must be true or false: %s" % opt["login_assist"])
 UNIT = {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}
 for key in ("home_memory_high", "home_memory_max"):
     if not isinstance(opt[key], str) or not re.fullmatch(r"[1-9][0-9]{0,5}[KMGT]", opt[key]):
@@ -165,6 +175,10 @@ if opt["control_pass_dir"] and re.search(r"[\s%$\"'\\]", opt["control_pass_dir"]
     fail("control_pass_dir must not contain whitespace, quotes, backslash, %% or $ (systemd splits, unquotes and expands them in ExecStart): %s" % opt["control_pass_dir"])
 if opt["audit_timers"] and not opt["pm_package"]:
     fail("audit_timers needs pm_package (a pm that merges a single account's audit into last-report.json, pm >= 0.10.3)")
+if opt["login_assist"] and not opt["pm_package"]:
+    fail("login_assist needs pm_package (a pm with `pm chatgpt login-assist`, pm >= 0.13.1)")
+if opt["login_assist"] and (int(opt["home_port"]) != 9226 or int(opt["glide_port"]) != 9223):
+    fail("login_assist needs the default DevTools ports (home_port 9226, glide_port 9223): pm login-assist has them built in")
 if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
     fail('chrome must be an absolute path or "user": %s' % opt["chrome"])
 if not opt["package"]:
@@ -174,6 +188,7 @@ for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
 print("opt_audit_timers=%s" % ("true" if opt["audit_timers"] else "false"))
+print("opt_login_assist=%s" % ("true" if opt["login_assist"] else "false"))
 for key in ("chats_home", "chats_glide"):
     print("opt_%s=(%s)" % (key, " ".join(shlex.quote(u) for u in opt[key])))
 PY
@@ -193,6 +208,7 @@ home_private_display=$opt_home_private_display
 glide_domain=$opt_glide_domain
 control_dir=$opt_control_pass_dir
 audit_timers=$opt_audit_timers
+login_assist=$opt_login_assist
 
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 vpy="$venv/bin/python"
@@ -444,6 +460,38 @@ audit_ok() {
   done
   [ -x "$here/audit-gate" ]
 }
+# The login helper (option login_assist): the pm-shipped template pair, installed verbatim, one enabled timer instance per account.
+# relogin, profile-sync and the login helper (every run, signed in or not, for its probe; a whole login session while a window is open) hold this flock (same path as
+# ./revive). Apply must not start that account's browser (a second Chrome on the profile the owner is typing into), probe its DevTools port or call its stopped units
+# drift. A short helper probe is waited out (flock -w, longer than the helper's 20 s probe budget); a login session outlasts the wait and counts as held.
+lock_dir=${CHATGPT_RELOGIN_LOCK_DIR:-$HOME/.local/state/ubuntu-tweaks/chatgpt-guardian-locks}
+lock_wait=${CHATGPT_LOCK_WAIT:-25}
+declare -A lock_cache=() # only a held answer is remembered (a session outlasts the run; waiting for it again per unit would cost minutes): a free answer is asked again every time
+profile_locked() { # profile_locked WS (home | glide.vc): true while another run holds the profile
+  [ "${lock_cache[$1]:-}" = held ] && return 0
+  if [ -e "$lock_dir/$1.lock" ] && ! flock -s -w "$lock_wait" "$lock_dir/$1.lock" true; then lock_cache[$1]=held; return 0; fi
+  return 1
+}
+unit_locked() { case $1 in *glide*) profile_locked glide.vc ;; *home*) profile_locked home ;; *) return 1 ;; esac; } # unit_locked UNIT-NAME
+hold_profile() { # hold_profile WS: take the shared lock for the probe + start of one account (the helper then answers busy); false when a login session holds it
+  # 0700 / 0600 like relogin and pm: a world-readable lock would let any local user hold it shared and block every exclusive taker
+  local old_umask; old_umask=$(umask); umask 077
+  if mkdir -p -m 0700 "$lock_dir" && exec {lock_fd}>>"$lock_dir/$1.lock"; then
+    umask "$old_umask"
+    flock -s -w "$lock_wait" "$lock_fd" && return 0
+  else umask "$old_umask"; fi
+  release_profile
+  lock_cache[$1]=held
+  return 1
+}
+release_profile() { if [ -n "${lock_fd:-}" ]; then exec {lock_fd}>&-; lock_fd=; fi; }
+login_assist_names=(pm-chatgpt-login-assist@.service pm-chatgpt-login-assist@.timer)
+login_assist_instances=(pm-chatgpt-login-assist@home pm-chatgpt-login-assist@glide.vc)
+login_assist_text() { render "$here/units/login-assist/$1"; }
+login_assist_ok() {
+  local n
+  for n in "${login_assist_names[@]}"; do text_ok "$units_dir/$n" "$(login_assist_text "$n" 2>/dev/null)" || return 1; done
+}
 timer_on() { [ "$(sc is-enabled "$1.timer" 2>/dev/null || true)" = enabled ] && [ "$(sc is-active "$1.timer" 2>/dev/null || true)" = active ]; }
 stale_list() {
   local n f
@@ -540,6 +588,7 @@ if [ "$mode" = check ]; then
   tunnel_gate_ok || problems+=("$tunnel_gate is missing or differs (guardian-tunnel needs a platform API key)")
   if control_active && ! control_ok; then problems+=("the control pass in $control_dir (${control_files[*]}, bin-quiet stubs) or $control_unit.service/.timer is missing or differs"); fi
   if [ "$audit_timers" = true ] && ! audit_ok; then problems+=("a pm-chatgpt-audit-<account> service/timer is missing or differs, or $here/audit-gate is not executable"); fi
+  if [ "$login_assist" = true ] && ! login_assist_ok; then problems+=("pm-chatgpt-login-assist@.service/.timer in $units_dir is missing or differs"); fi
   while IFS= read -r f; do problems+=("stale drop-in $f"); done < <(stale_list)
   if sc show -p Id --value default.target >/dev/null 2>&1; then
     for n in "${unit_names[@]}"; do
@@ -550,8 +599,11 @@ if [ "$mode" = check ]; then
     if [ "$audit_timers" = true ]; then
       for ws in "${workspaces[@]}"; do timer_on "$(audit_unit "$ws")" || problems+=("$(audit_unit "$ws").timer is not enabled and active"); done
     fi
+    if [ "$login_assist" = true ]; then
+      for n in "${login_assist_instances[@]}"; do timer_on "$n" || problems+=("$n.timer is not enabled and active"); done
+    fi
     for ws in "${workspaces[@]}"; do
-      if dep_ok "$ws"; then
+      if dep_ok "$ws" && ! profile_locked "$ws"; then
         for n in "chatgpt-guardian-${ws_unit[$ws]}-browser" "chatgpt-guardian-${ws_unit[$ws]}" "chatgpt-guardian-${ws_unit[$ws]}-observer"; do
           is_active "$n" || problems+=("$n.service is not active")
         done
@@ -600,6 +652,9 @@ if [ "$mode" = plan ]; then
   if [ "$audit_timers" != true ]; then echo "pm audit timers: not managed (audit_timers is false)"
   elif audit_ok && timer_on "$(audit_unit home)" && timer_on "$(audit_unit glide.vc)"; then echo "pm audit timers: $(audit_unit home) (:${audit_minute[home]}) and $(audit_unit glide.vc) (:${audit_minute[glide.vc]}) every 4 h ok and enabled"
   else echo "pm audit timers: render $(audit_unit home) / $(audit_unit glide.vc) service + timer (every 4 h at :${audit_minute[home]} / :${audit_minute[glide.vc]}, gated by $here/audit-gate), enable the timers"; fi
+  if [ "$login_assist" != true ]; then echo "login helper: not managed (login_assist is false)"
+  elif login_assist_ok && timer_on "${login_assist_instances[0]}" && timer_on "${login_assist_instances[1]}"; then echo "login helper: ${login_assist_instances[*]} (every 2 min) ok and enabled"
+  else echo "login helper: install pm-chatgpt-login-assist@.service/.timer and enable ${login_assist_instances[*]} timers (a signed-out account gets a login window, a notification and one Telegram message)"; fi
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
@@ -780,6 +835,15 @@ if [ "$audit_timers" = true ]; then
     done
   done
 fi
+if [ "$login_assist" = true ]; then
+  for n in "${login_assist_names[@]}"; do
+    text=$(login_assist_text "$n") || die "cannot render $n"
+    if ! text_ok "$units_dir/$n" "$text"; then
+      install_text "$units_dir/$n" "$text"
+      case $n in *.timer) rewritten_timers+=("${login_assist_instances[@]}") ;; esac
+    fi
+  done
+fi
 while IFS= read -r f; do rm -f -- "$f"; changed=1; done < <(stale_list)
 if [ "$changed" != 0 ]; then
   sc daemon-reload
@@ -803,7 +867,7 @@ start_unit() {
 # Only stopped units are started: a running browser keeps its windows; a changed unit takes effect at its next restart.
 for n in "${started_units[@]}"; do
   enable_unit "$n"
-  start_unit "$n"
+  unit_locked "$n" || start_unit "$n"
 done
 # restarts units that ended `failed` (never an operator-stopped one), whether or not a profile is signed in yet
 sc enable --now "$revive_unit.timer" >/dev/null || echo "warning: $revive_unit.timer failed to start" >&2
@@ -817,13 +881,14 @@ if [ "$audit_timers" = true ]; then
     timer_on "$(audit_unit "$ws")" || sc enable --now "$(audit_unit "$ws").timer" >/dev/null || echo "warning: $(audit_unit "$ws").timer failed to start" >&2
   done
 fi
-
 # logins live in the browser profiles: report, never fake. The --apply guardian of a workspace is enabled and
 # started only once its profile is signed in.
 signed_out=()
 unreachable=()
 desktop_browser=0
+login_held=()
 for ws in "${workspaces[@]}"; do
+  if ! hold_profile "$ws"; then login_held+=("$ws"); continue; fi
   state=unreachable
   for _ in $(seq "$login_attempts"); do
     state=$(login_state "${ws_port[$ws]}")
@@ -843,17 +908,28 @@ for ws in "${workspaces[@]}"; do
     no) signed_out+=("$ws") ;;
     *) unreachable+=("$ws") ;;
   esac
+  release_profile
 done
 
 # the started units must come up (a browser waits for its display; give them time before judging)
 down=()
 for n in "${to_start[@]}"; do
+  unit_locked "$n" && continue
   for _ in $(seq "$start_wait"); do is_active "$n" && break; sleep 1; done
   is_active "$n" || down+=("$n")
 done
+# the login helper timers go on last: its first run (the timer fires at once) stops units of a signed-out account, which the checks above must not mistake for failed starts
+if [ "$login_assist" = true ]; then
+  for n in "${login_assist_instances[@]}"; do
+    timer_on "$n" || sc enable --now "$n.timer" >/dev/null || echo "warning: $n.timer failed to start" >&2
+  done
+fi
 if [ ${#down[@]} -gt 0 ]; then
   echo "not running after start: ${down[*]} (journalctl --user -u <unit>; the home browser needs the desktop session's DISPLAY)" >&2
   exit 1
+fi
+if [ ${#login_held[@]} -gt 0 ]; then
+  echo "login session in progress for ${login_held[*]} (relogin / profile-sync / the login helper holds the profile): its units, DevTools port and sign-in were left alone"
 fi
 if [ ${#unreachable[@]} -gt 0 ]; then
   echo "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)" >&2

@@ -73,6 +73,7 @@ reason = "rendered from units/ and enabled by the chatgpt-guardian module"
 match = [
   "unit:guardian-proactive-control.service", "unit:guardian-proactive-control.timer",
   "unit:pm-chatgpt-audit-home.service", "unit:pm-chatgpt-audit-home.timer", "unit:pm-chatgpt-audit-glide.service", "unit:pm-chatgpt-audit-glide.timer",
+  "unit:pm-chatgpt-login-assist@.service", "unit:pm-chatgpt-login-assist@.timer", "unit:pm-chatgpt-login-assist@home.timer", "unit:pm-chatgpt-login-assist@glide.vc.timer",
 ]
 class = "tracked"
-reason = "rendered from units/control and units/audit and enabled by the chatgpt-guardian module (options control_pass_dir and audit_timers)"
+reason = "rendered from units/control and units/audit and enabled by the chatgpt-guardian module (options control_pass_dir, audit_timers and login_assist)"

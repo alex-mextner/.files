@@ -30,7 +30,7 @@ INSTALL_BLOCK = between("if control_active; then\n  install_file()", "while IFS=
 ENABLE_BLOCK = between("# the control pass and the audits are driven by their timers", "# logins live in the browser profiles")
 
 
-def harness(home, body, *, control="1", audit="true"):
+def harness(home, body, *, control="1", audit="true", login="false"):
     control_dir = f"{home}/state/control" if control == "1" else ""
     return f"""set -euo pipefail
 here={MODULE}
@@ -39,6 +39,7 @@ HOME={home}
 units_dir=$HOME/.config/systemd/user
 control_dir={control_dir}
 audit_timers={audit}
+login_assist={login}
 workspaces=(home glide.vc)
 declare -A ws_unit=([home]=home [glide.vc]=glide)
 sc() {{ :; }}

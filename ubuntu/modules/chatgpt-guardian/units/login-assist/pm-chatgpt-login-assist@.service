@@ -1,0 +1,27 @@
+# Installed by the chatgpt-guardian module (option login_assist); source: the pm-cli template `pm chatgpt unit login-assist-service`.
+# One instance per Guardian account (%i = home or glide.vc). The timer is the entry point; this oneshot has no [Install] section.
+# Nothing happens while the account is signed in or cannot be asked. When it is signed out the helper stops that account's Guardian units (so they do not
+# restart-loop on the failing sign-in gate), opens the login window on workspace 2, notifies the owner (desktop notification with an Open action plus one
+# Telegram message per cooldown), waits for the login (up to the wait limit; the service stays running, so the timer starts no second copy) and restarts the units.
+[Unit]
+Description=pm ChatGPT login helper for %i (window, notice and resume for a signed-out Guardian account)
+Documentation=https://git.hyperide.ai/ultrabricks/pm-cli
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/pm chatgpt login-assist --account %i
+# Whatever ended the run (error, SIGKILL after the stop timeout, a crash), the units this helper
+# stopped are started again; units the operator had stopped are never touched.
+ExecStopPost=-%h/.local/bin/pm chatgpt login-assist --account %i --restore
+Restart=no
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+# No Nice/CPUWeight/TasksMax: the login Chrome pm opens stays in this unit's cgroup, and the owner types into it.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pm-chatgpt-login-assist
+LogRateLimitIntervalSec=30min
+LogRateLimitBurst=40
+UMask=0077
+NoNewPrivileges=true
