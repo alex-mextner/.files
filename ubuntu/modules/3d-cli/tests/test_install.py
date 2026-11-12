@@ -26,6 +26,9 @@ if [ "$1" = init ] && [ "$2" = --env ]; then
   {writes_config}
   exit {init_rc}
 fi
+if [ "$1" = printer ] && [ "$2" = supervise ]; then
+  exit {supervise_rc}
+fi
 exit 64
 """
 
@@ -90,10 +93,18 @@ class ThreeDCliInstall(unittest.TestCase):
         self.link = os.path.join(self.home, ".local", "bin", "3d")
         self.config = os.path.join(self.home, ".config", "3d-cli", "printops.yaml")
 
-    def make_checkout(self, *, env_init=True, init_rc=0, writes_config=False, skips_bootstrap=True):
+    def make_checkout(
+        self, *, env_init=True, init_rc=0, writes_config=False, skips_bootstrap=True, unit_install=False, supervise_rc=0
+    ):
         os.makedirs(os.path.join(self.dir, "bin"))
         os.makedirs(os.path.join(self.dir, ".git"))
-        body = FAKE_3D.format(writes_config=WRITES_CONFIG if writes_config else ":", init_rc=init_rc)
+        body = FAKE_3D.format(
+            writes_config=WRITES_CONFIG if writes_config else ":", init_rc=init_rc, supervise_rc=supervise_rc
+        )
+        if unit_install:  # a checkout that ships the on-demand units (3d-cli#747)
+            os.makedirs(os.path.join(self.dir, "lib", "printer_ops"))
+            with open(os.path.join(self.dir, "lib", "printer_ops", "supervise_units.py"), "w") as fh:
+                fh.write('SUPERVISOR = "ondemand"\n')
         os.makedirs(os.path.join(self.dir, "lib", "commands"))
         with open(os.path.join(self.dir, "lib", "commands", "init.py"), "w") as fh:
             fh.write('HELP = "3d init [path] --name N"\n' + ('FLAG = "--env"\n' if env_init else ""))
@@ -103,6 +114,12 @@ class ThreeDCliInstall(unittest.TestCase):
         path = os.path.join(self.dir, "bin", "3d")
         with open(path, "w") as fh:
             fh.write(body)
+        os.chmod(path, 0o755)
+
+    def make_fake_3d(self, *, supervise_rc):
+        path = os.path.join(self.dir, "bin", "3d")
+        with open(path, "w") as fh:
+            fh.write(FAKE_3D.format(writes_config=":", init_rc=0, supervise_rc=supervise_rc))
         os.chmod(path, 0o755)
 
     def write_config(self, text):
@@ -116,8 +133,15 @@ class ThreeDCliInstall(unittest.TestCase):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key not in ("PRINTOPS_API", "PRINTOPS_TOKEN", "XDG_CONFIG_HOME")
+            if key not in ("PRINTOPS_API", "PRINTOPS_TOKEN", "XDG_CONFIG_HOME", "XDG_STATE_HOME")
         }
+        stub_dir = os.path.join(self.tmp, "stubbin")
+        os.makedirs(stub_dir, exist_ok=True)
+        stub = os.path.join(stub_dir, "systemctl")
+        with open(stub, "w") as fh:
+            fh.write('#!/bin/sh\necho "systemctl $*" >> "$HOME/calls.log"\n[ -e "$HOME/reload-fails" ] && exit 1\nexit 0\n')
+        os.chmod(stub, 0o755)
+        env["PATH"] = stub_dir + os.pathsep + env.get("PATH", "")
         env.update({"HOME": self.home, "UBUNTU_TWEAK_MODULE_CONFIG": json.dumps(table), **extra})
         return subprocess.run(["bash", SCRIPT, *args], env=env, capture_output=True, text=True, check=False)
 
@@ -434,6 +458,256 @@ class ThreeDCliInstall(unittest.TestCase):
             res = self.run_script("--check", config=bad)
             self.assertEqual(res.returncode, 1, (bad, res.stdout, res.stderr))
             self.assertIn("[modules.3d-cli]", res.stderr)
+
+    # -- retired always-on printer unit links (3d-cli#747, dotfiles #151) ---------------------------
+    def unit_dir(self):
+        return os.path.join(self.home, ".config", "systemd", "user")
+
+    def link_retired(self, rel, *, target_exists=False):
+        """The layout older applies left: ~/.config/systemd/user/REL -> <dotfiles>/.../files/.config/systemd/user/REL."""
+        target = os.path.join(
+            self.home, ".files", "ubuntu", "machines", "ubuntu-pc", "files", ".config", "systemd", "user", rel
+        )
+        if target_exists:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w") as fh:
+                fh.write("[Service]\n")
+        link = os.path.join(self.unit_dir(), rel)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(target, link)
+        return link
+
+    def supervise_calls(self):
+        return [c for c in self.calls() if c.startswith("3d printer supervise")]
+
+    def test_dangling_template_links_are_removed_and_the_units_are_installed_from_the_checkout(self):
+        self.make_checkout(unit_install=True)
+        watch = self.link_retired("3d-printer-watch@.service")
+        vision = self.link_retired("3d-printer-vision@.service")
+        gate = self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        keep = self.link_retired("3d-printer-watch@k1se.service.d/live-observer.conf", target_exists=True)
+        check = self.run_script("--check")
+        self.assertEqual(check.returncode, 3, check.stdout + check.stderr)
+        self.assertEqual(check.stdout.count("no longer carries"), 3)
+        plan = self.run_script("--plan")
+        self.assertIn("rm ", plan.stdout)
+        self.assertIn("printer supervise install --all --yes", plan.stdout)
+        self.assertTrue(os.path.islink(watch))  # check and plan change nothing
+        self.assertEqual(self.supervise_calls(), [])
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)  # 10 only for the unrelated Spoolman step
+        for path in (watch, vision, gate):
+            self.assertFalse(os.path.lexists(path), path)
+        self.assertTrue(os.path.islink(keep))  # a link that still resolves is never touched
+        self.assertEqual(self.supervise_calls(), ["3d printer supervise install --all --yes"] * 2)  # two passes
+
+    def test_the_unit_installer_runs_twice_with_a_reload_between_and_one_after_the_links_are_gone(self):
+        """Pass one writes the templates; only then does systemd know the worker instances (enablement, cached
+        --dry-run definitions), so the reload comes first and pass two acts on what was really loaded."""
+        self.make_checkout(unit_install=True)
+        self.link_retired("3d-printer-watch@.service")
+        self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        self.run_script()
+        install = "3d printer supervise install --all --yes"
+        reload = "systemctl --user daemon-reload"
+        steps = [c for c in self.calls() if c in (install, reload)]
+        self.assertEqual(steps, [install, reload, install, reload])
+
+    def test_a_second_run_finds_nothing_left_to_migrate(self):
+        self.make_checkout(unit_install=True)
+        self.link_retired("3d-printer-watch@.service")
+        self.run_script()
+        again = self.run_script("--check")
+        self.assertNotIn("no longer carries", again.stdout)
+        self.run_script()
+        self.assertEqual(len(self.supervise_calls()), 2)  # migrated once (two passes), not on every apply
+
+    def test_a_regular_file_or_a_still_resolving_link_is_never_removed(self):
+        self.make_checkout(unit_install=True)
+        regular = os.path.join(self.unit_dir(), "3d-printer-watch@.service")
+        os.makedirs(self.unit_dir())
+        with open(regular, "w") as fh:
+            fh.write("# managed-by: 3d printer supervise install\n")
+        resolving = self.link_retired("3d-printer-vision@.service", target_exists=True)
+        self.run_script()
+        self.assertTrue(os.path.isfile(regular) and os.path.islink(resolving))
+        self.assertEqual(self.supervise_calls(), [])
+
+    def test_a_dangling_link_elsewhere_is_not_ours(self):
+        self.make_checkout(unit_install=True)
+        os.makedirs(self.unit_dir())
+        other = os.path.join(self.unit_dir(), "3d-printer-watch@.service")
+        os.symlink("/nonexistent/other/place.service", other)
+        self.run_script()
+        self.assertTrue(os.path.islink(other))
+        self.assertEqual(self.supervise_calls(), [])
+
+    def test_a_checkout_that_cannot_install_the_units_is_a_manual_step_after_the_link_is_gone(self):
+        self.make_checkout(unit_install=False)
+        watch = self.link_retired("3d-printer-watch@.service")
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("3d printer supervise install --all --yes", res.stderr)
+        self.assertTrue(os.path.islink(watch))  # kept: the migration is still pending, --check says so
+        self.assertEqual(self.run_script("--check").returncode, 3)
+        self.assertEqual(self.supervise_calls(), [])
+
+    def test_a_failing_unit_install_is_a_manual_step(self):
+        self.make_checkout(unit_install=True, supervise_rc=3)
+        self.link_retired("3d-printer-vision@.service")
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("exited 3", res.stderr)
+
+    def test_a_failed_unit_install_is_retried_by_the_next_apply_not_forgotten(self):
+        self.make_checkout(unit_install=True, supervise_rc=3)
+        link = self.link_retired("3d-printer-vision@.service")
+        self.run_script()
+        self.assertTrue(os.path.islink(link))  # the trigger survives the failure
+        self.assertIn("no longer carries", self.run_script("--check").stdout)
+        os.remove(os.path.join(self.dir, "bin", "3d"))
+        self.make_fake_3d(supervise_rc=0)  # the installer works now
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)
+        self.assertEqual(self.supervise_calls(), ["3d printer supervise install --all --yes"] * 3)  # 1 failed + 2
+        self.assertFalse(os.path.lexists(link))
+
+    def test_a_failure_after_the_installer_replaced_the_links_is_still_retried(self):
+        """The real installer replaces a dangling template link with the file first and only then reloads and
+        enables: its failure must not make the migration look done (the link, the retry trigger, is gone)."""
+        self.make_checkout(unit_install=True, supervise_rc=3)
+        link = self.link_retired("3d-printer-watch@.service")
+        # the stand-in installer: replaces the link with a real file (as `supervise install` does), then fails
+        path = os.path.join(self.dir, "bin", "3d")
+        with open(path, "w") as fh:
+            fh.write(
+                FAKE_3D.format(writes_config=":", init_rc=0, supervise_rc=3).replace(
+                    "  exit 3\nfi",
+                    f'  rm -f "{link}"; echo "# managed-by: x" > "{link}"; exit 3\nfi',
+                )
+            )
+        os.chmod(path, 0o755)
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertFalse(os.path.islink(link))  # the retry trigger is gone ...
+        check = self.run_script("--check")
+        self.assertEqual(check.returncode, 3, check.stdout + check.stderr)  # ... but the drift is still reported
+        self.assertIn("did not finish last time", check.stdout)
+        self.make_fake_3d(supervise_rc=0)  # the installer works now
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)
+        self.assertEqual(len(self.supervise_calls()), 3)  # retried (1 failed pass + 2)
+        self.assertNotIn("did not finish last time", self.run_script("--check").stdout)
+        self.run_script()
+        self.assertEqual(len(self.supervise_calls()), 3)  # and not again once it succeeded
+
+    def test_a_failed_daemon_reload_keeps_the_marker_so_the_next_apply_reloads_again(self):
+        """A retry finds the units already written, so the installer plans no action and would never reload."""
+        self.make_checkout(unit_install=True)
+        self.link_retired("3d-printer-watch@.service")
+        open(os.path.join(self.home, "reload-fails"), "w").close()
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("daemon-reload", res.stderr)
+        self.assertIn("did not finish last time", self.run_script("--check").stdout)
+        os.remove(os.path.join(self.home, "reload-fails"))
+        self.run_script()
+        reloads = [c for c in self.calls() if c == "systemctl --user daemon-reload"]
+        self.assertGreaterEqual(len(reloads), 2)
+        self.assertNotIn("did not finish last time", self.run_script("--check").stdout)
+
+    def test_removing_a_gate_drop_in_alone_reloads_systemd_and_a_failed_reload_is_retried(self):
+        """A loaded instance keeps the cached Condition of the removed intentional-off gate until systemd re-reads
+        its units; the engine's own reload does not run for a single module."""
+        self.make_checkout(unit_install=True)
+        gate = self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        open(os.path.join(self.home, "reload-fails"), "w").close()
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertFalse(os.path.lexists(gate))  # the link is gone, so only the marker can say it is unfinished
+        self.assertIn("did not finish last time", self.run_script("--check").stdout)
+        os.remove(os.path.join(self.home, "reload-fails"))
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)
+        self.assertNotIn("did not finish last time", self.run_script("--check").stdout)
+        self.assertIn("systemctl --user daemon-reload", self.calls())
+
+    def test_an_older_checkout_with_a_dangling_gate_only_retries_the_reload_not_the_unit_installer(self):
+        self.make_checkout(unit_install=False)
+        self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        open(os.path.join(self.home, "reload-fails"), "w").close()
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("daemon-reload", res.stderr)
+        os.remove(os.path.join(self.home, "reload-fails"))
+        res = self.run_script()
+        self.assertNotIn("cannot install the on-demand", res.stderr)  # the checkout is not asked for units
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)  # 10 only for the Spoolman step
+        self.assertNotIn("did not finish last time", self.run_script("--check").stdout)
+
+    def test_the_links_are_found_in_the_home_directory_whatever_xdg_config_home_says(self):
+        """The files planner linked them under $HOME/.config/systemd/user; the manager reads that directory."""
+        self.make_checkout(unit_install=True)
+        link = self.link_retired("3d-printer-watch@.service")
+        res = self.run_script(XDG_CONFIG_HOME=os.path.join(self.tmp, "elsewhere"))
+        self.assertFalse(os.path.lexists(link), res.stdout + res.stderr)
+        self.assertEqual(len(self.supervise_calls()), 2)
+
+    def test_an_empty_marker_is_read_as_units_pending_not_as_reload_only(self):
+        """A torn marker must not downgrade an unfinished install to a reload: redoing the install is harmless."""
+        self.make_checkout(unit_install=True)
+        marker_dir = os.path.join(self.home, ".local", "state", "ubuntu-tweak")
+        os.makedirs(marker_dir)
+        open(os.path.join(marker_dir, "3d-cli-unit-migration.pending"), "w").close()
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)
+        self.assertEqual(len(self.supervise_calls()), 2)
+        self.assertNotIn("did not finish last time", self.run_script("--check").stdout)
+
+    def test_an_unwritable_state_directory_stops_before_the_installer_runs(self):
+        self.make_checkout(unit_install=True)
+        link = self.link_retired("3d-printer-watch@.service")
+        state = os.path.join(self.home, ".local", "state")
+        os.makedirs(state)
+        os.chmod(state, 0o555)
+        self.addCleanup(os.chmod, state, 0o755)
+        if os.access(state, os.W_OK):
+            self.skipTest("the directory stays writable (running as root)")
+        res = self.run_script(XDG_STATE_HOME=state)
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("retry marker", res.stderr)
+        self.assertEqual(self.supervise_calls(), [])  # the installer did not run: nothing was replaced
+        self.assertTrue(os.path.islink(link))
+
+    def test_plan_for_a_dangling_gate_drop_in_alone_does_not_announce_the_unit_installer(self):
+        self.make_checkout(unit_install=False)
+        self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        plan = self.run_script("--plan")
+        self.assertIn("rm ", plan.stdout)
+        self.assertNotIn("supervise install", plan.stdout)
+        self.assertNotIn("cannot install the on-demand units", plan.stdout)
+        res = self.run_script()
+        self.assertIn(res.returncode, (0, 10), res.stdout + res.stderr)  # 10 only for the Spoolman step
+        self.assertEqual(self.supervise_calls(), [])
+        self.assertFalse(os.path.lexists(os.path.join(self.unit_dir(), "3d-printer-watch@k1se.service.d/intentional-off.conf")))
+
+    def test_a_link_that_cannot_be_removed_is_a_manual_step_not_a_success(self):
+        self.make_checkout(unit_install=True)
+        gate = self.link_retired("3d-printer-watch@k1se.service.d/intentional-off.conf")
+        os.chmod(os.path.dirname(gate), 0o555)  # unlink needs write permission on the directory
+        self.addCleanup(os.chmod, os.path.dirname(gate), 0o755)
+        if os.access(os.path.dirname(gate), os.W_OK):
+            self.skipTest("the directory stays writable (running as root)")
+        res = self.run_script()
+        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
+        self.assertIn("cannot remove", res.stderr)
+        self.assertTrue(os.path.islink(gate))
+
+    def test_without_a_checkout_the_links_are_left_alone(self):
+        link = self.link_retired("3d-printer-watch@.service")
+        res = self.run_script()
+        self.assertEqual(res.returncode, 0)
+        self.assertTrue(os.path.islink(link))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,16 @@
 #      It is read, never run: `3d` bootstraps itself (config migration, library clones) before it prints even
 #      its help, and --check / --plan must change nothing. An older checkout is reported and skipped; update it
 #      and the next apply picks the step up.
+#   5. no link of the RETIRED always-on printer units dangles. Until 3d-cli#747 this repository carried the user units
+#      3d-printer-{watch,vision}@.service and the k1se intentional-off drop-ins, and apply linked them into
+#      ~/.config/systemd/user. 3d-cli now ships the units itself (`3d printer supervise install`, on demand), so those
+#      files are gone here and every link that still points at them dangles: systemd cannot load a template through
+#      it, the printer supervision silently stops. When a template link dangles, install first installs the units from
+#      the checkout (`3d printer supervise install --all --yes`, run twice with a `systemctl --user daemon-reload`
+#      between: the second pass sees what systemd loaded from the new files; a checkout that cannot, or an installer
+#      that fails, ends with exit 10 and the next apply retries), then removes the dangling links that remain (only a
+#      symlink into a `files/.config/systemd/user/3d-printer-*` path, never a regular file and never a link that
+#      still resolves; a removal that fails is exit 10) and reloads systemd once more.
 #   4. the Spoolman / PrintOps client is configured, resolved like the client does: `api` from $PRINTOPS_API, else
 #      from ~/.config/3d-cli/printops.yaml ($XDG_CONFIG_HOME/3d-cli/ when set); an empty, null or unparsable value
 #      does not count. The token is optional (a plain Spoolman server has none). Read from files and the environment only: no
@@ -78,6 +88,51 @@ tool="$dir/bin/3d"
 config="${XDG_CONFIG_HOME:-$HOME/.config}/3d-cli/printops.yaml"
 init_cmd=("$tool" init --env --no-input --spoolman auto)
 
+# the directory the retired links were made in: the files planner links under $HOME/.config whatever XDG_CONFIG_HOME says
+unit_dir="$HOME/.config/systemd/user"
+retired_links=(
+  3d-printer-watch@.service
+  3d-printer-vision@.service
+  3d-printer-watch@k1se.service.d/intentional-off.conf
+  3d-printer-vision@k1se.service.d/intentional-off.conf
+)
+# the retired links that dangle (fact 5): one relative path per line
+dangling_retired() {
+  local rel target
+  for rel in "${retired_links[@]}"; do
+    [ -L "$unit_dir/$rel" ] && [ ! -e "$unit_dir/$rel" ] || continue
+    target=$(readlink "$unit_dir/$rel")
+    case "$target" in */files/.config/systemd/user/3d-printer-*) echo "$rel" ;; esac
+  done
+}
+# set before the migration steps run and removed when all succeeded: the installer replaces the dangling template links
+# itself and the links are removed here, so a failure afterwards would otherwise forget the migration. It holds the
+# stage that must be retried: `units` (the unit installer, then the reload) or `reload` (only the reload).
+pending_marker="${XDG_STATE_HOME:-$HOME/.local/state}/ubuntu-tweak/3d-cli-unit-migration.pending"
+migration_pending() { [ -e "$pending_marker" ] || [ -n "$(dangling_retired)" ]; }
+# does the pending migration need the unit installer (a template link dangles or an earlier install did not finish)?
+# A dangling gate drop-in alone only needs its link removed and a reload. One predicate for --plan and install.
+migration_needs_units() {
+  # anything but a clean `reload` (an empty or torn file included) counts as `units`: redoing the install is harmless
+  [ -e "$pending_marker" ] && ! grep -qx reload "$pending_marker" 2>/dev/null && return 0
+  case "$(dangling_retired)" in *@.service*) return 0 ;; esac
+  return 1
+}
+# a checkout that ships the on-demand units can install them (looked up in its source: never run in --check/--plan)
+has_unit_install() { grep -qF 'ondemand' "$dir/lib/printer_ops/supervise_units.py" 2>/dev/null; }
+
+# the unit installer, from $HOME (the engine's working directory is the module directory in the dotfiles repository)
+run_unit_installer() {
+  local rc=0
+  (cd "$HOME" && timeout 120 "$tool" printer supervise install --all --yes </dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || { echo "needs manual: \`3d printer supervise install --all --yes\` exited $rc; run it and read what it says (the next apply retries)" >&2; return 1; }
+}
+# the installer only reloads when it wrote something, so a retry would never reload: the pending marker is cleared only
+# once systemd has really re-read the units
+reload_units() {
+  systemctl --user daemon-reload || { echo "needs manual: \`systemctl --user daemon-reload\` failed after the printer units changed (the next apply retries)" >&2; return 1; }
+}
+
 has_checkout() { [ -f "$tool" ] && [ -e "$dir/.git" ]; }
 link_ok() { [ -L "$bin/3d" ] && [ "$(readlink -f "$bin/3d")" = "$(readlink -f "$tool")" ]; }
 link_foreign() { [ -e "$bin/3d" ] || [ -L "$bin/3d" ]; }   # something is at the link path, and link_ok said it is not ours
@@ -133,6 +188,10 @@ if [ "$mode" = check ]; then
     if link_foreign; then problems+=("$bin/3d exists and is not a link to $tool (install will ask you to move it)")
     else problems+=("$bin/3d is missing"); fi
   fi
+  while IFS= read -r rel; do
+    [ -n "$rel" ] && problems+=("$unit_dir/$rel is a link to a unit file this repository no longer carries (install removes it and installs the units from the checkout)")
+  done < <(dangling_retired)
+  [ ! -e "$pending_marker" ] || problems+=("the migration of the retired printer unit links did not finish last time (install retries it)")
   if [ "$spoolman" = auto ] && ! configured && has_env_init; then
     if [ "$state" -eq 2 ]; then problems+=("Spoolman / PrintOps client is not configured: $(unparsable)")
     else problems+=("Spoolman / PrintOps client is not configured ($config has no api:)"); fi
@@ -153,6 +212,13 @@ if [ "$mode" = plan ]; then
   if link_ok; then echo "link: $bin/3d already points at $tool"
   elif link_foreign; then echo "link: $bin/3d exists and is not a link to $tool: needs manual"
   else echo "ln -s $tool $bin/3d"; fi
+  while IFS= read -r rel; do
+    [ -n "$rel" ] && echo "rm $unit_dir/$rel   # retired link: the file is gone from this repository"
+  done < <(dangling_retired)
+  if migration_needs_units; then
+    if has_unit_install; then echo "$tool printer supervise install --all --yes   # the on-demand units, from the checkout"
+    else echo "units: $dir cannot install the on-demand units yet (update it): needs manual"; fi
+  fi
   if [ "$spoolman" = skip ]; then echo "spoolman: declined on this machine ([modules.3d-cli] spoolman = \"skip\")"
   elif configured; then echo "spoolman: client configured in $config (nothing to do)"
   elif ! has_env_init; then echo "spoolman: this checkout has no \`3d init --env\` yet (update it); skipped"
@@ -172,6 +238,48 @@ if ! link_ok; then
   mkdir -p "$bin"
   if ln -sT "$tool" "$bin/3d" 2>/dev/null; then echo "linked $bin/3d -> $tool"
   elif ! link_ok; then echo "needs manual: cannot link $bin/3d to $tool (something else is there); move it away" >&2; exit 10; fi
+fi
+
+# fact 5: install the units the checkout ships FIRST, then drop the dangling retired links that are left. A link that
+# triggers the migration is only removed once nothing is pending any more, so a failed or impossible install is
+# retried by the next apply (and --check keeps reporting the drift) instead of being forgotten. The unit installer
+# replaces a dangling template link with the real file itself, which is why a marker file records that the install
+# is pending until it has succeeded. With no dangling link and no marker this block does nothing.
+if migration_pending; then
+  needs_units=0
+  migration_needs_units && needs_units=1   # decided BEFORE the marker below exists: the marker alone also says yes
+  if [ "$needs_units" -eq 1 ] && ! has_unit_install; then
+    echo "needs manual: $dir cannot install the on-demand printer units yet; update it, then run: 3d printer supervise install --all --yes" >&2; exit 10
+  fi
+  # the marker is what makes any failure below retry once the links, the retry triggers, are gone: it is written
+  # first (the installer must not run without it) and removed only when every step has succeeded
+  stage=reload
+  [ "$needs_units" -eq 1 ] && stage=units
+  # written whole or not at all: a torn marker must not downgrade a pending `units` stage
+  if ! { mkdir -p "$(dirname "$pending_marker")" && printf '%s\n' "$stage" > "$pending_marker.new" && mv -f "$pending_marker.new" "$pending_marker"; }; then
+    echo "needs manual: cannot write $pending_marker (the retry marker of the printer unit migration); fix the permissions, or run: 3d printer supervise install --all --yes" >&2; exit 10
+  fi
+  if [ "$needs_units" -eq 1 ]; then
+    # Two passes with a reload between them. The installer decides what to disable or restart from what systemd has
+    # loaded: with the template links dangling a fresh manager reports the worker instances as not enabled (no
+    # unit file), although their default.target.wants links survive, and a retry after a failed reload would
+    # restart workers on definitions that are still cached. Once the units are written and reloaded, the second
+    # pass sees the real state and fixes both. It is a no-op when there is nothing left to do.
+    run_unit_installer || exit 10
+    reload_units || exit 10
+    run_unit_installer || exit 10
+  fi
+  failed=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if rm -f "$unit_dir/$rel"; then echo "removed $unit_dir/$rel (retired always-on unit link)"
+    else echo "needs manual: cannot remove $unit_dir/$rel (a retired always-on unit link); remove it by hand" >&2; failed=1; fi
+  done < <(dangling_retired)
+  # a gate drop-in that is gone only takes effect once systemd has re-read its units (a loaded instance keeps its
+  # cached Condition), and the engine's own reload does not run for a single module
+  reload_units || exit 10
+  [ "$failed" -eq 0 ] || exit 10
+  rm -f "$pending_marker"
 fi
 
 [ "$spoolman" = auto ] || { echo "spoolman: declined on this machine"; exit 0; }
