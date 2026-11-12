@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# tmux-save-debounce: what tmux's layout hooks run (`run-shell -b`, see tmux-lib's tl_assert_hooks): a save of the server
+# when sessions, windows or panes appear, go away or are renamed, without a save per event. A burst of events (restoring
+# 16 windows, closing a session full of panes) costs ONE save, taken TMUX_SAVE_DEBOUNCE seconds (default 60) after the
+# first event of the burst, so at most one event-driven save per window; the trailing edge sees the final layout.
+#
+# How: every event stamps `debounce.dirty`; the first caller takes the debounce lock and becomes the one waiter (all the
+# others return at once, their event is covered); it sleeps the window out, saves through tmux-save-now, and goes round
+# again only if an event arrived during that save.
+#
+# This trigger lives inside the server's own hook table, so it survives what kills continuum's status-right trigger
+# (a client that runs `set -g status-right` with no value). The hooks are (re)asserted by tmux-autosave and tmux-watchdog
+# on every run: a tmux restart loses them until the next one.
+#
+#   TMUX_SAVE_DEBOUNCE   seconds (default 60)
+#   TMUX_SAVE_DEBOUNCE_BEFORE_UNLOCK   a command run between the last "no new event" check and the lock release (tests only)
+#   TMUX_SAVE_DEBOUNCE_BEFORE_EXIT     the same, after the last release, just before the script ends (tests only)
+#   TMUX_BOOT_STATE_DIR  where the lock and stamps live (default ~/.local/state/tmux-boot)
+set -u
+
+window=${TMUX_SAVE_DEBOUNCE:-60}
+case $window in ''|*[!0-9]*) echo "tmux-save-debounce: TMUX_SAVE_DEBOUNCE must be whole seconds, got '$window'" >&2; exit 2 ;; esac
+
+lib=$(dirname "$(readlink -f "$0")")/tmux-lib
+# shellcheck source=tmux-lib
+. "$lib" || { echo "tmux-save-debounce: cannot load $lib" >&2; exit 1; }
+
+state=$(tl_state_dir)
+mkdir -p "$state" 2>/dev/null || { echo "tmux-save-debounce: cannot create $state" >&2; exit 1; }
+dirty="$state/debounce.dirty"
+
+# the hooks run us as `run-shell -b`, and tmux shows a finished background job's output in view mode over the
+# CURRENT pane: nothing this script or tmux-save-now prints may reach stdout or stderr here (tmux-save-now's own
+# record is the save-status file in the state directory)
+exec >/dev/null 2>&1
+
+# the event is recorded first: whoever holds the lock sees it, or becomes the one who saves it
+touch "$dirty"
+exec 7>"$state/debounce.lock"
+flock -n 7 || exit 0
+
+dirty_mark() { stat -c %.9Y -- "$dirty" 2>/dev/null || echo 0; }
+while :; do
+  sleep "$window"
+  mark=$(dirty_mark)
+  # the lock descriptor stays out of the saver's children
+  "$(tl_dir)/tmux-save-now" --reason event 7>&- || echo "tmux-save-debounce: the event-driven save failed" >&2
+  # an event during the save is a change the snapshot may not hold: save once more, after another window
+  [ "$(dirty_mark)" = "$mark" ] || continue
+  # An event that stamps `dirty` after the check above but before the lock is released finds the lock busy and returns
+  # as "covered" while this run is about to exit. So release the lock first, then look once more: an event from then on
+  # takes the lock itself; one that slipped into the gap is seen here, and the lock is taken back for it (when that
+  # fails, another run owns the lock and covers it).
+  [ -z "${TMUX_SAVE_DEBOUNCE_BEFORE_UNLOCK:-}" ] || sh -c "$TMUX_SAVE_DEBOUNCE_BEFORE_UNLOCK" || true # a test injects its event here
+  flock -u 7
+  [ "$(dirty_mark)" != "$mark" ] || break
+  flock -n 7 || break
+done
+# the lock is free from here on (it was released before the last check): an event now becomes the worker itself
+[ -z "${TMUX_SAVE_DEBOUNCE_BEFORE_EXIT:-}" ] || sh -c "$TMUX_SAVE_DEBOUNCE_BEFORE_EXIT" || true # a test injects its event here

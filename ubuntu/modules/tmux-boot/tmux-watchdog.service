@@ -1,0 +1,13 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): asserts the tmux save/restore invariants, self-heals, alerts.
+[Unit]
+Description=Check the tmux save/restore chain (autosave, hooks, snapshots, session maps), repair it and alert when it cannot be
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-watchdog
+# recovery starts a tmux server as a descendant of this unit (rig runs the boot script, which runs tmux new-session):
+# when this oneshot ends, systemd must not kill what is left in its control group -- the server it just restored.
+# KillMode=process ends only the watchdog itself (tmux-boot.service sets the same for the same reason).
+KillMode=process
+# a forced save and, with recovery on, rig's identity-checked server restart both run inside one pass
+TimeoutStartSec=240

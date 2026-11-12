@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# tmux-save-now [--reason NAME] [--force]: THE guarded save of the running tmux server, the one entry every trigger uses
+# (the autosave timer, tmux's event hooks, the shutdown watcher, the watchdog, and continuum's own status-right trigger,
+# which reaches it through tmux-resurrect-save, the wrapper that @resurrect-save-script-path points at).
+#
+# It runs tmux-resurrect's real save script, so rig's @resurrect-hook-post-save-all still writes the omp/claude/codex
+# session maps, and then judges the result before it is allowed to be what a reboot restores:
+#
+#   * single flight: one save runs at a time (flock). A request that arrives meanwhile queues behind it, at most ONE
+#     request waits; any further one is covered by the queued run and returns at once.
+#   * a DEGENERATE snapshot never replaces `last`: fewer panes or windows than the previous good snapshot by more than
+#     TMUX_SAVE_NOW_TOLERANCE percent, a bare single window after a richer layout, or no omp/claude/codex pane where the
+#     previous one had some (a fresh server that has not restored yet, a crashed restore). The file is kept under
+#     <resurrect dir>/degenerate/ for forensics, `last`, the pane archive and rig's session maps go back to what they
+#     were, and tmux-alert fires (once per 6 h). A smaller state that persists TMUX_SAVE_NOW_ACCEPT_AFTER seconds is the
+#     new reality and is accepted; --force accepts it at once.
+#   * `last-with-harness` always points at the newest accepted snapshot that holds an omp/claude/codex pane, so a restore
+#     can still bring the agents back when `last` is a plain-shell layout.
+#   * every accepted snapshot keeps its pane archive and the session maps next to it (pane_contents_<stamp>.tar.gz,
+#     maps/<stamp>/), for tmux-boot's restore of an older snapshot.
+#   * retention replaces resurrect's own prune (which keeps the 5 newest and only deletes files older than 30 days):
+#     the newest TMUX_SAVE_NOW_KEEP snapshots (48) plus the newest one of each day for TMUX_SAVE_NOW_KEEP_DAYS days
+#     (14); the targets of `last` and `last-with-harness` are never removed. resurrect's own prune is pushed out of
+#     the way (@resurrect-delete-backup-after 3650). This is a deliberate policy, not resurrect's: 48 plus 14 days
+#     of dailies is what a reboot wants to choose from.
+#
+# Exit 0: saved, or deliberately skipped (no server, a degenerate snapshot held back, covered by a queued run).
+# Exit 1: the save failed (no saver, unwritable directory, saver failed, no lock in time): journald has the reason.
+# Exit 2: usage.
+#
+#   TMUX_AUTOSAVE_TMUX         tmux executable, one word (default tmux); tests point it at a throwaway socket
+#   TMUX_SAVE_NOW_SAVER        tmux-resurrect's real save script (default: the one @resurrect-save-script-path or
+#                              @tmux-boot-resurrect-save-script names, else ~/.tmux/plugins/tmux-resurrect/scripts/save.sh)
+#   TMUX_SAVE_NOW_MAP_DIR      where rig keeps its omp/cc/codex session maps (default ~/.config/rig/tmux)
+#   TMUX_SAVE_NOW_TOLERANCE    percent of panes/windows a save may lose against the previous one (default 50)
+#   TMUX_SAVE_NOW_MIN_PANES    the percentage rules apply only when the previous snapshot has this many (default 4)
+#   TMUX_SAVE_NOW_ACCEPT_AFTER seconds a degenerate state must persist before it is accepted (default 21600)
+#   TMUX_SAVE_NOW_KEEP / _KEEP_DAYS   retention (48 snapshots, 14 days)
+#   TMUX_SAVE_NOW_LOCK_WAIT    seconds the one queued request waits for the running save (default 240)
+#   TMUX_SAVE_NOW_TIMEOUT      seconds the real save script may run (default 180)
+#   TMUX_BOOT_STATE_DIR        state (lock files, status, degenerate-since; default ~/.local/state/tmux-boot)
+set -u
+
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+# a systemd user manager hands out a minimal PATH: add the user's tool dirs (rig, tg-ctl, lsof used by the hooks)
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+# always the default socket (or the one TMUX_AUTOSAVE_TMUX names), never whichever server a calling pane belongs to
+unset TMUX
+
+reason=manual
+force=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --reason) [ $# -ge 2 ] || { echo "tmux-save-now: --reason needs a value" >&2; exit 2; }; reason=$2; shift 2 ;;
+    --reason=*) reason=${1#--reason=}; shift ;;
+    --force) force=1; shift ;;
+    quiet) shift ;; # continuum starts the saver as `save.sh quiet`
+    *) echo "usage: tmux-save-now [--reason NAME] [--force]" >&2; exit 2 ;;
+  esac
+done
+
+lib=$(dirname "$(readlink -f "$0")")/tmux-lib
+# shellcheck source=tmux-lib
+. "$lib" || { echo "tmux-save-now: cannot load $lib" >&2; exit 1; }
+
+num() { # num VAR DEFAULT: a whole number from the environment variable VAR, or a usage error
+  local value=${!1:-$2}
+  case $value in ''|*[!0-9]*) echo "tmux-save-now: $1 must be a whole number, got '$value'" >&2; exit 2 ;; esac
+  printf '%s' "$((10#$value))" # "08" is eight, not a bad octal number
+}
+tolerance=$(num TMUX_SAVE_NOW_TOLERANCE 50) || exit 2
+accept_after=$(num TMUX_SAVE_NOW_ACCEPT_AFTER 21600) || exit 2
+keep=$(num TMUX_SAVE_NOW_KEEP 48) || exit 2
+keep_days=$(num TMUX_SAVE_NOW_KEEP_DAYS 14) || exit 2
+lock_wait=$(num TMUX_SAVE_NOW_LOCK_WAIT 240) || exit 2
+save_timeout=$(num TMUX_SAVE_NOW_TIMEOUT 180) || exit 2
+export TMUX_SAVE_NOW_TOLERANCE=$tolerance
+
+state=$(tl_state_dir)
+map_dir=${TMUX_SAVE_NOW_MAP_DIR:-$HOME/.config/rig/tmux}
+mkdir -p "$state" 2>/dev/null || { echo "tmux-save-now: cannot create $state" >&2; exit 1; }
+
+status() { # status RESULT DETAIL: the last outcome (save-status, for the watchdog) and a bounded history (save-history, for a human)
+  local line
+  line=$(printf 'epoch=%s result=%s reason=%s detail=%s' "$(date +%s)" "$1" "$reason" "$2")
+  printf '%s\n' "$line" > "$state/save-status.tmp" && mv -f "$state/save-status.tmp" "$state/save-status"
+  printf '%s\n' "$line" >> "$state/save-history"
+  if [ "$(wc -l < "$state/save-history")" -gt 400 ]; then
+    tail -n 200 "$state/save-history" > "$state/save-history.tmp" && mv -f "$state/save-history.tmp" "$state/save-history"
+  fi
+}
+fail() { echo "tmux-save-now: $*" >&2; status failed "$*"; exit 1; }
+log() { echo "tmux-save-now: $*"; }
+
+# the saver's own hooks never come back through here: a nested call would wait for the lock it is inside of
+if [ -n "${TMUX_SAVE_NOW_ACTIVE:-}" ]; then
+  log "called from inside a running save, nothing to do"
+  exit 0
+fi
+
+command -v "$tmux_bin" >/dev/null 2>&1 || fail "tmux is not installed"
+if ! "$tmux_bin" list-sessions >/dev/null 2>&1; then
+  log "no tmux server, nothing to save"
+  status skipped "no tmux server"
+  exit 0
+fi
+
+saver=${TMUX_SAVE_NOW_SAVER:-$(tl_real_saver)}
+[ -n "$saver" ] && [ -x "$saver" ] || fail "tmux-resurrect's save script is missing ('$saver')"
+rdir=$(tl_resurrect_dir)
+{ mkdir -p "$rdir" 2>/dev/null && [ -w "$rdir" ]; } || fail "the snapshot directory $rdir cannot be written"
+
+# ── single flight, one waiter ───────────────────────────────────────────────────────────────────────────────────────
+exec 8>"$state/save-now.lock" 9>"$state/save-now.queue"
+if ! flock -n 8; then
+  if flock -n 9; then
+    log "a save is running, this request ($reason) waits for it"
+    flock -w "$lock_wait" 8 || fail "the running save did not finish within ${lock_wait}s ($reason)"
+    flock -u 9
+  else
+    log "a save is running and another request already waits, this one ($reason) is covered by it"
+    exit 0
+  fi
+fi
+
+work=$(mktemp -d "$state/save-now.XXXXXX") || fail "cannot create a work directory in $state"
+trap 'rm -rf "$work"' EXIT
+tl_set_option @resurrect-delete-backup-after 3650
+
+# ── what `last` is before the save ──────────────────────────────────────────────────────────────────────────────────
+prev_target=$(readlink -f -- "$rdir/last" 2>/dev/null || true)
+[ -f "$prev_target" ] || prev_target=""
+[ -z "$prev_target" ] || cp -p -- "$prev_target" "$work/prev.txt" 2>/dev/null || prev_target=""
+[ ! -f "$rdir/pane_contents.tar.gz" ] || cp -p -- "$rdir/pane_contents.tar.gz" "$work/pane_contents.tar.gz"
+mkdir -p "$work/maps"
+for m in "$map_dir"/*-sessions.map; do [ ! -f "$m" ] || cp -p -- "$m" "$work/maps/"; done
+
+# ── the real save (rig's post-save hooks run inside it) ─────────────────────────────────────────────────────────────
+# tmux-resurrect names a snapshot after the current second: a save in the second of the previous snapshot would overwrite
+# it (and then delete it, seeing it equal to `last`), so wait the second out
+[ ! -e "$rdir/tmux_resurrect_$(date +%Y%m%dT%H%M%S).txt" ] || sleep 1
+# the lock descriptors stay out of the saver's children: a hook that daemonises must not hold the lock after we exit
+TMUX_SAVE_NOW_ACTIVE=1 timeout "$save_timeout" "$saver" quiet 8>&- 9>&-
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "tmux-save-now: the save script ($saver) exited $rc ($reason)" >&2
+fi
+
+cur_target=$(readlink -f -- "$rdir/last" 2>/dev/null || true)
+[ -f "$cur_target" ] || cur_target=""
+if [ -z "$cur_target" ]; then
+  if [ -n "$prev_target" ] && [ ! -e "$prev_target" ]; then
+    # resurrect names a snapshot after the second and deletes the new file when it equals the one `last` names: that is
+    # the previous snapshot itself when both saves share a second, and `last` is left dangling
+    cp -p -- "$work/prev.txt" "$prev_target" || fail "tmux-resurrect deleted the snapshot $prev_target and it could not be put back ($reason)"
+    log "tmux-resurrect deleted the snapshot of the same second ($(basename "$prev_target")), put back ($reason)"
+    rm -f "$state/degenerate-since" # the layout is back at `last`: the persistence clock starts over
+    status unchanged "$(basename "$prev_target")"
+    [ "$rc" -eq 0 ] || exit 1
+    exit 0
+  fi
+  fail "tmux-resurrect left no snapshot behind ($rdir/last is missing, save script exit $rc, $reason)"
+fi
+if [ -n "$prev_target" ] && [ "$cur_target" = "$prev_target" ] && cmp -s "$cur_target" "$work/prev.txt"; then
+  if [ "$rc" -ne 0 ]; then
+    status failed "the save script exited $rc and left $(basename "$cur_target") as it was"
+    exit 1
+  fi
+  log "nothing changed since the last snapshot ($(basename "$cur_target")), $reason"
+  rm -f "$state/degenerate-since" # identical to `last`, so the good state is back: the persistence clock starts over
+  status unchanged "$(basename "$cur_target")"
+  exit 0
+fi
+
+name=$(basename "$cur_target")
+stamp=${name#tmux_resurrect_}
+stamp=${stamp%.txt}
+
+# ── judge it ────────────────────────────────────────────────────────────────────────────────────────────────────────
+verdict=""
+if [ -n "$prev_target" ] && [ "$force" -eq 0 ]; then
+  verdict=$(tl_degenerate_reason "$work/prev.txt" "$cur_target") || true
+fi
+if [ -n "$verdict" ]; then
+  now=$(date +%s)
+  since=$(cat "$state/degenerate-since" 2>/dev/null || true)
+  case $since in ''|*[!0-9]*) since=$now; printf '%s\n' "$now" > "$state/degenerate-since" ;; esac
+  if [ $((now - since)) -ge "$accept_after" ]; then
+    log "the degenerate state ($verdict) has lasted $(((now - since) / 60)) min, accepting it as the new baseline"
+    verdict=""
+  fi
+fi
+
+if [ -n "$verdict" ]; then
+  mkdir -p "$rdir/degenerate"
+  cp -p -- "$cur_target" "$rdir/degenerate/${stamp}.txt"
+  prev_name=$(basename "$prev_target")
+  if [ "$cur_target" = "$prev_target" ]; then
+    cp -p -- "$work/prev.txt" "$cur_target" # the new save overwrote the previous snapshot in the same second
+  else
+    rm -f -- "$cur_target"
+  fi
+  tl_point_symlink "$rdir/last" "$prev_name"
+  if [ -f "$work/pane_contents.tar.gz" ]; then cp -p -- "$work/pane_contents.tar.gz" "$rdir/pane_contents.tar.gz"; fi
+  for m in "$work"/maps/*-sessions.map; do [ ! -f "$m" ] || cp -p -- "$m" "$map_dir/"; done
+  tl_prune_dir_count "$rdir/degenerate" 20
+  echo "tmux-save-now: DEGENERATE snapshot $name rejected ($verdict, $reason): last stays $prev_name, the file is kept in $rdir/degenerate/" >&2
+  tl_alert "tmux save rejected a degenerate snapshot ($verdict); last stays $prev_name until the server holds a layout as rich again (kept in $rdir/degenerate/)" tmux-degenerate-snapshot
+  status degenerate "$name: $verdict"
+  [ "$rc" -eq 0 ] || exit 1
+  exit 0
+fi
+
+# ── accepted ────────────────────────────────────────────────────────────────────────────────────────────────────────
+rm -f "$state/degenerate-since"
+# record the acceptance where a boot can trust it: `last` names what the guard just accepted, and tl_good_snapshot
+# honours that instead of replaying the older, richer layout against it
+tl_point_symlink "$rdir/last-guarded" "$name"
+if [ -f "$rdir/pane_contents.tar.gz" ]; then cp -p -- "$rdir/pane_contents.tar.gz" "$rdir/pane_contents_${stamp}.tar.gz"; fi
+mkdir -p "$rdir/maps/$stamp"
+for m in "$map_dir"/*-sessions.map; do [ ! -f "$m" ] || cp -p -- "$m" "$rdir/maps/$stamp/"; done
+read -r _ _ harness _ <<<"$(tl_snapshot_stats "$cur_target")"
+if [ "${harness:-0}" -gt 0 ]; then tl_point_symlink "$rdir/last-with-harness" "$name"; fi
+tl_prune_snapshots "$rdir" "$keep" "$keep_days"
+log "saved $name ($reason, ${harness:-0} agent panes)"
+status ok "$name"
+[ "$rc" -eq 0 ] || exit 1
+exit 0

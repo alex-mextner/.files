@@ -10,14 +10,38 @@
 # script once. A snapshot that holds at most the one window of the fresh session needs no restore, and a server that
 # already runs is never touched: no extra session, no second restore.
 #
-#   TMUX_BOOT_SESSION  the session that carries the server up (default main: rig's anti-sprawl session)
-#   TMUX_BOOT_WAIT     seconds to wait for continuum before restoring by hand (default 20)
+# What is restored, and when it is not:
+#   * before the server starts, `last` is pointed at the newest NON-degenerate snapshot (tl_prepare_restore): a `last` that
+#     something wrote behind tmux-save-now's guard (a bare `main`, a layout without its agents) never decides a restore, and
+#     the pane archive and session maps of the chosen snapshot come back with it. The directory is
+#     TMUX_BOOT_RESURRECT_DIR, else tmux-resurrect's rule (@resurrect-dir is only known once the server has loaded its
+#     config, so it is checked again afterwards).
+#   * restore-loop guard: a server that keeps dying must not be restored again and again. Every boot that restores is
+#     recorded; once TMUX_BOOT_MAX_RESTORES (default 3) are on record for the last hour, the server is started WITHOUT a
+#     restore (`last` is held out of continuum's sight while it comes up, then put back) and an alert is sent.
+#   * the boot id is recorded, so tmux-watchdog can tell a server that died this boot from one that never started.
+#
+#   TMUX_BOOT_SESSION       the session that carries the server up (default main: rig's anti-sprawl session)
+#   TMUX_BOOT_WAIT          seconds to wait for continuum before restoring by hand (default 20)
+#   TMUX_BOOT_MAX_RESTORES  restores per hour before the loop guard refuses (default 3)
+#   TMUX_BOOT_HOLD          seconds `last` stays hidden when the loop guard refuses (default 5)
+#   TMUX_BOOT_RESURRECT_DIR snapshot directory before the server runs (default: resurrect's rule)
+#   TMUX_BOOT_MAP_DIR       rig's session maps (default ~/.config/rig/tmux)
+#   TMUX_BOOT_ID_FILE       boot id source (default /proc/sys/kernel/random/boot_id), for tests
 set -u
 
 session=${TMUX_BOOT_SESSION:-main}
 wait_s=${TMUX_BOOT_WAIT:-20}
 case $wait_s in
   ''|*[!0-9]*) echo "tmux-boot: TMUX_BOOT_WAIT must be a whole number of seconds, got '$wait_s'" >&2; exit 2 ;;
+esac
+max_restores=${TMUX_BOOT_MAX_RESTORES:-3}
+case $max_restores in
+  ''|*[!0-9]*) echo "tmux-boot: TMUX_BOOT_MAX_RESTORES must be a whole number, got '$max_restores'" >&2; exit 2 ;;
+esac
+hold_s=${TMUX_BOOT_HOLD:-5}
+case $hold_s in
+  ''|*[!0-9]*) echo "tmux-boot: TMUX_BOOT_HOLD must be a whole number of seconds, got '$hold_s'" >&2; exit 2 ;;
 esac
 
 # a systemd user manager hands out a minimal PATH (the system dirs only): add the user's tool dirs (rig's resume
@@ -26,16 +50,11 @@ export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bi
 
 windows() { tmux list-windows -a 2>/dev/null | wc -l; }
 
-# same directory rule as tmux-resurrect's helpers.sh (@resurrect-dir wins, then ~/.tmux/resurrect, then XDG)
-resurrect_dir() {
-  local dir
-  dir=$(tmux show-option -gqv @resurrect-dir 2>/dev/null || true)
-  if [ -z "$dir" ]; then
-    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
-  fi
-  dir=${dir//\$HOME/"$HOME"}
-  printf '%s\n' "${dir/#\~/"$HOME"}"
-}
+# the snapshot directory rule is tmux-resurrect's, shared with tmux-autosave (tmux-lib, installed next to this script)
+lib=$(dirname "$(readlink -f "$0")")/tmux-lib
+# shellcheck source=tmux-lib
+. "$lib" || { echo "tmux-boot: cannot load $lib" >&2; exit 1; }
+boot_id() { cat "${TMUX_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null; }
 
 command -v tmux >/dev/null 2>&1 || { echo "tmux-boot: tmux is not installed" >&2; exit 1; }
 
@@ -44,13 +63,51 @@ if tmux list-sessions >/dev/null 2>&1; then
   exit 0
 fi
 
+state=$(tl_state_dir)
+map_dir=${TMUX_BOOT_MAP_DIR:-${TMUX_SAVE_NOW_MAP_DIR:-$HOME/.config/rig/tmux}}
+mkdir -p "$state" 2>/dev/null || echo "tmux-boot: cannot create $state, the loop guard and the boot id are not recorded" >&2
+
+# ── before the server starts: which snapshot, and whether to restore at all ──────────────────────────────────────────
+pre_dir=${TMUX_BOOT_RESURRECT_DIR:-$(tl_resurrect_dir)}
+held=""
+if msg=$(tl_prepare_restore "$pre_dir" "$map_dir") && [ -n "$msg" ]; then
+  echo "tmux-boot: $msg"
+  tl_alert "tmux-boot fell back to an older snapshot before restoring: $msg" tmux-restore-fallback
+fi
+if [ -e "$pre_dir/last" ] && [ "$(grep -c '^window[[:space:]]' "$pre_dir/last" 2>/dev/null || true)" -gt 1 ]; then
+  if [ "$(tl_restore_attempts "$state")" -ge "$max_restores" ]; then
+    mv -- "$pre_dir/last" "$pre_dir/last.held-by-tmux-boot" && held=1
+    echo "tmux-boot: restore loop: $max_restores restores in the last hour and the server died again, starting WITHOUT a restore (last stays $(readlink -f "$pre_dir/last.held-by-tmux-boot"))" >&2
+    tl_alert "tmux restore loop: the server was restored $max_restores times in the last hour and died again, so tmux-boot started it without restoring; the snapshot is untouched (restore by hand, or tmux-boot after fixing what kills the server)" tmux-restore-loop
+  else
+    tl_record_restore "$state"
+  fi
+fi
+[ -z "$(boot_id)" ] || printf '%s\n' "$(boot_id)" > "$state/boot-id"
+
 # The snapshot holds this session too (autosave saves `main` like every other session), so continuum can restore it
 # before this command runs: new-session then fails with "duplicate session" while the server is up and restoring,
 # which is the outcome wanted, not a failure.
 tmux new-session -d -s "$session" || tmux has-session -t "=$session" 2>/dev/null \
-  || { echo "tmux-boot: tmux new-session failed" >&2; exit 1; }
+  || { echo "tmux-boot: tmux new-session failed" >&2; [ -z "$held" ] || mv -- "$pre_dir/last.held-by-tmux-boot" "$pre_dir/last"; exit 1; }
 
-dir=$(resurrect_dir)
+if [ -n "$held" ]; then
+  sleep "$hold_s" # continuum looks for `last` while the config loads
+  # a save in the meantime made a new `last`: that one stays and the held pointer is kept next to it
+  if [ ! -e "$pre_dir/last" ]; then mv -- "$pre_dir/last.held-by-tmux-boot" "$pre_dir/last"; fi
+  echo "tmux-boot: the server runs with the one fresh session, nothing restored (restore loop guard)"
+  exit 0
+fi
+
+dir=$(tl_resurrect_dir)
+if [ "$dir" != "$pre_dir" ]; then
+  # @resurrect-dir is set by the config the server has just loaded: the same choice for that directory
+  if msg=$(tl_prepare_restore "$dir" "$map_dir") && [ -n "$msg" ]; then
+    echo "tmux-boot: $msg"
+    tl_alert "tmux-boot fell back to an older snapshot before restoring: $msg" tmux-restore-fallback
+  fi
+fi
+
 if [ ! -e "$dir/last" ]; then
   echo "tmux-boot: no saved snapshot ($dir/last), the server runs with the one fresh session"
   exit 0

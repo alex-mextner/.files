@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# tmux-alert "<message>" [--key KEY]: deliver an alert about the tmux save/restore chain to the live omp sessions,
+# at most once per interval per KEY, so a condition that persists (a watchdog finding the same fault every 5
+# minutes) sends one alert and not 288 a day.
+#
+#   --key KEY                 what the alert is about (default: the message itself); an alert with the same KEY is
+#                             suppressed until TMUX_ALERT_INTERVAL seconds have passed since the last one that was sent
+#   TMUX_ALERT_INTERVAL       seconds (default 21600 = 6 h)
+#   TMUX_ALERT_CMD            sender: one executable called as `CMD "<message>"`, replacing the whole default
+#                             delivery; the tests point it at a recorder
+#   TMUX_BOOT_STATE_DIR       where the per-key stamps live (default ~/.local/state/tmux-boot)
+#
+# The message is the caller's own diagnosis (never a credential or a token: nothing here reads or prints any). The
+# default delivery is mem-sentinel's channel (ops/mem-sentinel/mem_sentinel.py, steer()/broadcast()): a steer into
+# one live omp session -- `tg-ctl omp-live send <pid> --session <sessionId> -- <text>`, the pid and sessionId
+# `tg-ctl omp-live status --json` reports, prefixed [tmux-boot] -- and only when no live session is there to receive
+# it a broadcast to all of them (`omp-steer all <text>`). A separate Telegram chat is NOT the default channel: the
+# ones who can act on a tmux-boot alert are the agent sessions running on this machine. The sender's output is not
+# shown, only whether it worked, so a token in a sender's own diagnostics cannot reach the journal.
+# Exit 0 = sent or suppressed on purpose, 1 = the sender failed (the stamp is then NOT written: the next run retries),
+# 2 = usage.
+set -u
+
+msg=""
+key=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --key) [ $# -ge 2 ] || { echo "tmux-alert: --key needs a value" >&2; exit 2; }; key=$2; shift 2 ;;
+    --key=*) key=${1#--key=}; shift ;;
+    -*) echo "usage: tmux-alert \"<message>\" [--key KEY]" >&2; exit 2 ;;
+    *) [ -z "$msg" ] || { echo "usage: tmux-alert \"<message>\" [--key KEY]" >&2; exit 2; }; msg=$1; shift ;;
+  esac
+done
+[ -n "$msg" ] || { echo "usage: tmux-alert \"<message>\" [--key KEY]" >&2; exit 2; }
+
+interval=${TMUX_ALERT_INTERVAL:-21600}
+case $interval in ''|*[!0-9]*) echo "tmux-alert: TMUX_ALERT_INTERVAL must be whole seconds, got '$interval'" >&2; exit 2 ;; esac
+interval=$((10#$interval)) # a leading zero is a decimal number here, not a bad octal one
+
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+state=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+mkdir -p "$state/alerts" 2>/dev/null || { echo "tmux-alert: cannot create $state/alerts" >&2; exit 1; }
+
+[ -n "$key" ] || key=$msg
+safe=$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)
+stamp="$state/alerts/$safe"
+now=$(date +%s)
+if [ -f "$stamp" ]; then
+  last=$(cat "$stamp" 2>/dev/null)
+  case $last in ''|*[!0-9]*) last=0 ;; esac
+  if [ $((now - last)) -lt "$interval" ]; then
+    echo "tmux-alert: suppressed ($key: last sent $(( (now - last) / 60 )) min ago, once per $((interval / 60)) min)"
+    exit 0
+  fi
+fi
+
+text="[tmux-boot] $(hostname 2>/dev/null || uname -n): $msg"
+if [ -n "${TMUX_ALERT_CMD:-}" ]; then
+  "$TMUX_ALERT_CMD" "$text" >/dev/null 2>&1
+else
+  # the first live session that reports a pid and a sessionId: any live session can carry the alert to its user.
+  # timeout, the way mem-sentinel wraps its deliveries: a wedged tg-ctl round trip must not hang the calling unit
+  # (tmux-watchdog, tmux-boot) -- a killed delivery simply reads as a failed sender and is retried next time
+  recipient=""
+  if command -v tg-ctl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    recipient=$(timeout 25 tg-ctl omp-live status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    hosts = json.load(sys.stdin) or []
+except ValueError:
+    sys.exit(1)  # tg-ctl spoke garbage: no session to steer into, fall through to the broadcast
+for h in hosts:
+    if h.get("pid") and h.get("sessionId"):
+        print(h["pid"], h["sessionId"])
+        break
+' 2>/dev/null) || recipient=""
+  fi
+  if [ -n "$recipient" ]; then
+    read -r alert_pid alert_sid <<<"$recipient"
+    timeout 40 tg-ctl omp-live send "$alert_pid" --request-id "tmux-alert-$(date +%s)-$$" --session "$alert_sid" -- "$text" >/dev/null 2>&1
+  elif command -v omp-steer >/dev/null 2>&1; then
+    timeout 40 omp-steer all "$text" >/dev/null 2>&1
+  else
+    echo "tmux-alert: cannot send ($key): no live omp session to steer into (tg-ctl) and omp-steer is not installed" >&2
+    exit 1
+  fi
+fi
+# shellcheck disable=SC2181  # the sender's status is the sender's, whichever branch ran
+if [ $? -ne 0 ]; then
+  echo "tmux-alert: the sender failed, nothing recorded ($key)" >&2
+  exit 1
+fi
+printf '%s\n' "$now" > "$stamp"
+echo "tmux-alert: sent ($key)"

@@ -1,0 +1,12 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): triggers tmux-watchdog.service.
+[Unit]
+Description=Check the tmux save/restore chain every few minutes
+
+[Timer]
+# 6 min after boot: tmux-boot has started the server and tmux-autosave (5 min) has had its first run
+OnBootSec=6min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

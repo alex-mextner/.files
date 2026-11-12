@@ -5,6 +5,7 @@ into a temp dir with TMUX_BOOT_*_DIR, and every stub keeps its state in files un
 """
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -15,8 +16,7 @@ import unittest
 MODULE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SYSTEMCTL = """#!/bin/sh
-# usage: systemctl --user VERB ...; tmux-boot.service's state is the file `enabled`, tmux-autosave.timer's `timer-enabled`
-# and `timer-active`
+# usage: systemctl --user VERB ...; a unit's state is the files `enabled-UNIT` and `active-UNIT` in $STUB
 echo "systemctl $*" >> "$STUB/calls.log"
 shift
 [ -e "$STUB/no-bus" ] && exit 1
@@ -24,15 +24,14 @@ case "$1" in
   show-environment) exit 0 ;;
   daemon-reload) exit 0 ;;
   is-enabled)
-    case "$2" in tmux-autosave.timer) f=timer-enabled ;; *) f=enabled ;; esac
-    if [ -e "$STUB/$f" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;
-  is-active) [ -e "$STUB/timer-active" ]; exit $? ;;
+    if [ -e "$STUB/enabled-$2" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;
+  is-active) for last; do :; done; [ -e "$STUB/active-$last" ]; exit $? ;;
   enable)
+    now=0
+    for a in "$@"; do [ "$a" = --now ] && now=1; done
     for a in "$@"; do
       case "$a" in
-        tmux-boot.service) : > "$STUB/enabled" ;;
-        tmux-autosave.timer) : > "$STUB/timer-enabled" ;;
-        --now) : > "$STUB/timer-active" ;;
+        tmux-*) [ -e "$STUB/fail-enable-$a" ] && exit 1; : > "$STUB/enabled-$a"; [ "$now" = 1 ] && : > "$STUB/active-$a" ;;
       esac
     done
     exit 0 ;;
@@ -176,7 +175,7 @@ class Installer(Base):
 
     def test_a_stopped_or_missing_autosave_timer_is_drift_and_install_repairs_it(self):
         self.install_ok()
-        os.remove(os.path.join(self.stub, "timer-active"))
+        os.remove(os.path.join(self.stub, "active-tmux-autosave.timer"))
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3)
         self.assertIn("tmux-autosave.timer is not enabled and running", res.stdout)
@@ -187,7 +186,7 @@ class Installer(Base):
         os.remove(os.path.join(self.unit_dir, "tmux-autosave.timer"))
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3)
-        self.assertIn("tmux-autosave.service or .timer is missing", res.stdout)
+        self.assertIn("tmux-autosave.timer is missing", res.stdout)
         self.assertEqual(self.run_script("install.sh").returncode, 0)
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
@@ -204,7 +203,7 @@ class Installer(Base):
         self.assertTrue(os.access(os.path.join(self.bin_dir, "tmux-boot"), os.X_OK))
         with open(os.path.join(self.unit_dir, "tmux-boot.service")) as fh:
             self.assertIn("ExecStart=%h/.local/bin/tmux-boot", fh.read())
-        self.assertTrue(os.path.exists(os.path.join(self.stub, "enabled")))
+        self.assertTrue(os.path.exists(os.path.join(self.stub, "enabled-tmux-boot.service")))
         self.assertNotIn("systemctl --user start tmux-boot.service", self.calls())
         self.assertNotIn("systemctl --user enable --now tmux-boot.service", self.calls())
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
@@ -297,7 +296,7 @@ class Installer(Base):
 
     def test_an_installed_but_disabled_unit_is_drift(self):
         self.install_ok()
-        os.remove(os.path.join(self.stub, "enabled"))
+        os.remove(os.path.join(self.stub, "enabled-tmux-boot.service"))
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3)
         self.assertIn("tmux-boot.service is not enabled", res.stdout)
@@ -316,6 +315,169 @@ class Installer(Base):
     def test_a_usage_error_is_exit_2(self):
         self.assertEqual(self.run_script("install.sh", "--nope").returncode, 2)
 
+    def test_an_install_section_is_recognised_as_the_first_line_and_with_blanks(self):
+        module = os.path.join(self.tmp, "module")
+        shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        for name, text in (
+            ("tmux-first.timer", "[Install]\nWantedBy=timers.target\n\n[Timer]\nOnBootSec=1min\n"),
+            ("tmux-indented.timer", "[Timer]\nOnBootSec=1min\n\n  [Install]  \nWantedBy=timers.target\n"),
+            ("tmux-nonewline.timer", "[Timer]\nOnBootSec=1min\n[Install]"),
+            ("tmux-comment.timer", "[Timer]\nOnBootSec=1min\n# [Install] is for documentation only\n"),
+            ("tmux-quoted.timer", "[Timer]\nDescription=see [Install]\n"),
+        ):
+            with open(os.path.join(module, name), "w") as fh:
+                fh.write(text)
+        self.touch("linger")
+        res = subprocess.run(["bash", os.path.join(module, "install.sh")], env=self.env(), capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        for name in ("tmux-first.timer", "tmux-indented.timer", "tmux-nonewline.timer"):
+            self.assertIn(f"systemctl --user enable --now {name}", self.calls(), name)
+        for name in ("tmux-comment.timer", "tmux-quoted.timer"):
+            self.assertNotIn(f"systemctl --user enable --now {name}", self.calls(), name)
+        check = subprocess.run(["bash", os.path.join(module, "install.sh"), "--check"], env=self.env(), capture_output=True, text=True, check=False)
+        self.assertEqual(check.returncode, 0, check.stdout)
+        os.remove(os.path.join(self.stub, "enabled-tmux-first.timer"))
+        check = subprocess.run(["bash", os.path.join(module, "install.sh"), "--check"], env=self.env(), capture_output=True, text=True, check=False)
+        self.assertEqual(check.returncode, 3)
+        self.assertIn("tmux-first.timer is not enabled", check.stdout)
+
+    def test_every_layer_of_the_module_is_installed_and_the_timers_are_started(self):
+        self.install_ok()
+        for script in ("tmux-boot", "tmux-autosave", "tmux-lib", "tmux-save-now", "tmux-resurrect-save", "tmux-alert", "tmux-save-debounce", "tmux-watchdog", "tmux-recover"):
+            self.assertTrue(os.access(os.path.join(self.bin_dir, script), os.X_OK), script)
+        for unit in ("tmux-autosave.timer", "tmux-watchdog.timer"):
+            self.assertIn(f"systemctl --user enable --now {unit}", self.calls())
+        for unit in ("tmux-autosave.service", "tmux-watchdog.service"):  # oneshots fired by their timers: copied, never enabled
+            self.assertTrue(os.path.exists(os.path.join(self.unit_dir, unit)), unit)
+            self.assertNotIn(f"systemctl --user enable {unit}", self.calls())
+        with open(os.path.join(self.unit_dir, "tmux-watchdog.service")) as fh:
+            self.assertIn("ExecStart=%h/.local/bin/tmux-watchdog", fh.read())
+        with open(os.path.join(self.unit_dir, "tmux-watchdog.service")) as fh:
+            # recovery starts the server inside this unit's cgroup: its end must not kill the restored server
+            self.assertIn("KillMode=process", fh.read())
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_the_library_is_installed_first_and_a_failed_copy_of_it_leaves_the_scripts_alone(self):
+        self.install_ok()
+        real_install = shutil.which("install")
+        write_exec(
+            os.path.join(self.fakebin, "install"),
+            f'#!/bin/sh\nfor last; do :; done\necho "install $last" >> "$STUB/install.log"\n'
+            f'case "$last" in */tmux-lib) [ -e "$STUB/lib-fails" ] && exit 1 ;; esac\nexec {real_install} "$@"\n',
+        )
+        module = os.path.join(self.tmp, "module")
+        shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        for name in ("tmux-lib", "tmux-boot", "tmux-autosave"):  # a new version of everything that is installed
+            with open(os.path.join(module, name), "a") as fh:
+                fh.write("# newer\n")
+        self.touch("lib-fails")
+        run = lambda: subprocess.run(["bash", os.path.join(module, "install.sh")], env=self.env(), capture_output=True, text=True, check=False)
+        res = run()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        with open(os.path.join(self.stub, "install.log")) as fh:
+            copied = fh.read().splitlines()
+        self.assertEqual(copied, [f"install {self.bin_dir}/tmux-lib"], "the failed library copy is the only attempt")
+        for name in ("tmux-boot", "tmux-autosave"):
+            with open(os.path.join(self.bin_dir, name)) as fh:
+                self.assertNotIn("# newer", fh.read(), name)
+        os.remove(os.path.join(self.stub, "lib-fails"))
+        os.remove(os.path.join(self.stub, "install.log"))
+        self.assertEqual(run().returncode, 0)
+        with open(os.path.join(self.stub, "install.log")) as fh:
+            order = [line.split("/")[-1] for line in fh.read().splitlines() if "/tmux-" in line and "." not in line.split("/")[-1]]
+        self.assertEqual(order[0], "tmux-lib", order)
+
+    def test_the_shared_library_is_installed_next_to_the_scripts_it_serves(self):
+        self.install_ok()
+        self.assertTrue(os.access(os.path.join(self.bin_dir, "tmux-lib"), os.X_OK))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_new_scripts_and_units_dropped_into_the_module_are_found_by_glob(self):
+        module = os.path.join(self.tmp, "module")
+        shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        write_exec(os.path.join(module, "tmux-extra"), "#!/bin/sh\n")
+        with open(os.path.join(module, "tmux-noexec"), "w") as fh:  # committed without the exec bit: a script too
+            fh.write("#!/bin/sh\n")
+        with open(os.path.join(module, "tmux-extra.timer"), "w") as fh:
+            fh.write("[Timer]\nOnBootSec=1min\n\n[Install]\nWantedBy=timers.target\n")
+        # a service that must run (what the planned tmux-shutdown-* units look like): enabled AND started
+        with open(os.path.join(module, "tmux-extra.service"), "w") as fh:
+            fh.write("[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n\n[Install]\nWantedBy=default.target\n")
+        with open(os.path.join(module, "tmux-helper.service"), "w") as fh:  # a oneshot fired by a timer: copied, not enabled
+            fh.write("[Service]\nType=oneshot\nExecStart=/bin/true\n")
+        self.touch("linger")
+        run = lambda *a: subprocess.run(["bash", os.path.join(module, "install.sh"), *a], env=self.env(), capture_output=True, text=True, check=False)
+        self.assertEqual(run("--check").returncode, 3)
+        plan = run("--plan").stdout
+        self.assertIn("tmux-extra ->", plan)
+        self.assertIn("tmux-noexec ->", plan)
+        self.assertIn("systemctl --user enable --now tmux-extra.timer", plan)
+        self.assertIn("systemctl --user enable --now tmux-extra.service", plan)
+        res = run()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertTrue(os.access(os.path.join(self.bin_dir, "tmux-extra"), os.X_OK))
+        self.assertTrue(os.access(os.path.join(self.bin_dir, "tmux-noexec"), os.X_OK), "install -m 755 sets the mode")
+        for unit in ("tmux-extra.timer", "tmux-extra.service", "tmux-helper.service"):
+            self.assertTrue(os.path.exists(os.path.join(self.unit_dir, unit)), unit)
+        self.assertIn("systemctl --user enable --now tmux-extra.timer", self.calls())
+        self.assertIn("systemctl --user enable --now tmux-extra.service", self.calls())
+        self.assertNotIn("systemctl --user enable tmux-extra.service", self.calls())
+        self.assertNotIn("systemctl --user enable tmux-helper.service", self.calls())
+        self.assertEqual(run("--check").returncode, 0)
+        before = len(self.calls())
+        self.assertEqual(run().returncode, 0)
+        self.assertEqual([c for c in self.calls()[before:] if " enable " in c or "daemon-reload" in c], [])
+
+    def test_an_unrecognised_module_file_is_never_silently_skipped(self):
+        module = os.path.join(self.tmp, "module")
+        shutil.copytree(MODULE, module, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        with open(os.path.join(module, "tmux-stray.path"), "w") as fh:  # a unit kind the installer has no home for
+            fh.write("[Path]\nPathExists=/tmp\n")
+        run = lambda *a: subprocess.run(["bash", os.path.join(module, "install.sh"), *a], env=self.env(), capture_output=True, text=True, check=False)
+        check = run("--check")
+        self.assertEqual(check.returncode, 3, check.stdout + check.stderr)
+        self.assertIn("tmux-stray.path", check.stdout)
+        plan = run("--plan")
+        self.assertIn("tmux-stray.path", plan.stdout + plan.stderr)
+        res = run()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn("tmux-stray.path", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.unit_dir, "tmux-stray.path")))
+
+    def test_a_failing_auxiliary_unit_does_not_block_the_boot_unit(self):
+        # glob order enables tmux-autosave.timer before tmux-boot.service: a broken timer must not cost the boot path
+        self.touch("linger")
+        self.touch("fail-enable-tmux-autosave.timer")
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.stub, "enabled-tmux-boot.service")))
+
+    def test_module_toml_claims_exactly_the_assets_the_module_ships(self):
+        # coverage names every script and unit explicitly (a glob would also claim leftovers and unrelated tmux-*
+        # files as tracked), so the list must grow with the module: this is the test that fails when it does not
+        with open(os.path.join(MODULE, "module.toml")) as fh:
+            first_coverage = fh.read().split("[[coverage]]")[1]
+        claimed = set(re.findall(r'"((?:unit|file):[^"]+)"', first_coverage))
+        expected = set()
+        for name in os.listdir(MODULE):
+            if not name.startswith("tmux-"):
+                continue
+            if name.endswith((".service", ".timer")):
+                expected.add(f"unit:{name}")
+            elif "." not in name:
+                expected.add(f"file:~/.local/bin/{name}")
+        self.assertEqual(claimed, expected)
+
+    def test_a_script_whose_library_is_missing_fails_loudly(self):
+        # tmux-lib is a hard dependency of both: a partial install must not pass silently at boot time
+        lonely = os.path.join(self.tmp, "lonely")
+        os.makedirs(lonely)
+        for script in ("tmux-boot", "tmux-autosave"):
+            shutil.copy(os.path.join(MODULE, script), lonely)
+            res = subprocess.run(["bash", os.path.join(lonely, script)], env=self.env(), capture_output=True, text=True, check=False)
+            self.assertEqual(res.returncode, 1, script)
+            self.assertIn("cannot load", res.stderr)
+
 
 class Runtime(Base):
     def boot(self, **extra):
@@ -332,7 +494,8 @@ class Runtime(Base):
             os.symlink("tmux_resurrect_x.txt", link)
 
     def reset_stubs(self):
-        """A new boot: no server, an empty call log."""
+        """A new boot (a new day for the restore-loop guard): no server, an empty call log."""
+        shutil.rmtree(os.path.join(self.home, ".local", "state"), ignore_errors=True)
         with open(os.path.join(self.stub, "calls.log"), "w"):
             pass
         if os.path.exists(os.path.join(self.stub, "server")):
@@ -414,6 +577,13 @@ class Runtime(Base):
                 res = self.boot(FAKE_RESURRECT_DIR="", **extra)
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertEqual(self.calls().count("restore.sh ran"), 1, res.stdout)
+
+    def test_the_snapshot_directory_expands_hostname_like_resurrect(self):
+        host = subprocess.run(["hostname"], capture_output=True, text=True, check=True).stdout.strip()
+        self.snapshot(windows=3, directory=os.path.join(self.home, "r", host))
+        res = self.boot(FAKE_RESURRECT_DIR="~/r/$HOSTNAME")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.calls().count("restore.sh ran"), 1, res.stdout)
 
     def test_a_wait_that_is_not_a_number_is_a_usage_error(self):
         res = self.boot(TMUX_BOOT_WAIT="soon")
@@ -512,6 +682,61 @@ exit 0
         self.assertEqual(res.returncode, 1)
         self.assertIn("tmux-resurrect wrote nothing", res.stderr)
 
+    def test_a_snapshot_directory_created_in_the_same_second_proves_nothing(self):
+        # a directory that is new, and whose mtime is not older than this run's start, while the saver writes nothing
+        shutil.rmtree(self.resurrect)
+        os.makedirs(self.resurrect)
+        future = time.time() + 5
+        os.utime(self.resurrect, (future, future))
+        self.saves(writes=False)
+        res = self.autosave(TMUX_AUTOSAVE_SAVE_WAIT="1")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertIn("tmux-resurrect wrote nothing", res.stderr)
+
+    def test_a_symlinked_snapshot_directory_is_judged_by_its_target(self):
+        link = os.path.join(self.tmp, "resurrect-link")
+        os.symlink(self.resurrect, link)
+        past = time.time() - 3600
+        os.utime(link, (past, past), follow_symlinks=False)
+        self.option("@resurrect-dir", link)
+        self.saves()
+        res = self.autosave(FAKE_RESURRECT_DIR=link)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.calls().count("continuum_save ran"), 1)
+        os.remove(os.path.join(self.stub, "saver-writes"))
+        self.option("@continuum-save-last-timestamp", str(int(time.time()) - 20 * 60))
+        res = self.autosave(FAKE_RESURRECT_DIR=link, TMUX_AUTOSAVE_SAVE_WAIT="1")
+        self.assertEqual(res.returncode, 1, "a save that wrote nothing must still fail behind a symlink")
+
+    def test_the_save_wait_is_the_full_configured_time_whatever_the_fraction_of_the_second(self):
+        # the save lands 0.9 s after the trigger and the allowance is 1 s: a whole-second deadline taken at x.9 would
+        # expire at (x+1).0 already, 0.1 s into the allowance
+        write_exec(
+            self.continuum,
+            '#!/bin/sh\necho "continuum_save ran" >> "$STUB/calls.log"\ndate +%s > "$STUB/opt-@continuum-save-last-timestamp"\n'
+            '( sleep 0.9; : > "$FAKE_RESURRECT_DIR/tmux_resurrect_late.txt" ) >/dev/null 2>&1 </dev/null &\nexit 0\n',
+        )
+        while time.time() % 1 < 0.85:  # start late in a second
+            time.sleep(0.01)
+        res = self.autosave(TMUX_AUTOSAVE_SAVE_WAIT="1")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_the_snapshot_directory_follows_resurrects_expansion_of_home_tilde_and_hostname(self):
+        host = subprocess.run(["hostname"], capture_output=True, text=True, check=True).stdout.strip()
+        target = os.path.join(self.home, "rr", host)
+        for configured in ("~/rr/$HOSTNAME", "$HOME/rr/$HOSTNAME"):
+            with self.subTest(configured=configured):
+                shutil.rmtree(os.path.join(self.home, "rr"), ignore_errors=True)
+                os.makedirs(target)
+                past = time.time() - 3600
+                os.utime(target, (past, past))
+                self.option("@resurrect-dir", configured)
+                self.option("@continuum-save-last-timestamp", str(int(time.time()) - 20 * 60))
+                self.saves()
+                res = self.autosave(FAKE_RESURRECT_DIR=target)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.home, "rr", "$HOSTNAME")))
+
     def test_a_missing_resurrect_save_script_is_a_loud_failure_before_anything_runs(self):
         self.option("@resurrect-save-script-path", os.path.join(self.tmp, "gone.sh"))
         self.saves()
@@ -581,6 +806,24 @@ exit 0
         tmux_calls = [c for c in self.calls() if c.startswith("tmux ")]
         self.assertTrue(tmux_calls)
         self.assertTrue(all(c.endswith("[TMUX=unset]") for c in tmux_calls), tmux_calls)
+
+    def test_numbers_with_a_leading_zero_are_decimal_and_never_skip_the_save_check(self):
+        # "08" and "09" are no valid octal numbers: bash arithmetic on them fails, which used to skip the verification
+        # and exit 0 ("010" is valid octal and proved nothing, so it is not here)
+        for wait in ("08", "09"):
+            with self.subTest(wait=wait):
+                self.option("@continuum-save-last-timestamp", str(int(time.time()) - 20 * 60))
+                self.saves(writes=False)
+                res = self.autosave(TMUX_AUTOSAVE_SAVE_WAIT=wait)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn("tmux-resurrect wrote nothing", res.stderr)
+                self.assertNotIn("invalid", res.stderr)
+        os.remove(os.path.join(self.stub, "continuum-saves"))  # continuum does not save this time: the interval has not passed
+        self.option("@continuum-save-interval", "08")
+        self.option("@continuum-save-last-timestamp", str(int(time.time()) - 600))
+        res = self.autosave(TMUX_AUTOSAVE_STALE_MIN="09")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("invalid", res.stderr)
 
     def test_a_stale_limit_or_save_wait_that_is_not_a_number_is_a_usage_error(self):
         for name in ("TMUX_AUTOSAVE_STALE_MIN", "TMUX_AUTOSAVE_SAVE_WAIT"):

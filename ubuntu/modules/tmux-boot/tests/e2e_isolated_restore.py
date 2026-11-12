@@ -28,6 +28,9 @@ import time
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import e2e_procs  # noqa: E402
+
 MODULE = Path(__file__).resolve().parent.parent
 HOME = Path.home()
 RIG_TMUX = HOME / ".config/rig/tmux"
@@ -66,8 +69,23 @@ def need(cmd):
 
 def env():
     # the shim dir first: every `tmux` (plugins, hooks, rig, the module scripts) resolves to the throwaway socket and
-    # continuum's "another tmux server runs, so no restore" count (`ps`, lines starting with `tmux`) ignores the real ones
-    return {**os.environ, "PATH": f"{SHIM}:{os.environ['PATH']}"}
+    # continuum's "another tmux server runs, so no restore" count (`ps`, lines starting with `tmux`) ignores the real ones.
+    # The state, the pre-server snapshot dir and the map dir are the throwaway ones too: without them every boot
+    # records its restore attempt in the REAL ~/.local/state/tmux-boot and consults the REAL ~/.tmux/resurrect, and
+    # three runs inside an hour arm the real restore-loop guard against this test. And the runner's own rig identity
+    # (RIG_SESSION/ABDUCO_SOCKET_DIR, set when the test itself runs inside an omp harness session) must not leak into
+    # the fixture omp processes: they would register under the runner's durable name, and rig's restore-panes then
+    # fail-closes on the identity mismatch instead of relaunching them under their own.
+    e = {
+        **os.environ,
+        "PATH": f"{SHIM}:{os.environ['PATH']}",
+        "TMUX_BOOT_STATE_DIR": str(ROOT / "state"),
+        "TMUX_BOOT_RESURRECT_DIR": str(RESURRECT),
+        "TMUX_BOOT_MAP_DIR": str(RIG),  # tl_prepare_restore copies session maps into the dir it is told, never the real one
+    }
+    for k in ("RIG_SESSION", "RIG_AGENT_ID", "RIG_SIGNAL_SCOPED", "ABDUCO_SOCKET_DIR"):
+        e.pop(k, None)
+    return e
 
 
 def sh(*args, **kw):
@@ -125,9 +143,8 @@ def process_table():
 
 
 def owned_pids(session_files):
-    """Every process that carries one of OUR session files or durable names in its command line (ps, not tg-ctl)."""
-    needles = set(session_files) | {durable_name(f) for f in session_files}
-    return sorted(pid for pid, _, args in process_table() if pid != os.getpid() and any(n in args for n in needles))
+    """The omp/abduco/harness processes of OUR session files or durable names (ps, not tg-ctl); never an inspector of a fixture."""
+    return e2e_procs.owned_pids(process_table(), set(session_files), {durable_name(f) for f in session_files}, os.getpid())
 
 
 def descendant_args(root_pid):
