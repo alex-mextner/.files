@@ -1,0 +1,13 @@
+# Installed by the chatgpt-guardian module (option login_assist); source: the pm-cli template `pm chatgpt unit login-assist-timer`.
+# Rollback: systemctl --user disable --now pm-chatgpt-login-assist@home.timer pm-chatgpt-login-assist@glide.vc.timer
+[Unit]
+Description=Every 2 minutes: is the Guardian ChatGPT account %i signed out? Help the owner log in
+
+[Timer]
+OnBootSec=3min
+OnActiveSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
