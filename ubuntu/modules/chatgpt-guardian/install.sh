@@ -73,7 +73,8 @@
 #                      guardian unit gets CHATGPT_RELOGIN_DOMAIN / CHATGPT_RELOGIN_DEVTOOLS_PORT and an ExecStartPre `relogin check --refuse-other`:
 #                      it stops the guardian from starting while the browser shows an account of ANOTHER domain, and never for want of
 #                      a chatgpt.com tab or an answer (unlike glide's `check --live`, which needs a tab revive opens for glide only).
-#                      Must differ from glide_email_domain. pm login-assist still accepts any home account (pm-cli#95)
+#                      Must differ from glide_email_domain. pm login-assist (pm >= 0.13.3, pm-cli#95) reads the same variable from the home unit
+#                      and does not accept a login of another domain at its window; an older pm accepts any home account there.
 #   control_pass_dir   absolute path (or ~/...) of the directory the control pass runs from and writes its output to (default empty: the
 #                      pass is not managed by this module); the units' paths follow it
 #   audit_timers       true / false (default false): install the per-account pm audit timers of fact 10; needs a pm that merges a
@@ -134,10 +135,11 @@ for key in ("repo", "dir", "package", "chrome", "xvfb", "pm_package", "control_p
     if not isinstance(opt[key], str):
         fail("%s must be a string" % key)
 # read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
-if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["glide_email_domain"]):
+domain_re = r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}"  # relogin's DOMAIN_PATTERN
+if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(domain_re, opt["glide_email_domain"]):
     fail("glide_email_domain must be a domain name such as glide.vc")
 # empty = no required domain for home (the default); else the same domain syntax as glide_email_domain
-if not isinstance(opt["home_email_domain"], str) or (opt["home_email_domain"] and not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["home_email_domain"])):
+if not isinstance(opt["home_email_domain"], str) or (opt["home_email_domain"] and not re.fullmatch(domain_re, opt["home_email_domain"])):
     fail("home_email_domain must be empty or a domain name such as gmail.com")
 if opt["home_email_domain"] and opt["home_email_domain"].lstrip("@").lower() == opt["glide_email_domain"].lstrip("@").lower():
     fail("home_email_domain must differ from glide_email_domain: the two accounts are told apart by it")
@@ -934,10 +936,13 @@ done
 
 # The home guardian refuses to start while the home browser shows another account (its ExecStartPre `relogin check --refuse-other`):
 # that unit is down for a reason apply can name, not for want of a display. Fails unless the check itself refuses (exit 1).
+# It is only a hint on an error path, so it never waits like the guardian's own start check (30 s + 40 s by default): 5 s + 10 s.
 home_refusal() {
   local out rc=0
   [ -n "$home_domain" ] || return 1
-  out=$(CHATGPT_RELOGIN_DOMAIN="$home_domain" CHATGPT_RELOGIN_DEVTOOLS_PORT="$((10#$home_port))" "$here/relogin" check --refuse-other 2>&1) || rc=$?
+  out=$(CHATGPT_RELOGIN_DOMAIN="$home_domain" CHATGPT_RELOGIN_DEVTOOLS_PORT="$((10#$home_port))" \
+    CHATGPT_RELOGIN_ACCOUNT_TIMEOUT="${CHATGPT_RELOGIN_ACCOUNT_TIMEOUT:-5}" CHATGPT_RELOGIN_PROBE_TIMEOUT="${CHATGPT_RELOGIN_PROBE_TIMEOUT:-10}" \
+    "$here/relogin" check --refuse-other 2>&1) || rc=$?
   [ "$rc" = 1 ] || return 1
   printf '%s' "$out"
 }
