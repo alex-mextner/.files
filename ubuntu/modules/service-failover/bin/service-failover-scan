@@ -12,6 +12,8 @@
 #
 # Each finding becomes `systemctl --user start --no-block service-failover-repair@<instance>.service`; the repair script
 # rate limits itself (one session per unit per 12 hours, 4 per day), so a persistent failure is not re-reported every run.
+# At the end of every run it also delivers the desktop notifications the repair script could not show yet (no
+# notification daemon runs early in the login): `service-failover-repair --flush-notifications`.
 set -uo pipefail
 
 hosts_file=${SERVICE_FAILOVER_HOSTS:-${XDG_CONFIG_HOME:-$HOME/.config}/service-failover/hosts}
@@ -56,4 +58,5 @@ for host in "${hosts[@]}"; do
     done <<<"$found"
   done
 done
+"$(dirname "$0")/service-failover-repair" --flush-notifications >/dev/null || status=1
 exit "$status"

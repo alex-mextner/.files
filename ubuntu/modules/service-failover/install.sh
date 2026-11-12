@@ -19,7 +19,8 @@
 #   restart_units  [string] user units that need Restart=on-failure from this module because they have none
 #   autoheal       bool     docker autoheal container                                                    (default false)
 #
-# Test hooks: SERVICE_FAILOVER_UNIT_DIR / _BIN_DIR / _CONFIG_DIR / _ETC_DIR move the install locations.
+# Test hooks: SERVICE_FAILOVER_UNIT_DIR / _BIN_DIR / _CONFIG_DIR / _ETC_DIR move the install locations; SERVICE_FAILOVER_NOTIFY
+# names the desktop notifier --check looks for (default notify-send).
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
@@ -32,7 +33,7 @@ while [ "$#" -gt 0 ]; do
     --restart-only) cli_restart_only=1 ;;
     --autoheal) cli_autoheal=1 ;;
     --system) level=system ;;
-    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "usage: $0 [--plan|--check] [--restart-only] [--autoheal] [--system [UNIT...]]" >&2; exit 2 ;;
     *) sys_units+=("$1") ;;
   esac
@@ -108,11 +109,23 @@ find_stale() { # find_stale PATH: stale when it exists, carries the marker and i
   for w in "${want[@]}"; do case "$w" in *"|$f|"*) found=1 ;; esac; done
   [ "$found" = 1 ] || { marked "$f" && stale+=("$f"); }
 }
+find_unowned() { # find_unowned PATH: stale when it sits in a directory the module owns outright and nothing wants it
+  local f=$1 w s
+  for w in "${want[@]}"; do case "$w" in *"|$f|"*) return 0 ;; esac; done
+  for s in "${stale[@]}"; do [ "$s" = "$f" ] && return 0; done
+  stale+=("$f")
+}
 if [ "$level" = user ]; then
   find_stale "$unit_dir/service.d/15-failover-repair.conf"
   find_stale "$cfg_dir/hosts"
   for rel in $(cd "$here/files/units" && find . -type f -printf '%P\n'); do find_stale "$unit_dir/$rel"; done
   for s in service-failover-repair service-failover-scan; do find_stale "$bin_dir/$s"; done
+  # The module's own units are the module's to declare, so every drop-in of the directories named after them is its
+  # own: the repair template's, the scan's, one for a single instance. One nobody declared (a smoke-test drop-in set
+  # SERVICE_FAILOVER_DRY_RUN=1 and made every repair on the PC a dry run) is drift. Symlinks count: systemd loads them.
+  if [ -d "$unit_dir" ]; then
+    while IFS= read -r f; do find_unowned "$f"; done < <(find "$unit_dir" -mindepth 2 -maxdepth 2 \( -type f -o -type l \) -path "$unit_dir/service-failover-*.d/*")
+  fi
 fi
 restart_root=$unit_dir; [ "$level" = system ] && restart_root=$etc_dir
 if [ -d "$restart_root" ]; then
@@ -125,15 +138,23 @@ state_of() { # state_of SRC DEST MODE -> missing | differs | mode | (empty = in 
   elif [ "$(stat -c %a "$2")" != "$3" ]; then echo mode; fi
 }
 
+# A SERVICE_FAILOVER_* variable in the user manager's environment (a smoke test's `systemctl --user set-environment
+# SERVICE_FAILOVER_DRY_RUN=1`) reaches every repair run, whatever the files say: it is drift too, and install unsets it.
+leftover_env=()
+if [ "$level" = user ] && command -v systemctl >/dev/null; then
+  mapfile -t leftover_env < <(systemctl --user show-environment 2>/dev/null | sed -n 's/^\(SERVICE_FAILOVER_[A-Za-z0-9_]*\)=.*/\1/p')
+fi
 drift=()
 for w in "${want[@]}"; do
   IFS='|' read -r src dest m <<<"$w"
   st=$(state_of "$src" "$dest" "$m"); [ -z "$st" ] || drift+=("$st: $dest")
 done
-for f in "${stale[@]}"; do drift+=("stale: $f (no longer wanted by the options)"); done
+for f in "${stale[@]}"; do drift+=("stale: $f (not part of what the module installs with these options)"); done
 if [ "$level" = user ]; then
+  for v in "${leftover_env[@]}"; do drift+=("set: $v in the user manager's environment (a leftover test setting that changes every repair run)"); done
   if [ "$repair" = 1 ]; then
     [ -x "$launcher" ] || drift+=("missing: $launcher (the sanctioned omp launcher, installed by rig apply; the repair stack cannot start a session without it)")
+    command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null || drift+=("missing: ${SERVICE_FAILOVER_NOTIFY:-notify-send} (package libnotify-bin: without it the repair stack cannot tell the user that a service is down)")
     command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ] || drift+=("not enabled: service-failover-scan.timer")
   fi
   if [ "$repair" = 0 ] && command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ]; then
@@ -187,11 +208,13 @@ if ! systemctl --user show-environment >/dev/null 2>&1; then
 fi
 # daemon-reload applies the drop-ins to the NEXT start of each unit; it restarts nothing.
 systemctl --user daemon-reload || { echo "daemon-reload failed" >&2; exit 1; }
+for v in "${leftover_env[@]}"; do systemctl --user unset-environment "$v" && echo "unset: $v (user manager environment)" || rc=1; done
 if [ "$repair" = 1 ]; then
   if [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" != enabled ]; then
     systemctl --user enable --now service-failover-scan.timer >/dev/null && echo "enabled: service-failover-scan.timer" || rc=1
   fi
   if [ ! -x "$launcher" ]; then echo "needs manual: $launcher is missing (rig apply installs the rig-detached-omp skill); the repair stack is in place but cannot start a session" >&2; rc=10; fi
+  if ! command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null; then echo "needs manual: ${SERVICE_FAILOVER_NOTIFY:-notify-send} is missing (apt install libnotify-bin); the repair stack is in place but cannot tell you that a service is down" >&2; rc=10; fi
 fi
 if [ "$autoheal" = 1 ] && [ "$(docker inspect -f '{{.State.Running}}' autoheal 2>/dev/null)" != true ]; then
   if docker compose -f "$here/docker/autoheal.compose.yaml" up -d >/dev/null 2>&1; then echo "started: docker container autoheal"

@@ -8,6 +8,7 @@ import fcntl
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -24,7 +25,9 @@ scope=system
 [ "$1" = --user ] && { scope=user; shift; }
 [ "$1" = --no-ask-password ] && shift
 case "$1" in
-  show-environment|daemon-reload) exit 0 ;;
+  daemon-reload) exit 0 ;;
+  show-environment) [ -e "$STUB/env" ] && cat "$STUB/env"; exit 0 ;;
+  unset-environment) rm -f "$STUB/env" ;;
   is-enabled)
     # real systemd no longer reports a timer whose unit file is gone as enabled
     [ -n "${SERVICE_FAILOVER_UNIT_DIR:-}" ] && [ ! -e "$SERVICE_FAILOVER_UNIT_DIR/service-failover-scan.timer" ] && { echo not-found; exit 1; }
@@ -33,13 +36,23 @@ case "$1" in
   disable) rm -f "$STUB/timer-enabled" ;;
   reset-failed)
     [ -e "$STUB/reset-refused" ] && { echo "Access denied" >&2; exit 1; }
+    rm -f "$STUB/start-limited"
     # real systemd: a failed unit becomes inactive with Result=success and NRestarts=0
     printf 'ActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nInvocationID=old\nFragmentPath=%s\nTransient=no\n%s' "$(sed -n 's/^FragmentPath=//p' "$STUB/state")" "$(grep '^Type=' "$STUB/state")" > "$STUB/state.new"
     mv "$STUB/state.new" "$STUB/state" ;;
   restart)
     [ -e "$STUB/restart-refused" ] && { echo "Interactive authentication required" >&2; exit 1; }
-    [ -e "$STUB/heals" ] && printf 'ActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n' > "$STUB/state"
-    [ -e "$STUB/after-restart" ] && cp "$STUB/after-restart" "$STUB/state" ;;
+    # $STUB/start-limited: the unit's start limit is still in force, so `restart --no-block` exits 0 and starts nothing
+    # (same invocation, still failed) until reset-failed. Otherwise a restart is a new invocation.
+    # $STUB/dep-refused: a failed dependency refused the start job: also exit 0, nothing started, no limit in the journal
+    # (each refusal adds its own journal line, as systemd does; an old limit line stays in the journal)
+    [ -e "$STUB/start-limited" ] && echo "2026-11-11T02:00:00+01:00 pc systemd[2103]: ${2}: Start request repeated too quickly." >> "$STUB/journal"
+    [ -e "$STUB/dep-refused" ] && echo "2026-11-11T02:00:00+01:00 pc systemd[2103]: Dependency failed for ${2}." >> "$STUB/journal"
+    if [ ! -e "$STUB/start-limited" ] && [ ! -e "$STUB/dep-refused" ]; then
+      sed -i "s/^InvocationID=.*/InvocationID=run-$RANDOM/" "$STUB/state"
+      [ -e "$STUB/heals" ] && printf 'ActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n' > "$STUB/state"
+      [ -e "$STUB/after-restart" ] && cp "$STUB/after-restart" "$STUB/state"
+    fi ;;
   start) ;;
   show)
     if [ "$2" = -p ] && [ "$3" = ActiveState ] && [ "$4" = --value ]; then
@@ -53,9 +66,16 @@ case "$1" in
 esac
 exit 0
 """
+# journalctl: the whole stub journal; --show-cursor prints "-- cursor: N" (N = the line count) and --after-cursor N prints
+# the lines after the Nth, like the real one
 JOURNALCTL = r"""#!/bin/bash
 echo "journalctl $*" >> "$STUB/calls"
+after=
+for ((i = 1; i <= $#; i++)); do [ "${!i}" = --after-cursor ] && { j=$((i + 1)); after=${!j}; }; done
+if [ -n "$after" ]; then tail -n "+$((after + 1))" "$STUB/journal" 2>/dev/null; exit 0; fi
 cat "$STUB/journal" 2>/dev/null
+case " $* " in *" --show-cursor "*) echo "-- cursor: $(wc -l < "$STUB/journal" 2>/dev/null || echo 0)" ;; esac
+exit 0
 """
 # ssh: log, then run the remote command string locally (the stubs above stand in for the remote systemctl).
 SSH = r"""#!/bin/bash
@@ -73,6 +93,8 @@ cp "$2" "$STUB/brief-sent"
 NOTIFIER = r"""#!/bin/bash
 [ -e "$STUB/notify-down" ] && { echo "Could not connect: No such file or directory" >&2; exit 1; }
 args=("$@"); n=${#args[@]}
+# like GLib's option parser: a body that is not valid UTF-8 is refused
+printf '%s' "${args[n-1]}" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || { echo "Invalid UTF-8 in the message" >&2; exit 1; }
 printf '%s | %s\n' "${args[n-2]}" "${args[n-1]}" >> "$STUB/notifications"
 """
 # wireplumber.service on 2026-11-11 01:36:49: a distribution unit, refused its next start after five fast restarts.
@@ -138,6 +160,9 @@ class RepairTest(Base):
     def repair(self, inst, **extra):
         return subprocess.run(["bash", str(REPAIR), inst], capture_output=True, text=True, env={**self.env, **extra})
 
+    def flush(self):
+        return subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=self.env)
+
     def test_failed_unit_that_stays_down_launches_one_session_with_a_full_brief(self):
         self.set_state()
         (self.stub / "journal").write_text(
@@ -157,6 +182,8 @@ class RepairTest(Base):
             self.assertNotIn(secret, brief)
         self.assertIn(LONG_PATH, brief)  # a long path or unit name is not a secret
         self.assertNotIn("systemctl --user reset-failed foo.service", self.calls())  # it would hide a failure the restart cannot undo
+        self.assertNotIn("vendor unit", brief)  # the owner's own unit file may be edited
+        self.assertNotIn("do NOT edit", brief)
 
     def test_a_unit_refused_by_its_start_limit_is_reset_before_the_restart(self):
         self.set_state(FAILED_STATE.replace("Result=exit-code", "Result=start-limit-hit"))
@@ -232,7 +259,7 @@ class RepairTest(Base):
 
     def test_a_notification_names_the_unit_and_keeps_secrets_out(self):
         self.set_state()
-        (self.stub / "journal").write_text(f"Nov 10 foo[1]: connect failed password={PASSWORD_VALUE} api_key: {LONG_VALUE}\n")
+        (self.stub / "journal").write_text(f"2026-11-11T01:00:00+01:00 pc foo[1]: connect failed password={PASSWORD_VALUE} api_key: {LONG_VALUE}\n")
         self.repair("foo.service")
         notes = self.notifications()
         self.assertEqual(len(notes), 1, notes)
@@ -286,12 +313,12 @@ class RepairTest(Base):
         self.assertIn("notification pending", result.stdout)
         self.assertEqual(self.notifications(), [])
         (self.stub / "notify-down").unlink()
-        flushed = subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=self.env)
+        flushed = self.flush()
         self.assertEqual(flushed.returncode, 0, flushed.stderr)
         notes = self.notifications()
         self.assertEqual(len(notes), 1, notes)
         self.assertIn("foo.service", notes[0])
-        subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=self.env)
+        self.flush()
         self.assertEqual(len(self.notifications()), 1)  # delivered once
 
     def test_a_dry_run_notifies_nobody(self):
@@ -299,6 +326,242 @@ class RepairTest(Base):
         result = self.repair("foo.service", SERVICE_FAILOVER_DRY_RUN="1")
         self.assertIn("DRY RUN: would notify", result.stdout)
         self.assertEqual(self.notifications(), [])
+
+    def test_a_restart_the_start_limit_refused_is_retried_after_reset_failed(self):
+        # systemd keeps Result=exit-code when the limit hit during the auto-restart ("Start request repeated too quickly.
+        # Failed with result 'exit-code'") and `restart --no-block` exits 0 for a restart it refuses: the unit keeps its
+        # invocation and stays failed, which is how a refused restart shows
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "start-limited").write_text("")
+        (self.stub / "journal").write_text(WIREPLUMBER_JOURNAL)
+        (self.stub / "heals").write_text("")
+        result = self.repair("wireplumber.service")
+        calls = self.calls()
+        restart = "systemctl --user restart --no-block wireplumber.service"
+        reset = "systemctl --user reset-failed wireplumber.service"
+        restarts = [i for i, call in enumerate(calls) if call == restart]
+        self.assertEqual(len(restarts), 2, calls)
+        self.assertLess(restarts[0], calls.index(reset))
+        self.assertLess(calls.index(reset), restarts[1])
+        self.assertIn("back up after reset-failed and restart", result.stdout)
+        self.assertEqual((self.launches(), self.notifications()), ([], []))
+
+    def test_when_the_cleared_limit_does_not_help_the_brief_says_what_was_tried(self):
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "start-limited").write_text("")
+        (self.stub / "journal").write_text(WIREPLUMBER_JOURNAL)
+        (self.stub / "after-restart").write_text(WIREPLUMBER_STATE.replace("InvocationID=old", "InvocationID=run-new"))
+        self.repair("wireplumber.service")
+        brief = (self.stub / "brief-sent").read_text()
+        for needle in ("nothing had started", "systemctl reset-failed: ok"):
+            self.assertIn(needle, brief)
+        self.assertEqual(len(self.launches()), 1)
+
+    def test_a_unit_that_is_dead_with_its_failure_status_after_the_restart_is_still_down(self):
+        # something reset the failed state of the crashed service: inactive and Result=success, the crash's status stays
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "after-restart").write_text(
+            "InvocationID=new\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainStatus=78\n"
+            "FragmentPath=/usr/lib/systemd/user/wireplumber.service\nTransient=no\n")
+        result = self.repair("wireplumber.service")
+        self.assertNotIn("finished successfully", result.stdout)
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(len(self.notifications()), 1)
+
+    def test_a_unit_that_stopped_cleanly_or_exited_with_a_declared_success_status_after_the_restart_needs_nothing(self):
+        # Result=success is systemd's own verdict: a SIGTERM stop (code killed, status 15) and a status listed in
+        # SuccessExitStatus= (143) are not failures
+        for code, status, extra in (("2", "15", ""), ("1", "143", "SuccessExitStatus=143\n")):
+            self.set_state()
+            (self.stub / "after-restart").write_text(
+                f"InvocationID=new-{status}\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode={code}\n"
+                f"ExecMainStatus={status}\n{extra}Transient=no\n")
+            self.assertIn("finished successfully after the restart", self.repair(f"u{status}.service").stdout, status)
+        self.assertEqual((self.launches(), self.notifications()), ([], []))
+
+    def test_a_start_refused_by_a_failed_dependency_is_not_taken_for_a_start_limit(self):
+        # same invocation, still failed, restart exit 0: also what a failed BindsTo= dependency looks like; only the
+        # journal's "Start request repeated too quickly" says it was the limit, and reset-failed would hide the failure
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "dep-refused").write_text("")
+        (self.stub / "journal").write_text(WIREPLUMBER_JOURNAL)  # the old limit line of the original failure stays
+        self.repair("wireplumber.service")
+        calls = self.calls()
+        self.assertNotIn("systemctl --user reset-failed wireplumber.service", calls)
+        self.assertEqual(calls.count("systemctl --user restart --no-block wireplumber.service"), 1)
+        self.assertNotIn("start limit refused", (self.stub / "brief-sent").read_text())
+
+    def test_a_desktop_autostart_unit_is_left_alone(self):
+        # generated from an autostart entry: many exit non-zero by design, a restart would start the program a second time
+        self.set_state(FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", "/run/user/1000/systemd/generator.xdg-autostart/app-x@autostart.service"))
+        self.assertIn("desktop autostart", self.repair("app-x@autostart.service").stdout)
+        self.assertEqual((self.launches(), self.notifications()), ([], []))
+        self.assertNotIn("systemctl --user restart --no-block app-x@autostart.service", self.calls())
+
+    def test_a_cap_after_reset_failed_does_not_promise_a_scan_retry(self):
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "start-limited").write_text("")
+        (self.stub / "after-restart").write_text(
+            "InvocationID=run-new\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode=1\nExecMainStatus=78\nTransient=no\n"
+            "FragmentPath=/usr/lib/systemd/user/wireplumber.service\n")  # cleared after the crash: the scan cannot see it
+        launches = self.root / "state" / "launches"
+        launches.mkdir(parents=True)
+        (launches / "1-old").write_text("")
+        self.repair("wireplumber.service", SERVICE_FAILOVER_DAILY_CAP="1")
+        note = self.notifications()[0]
+        self.assertIn("daily cap", note)
+        self.assertNotIn("retried by the next scan", note)
+        self.assertIn("restart it by hand", note)
+
+    def test_a_crashed_unit_whose_failed_state_was_cleared_before_the_first_look_is_repaired(self):
+        # the incident's own state, seen at the first query: inactive, Result=success, the crash status 78 kept
+        self.set_state("InvocationID=old\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode=1\nExecMainStatus=78\n"
+                       "FragmentPath=/usr/lib/systemd/user/wireplumber.service\nTransient=no\n")
+        result = self.repair("wireplumber.service")
+        self.assertNotIn("finished successfully", result.stdout)
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(len(self.notifications()), 1)
+
+    def test_a_long_journal_does_not_hide_a_start_limit_refusal(self):
+        # 300 old lines, some of them limit lines: only what the restart wrote counts
+        self.set_state(WIREPLUMBER_STATE)
+        (self.stub / "start-limited").write_text("")
+        (self.stub / "journal").write_text(WIREPLUMBER_JOURNAL * 100)
+        (self.stub / "heals").write_text("")
+        result = self.repair("wireplumber.service")
+        self.assertIn("back up after reset-failed and restart", result.stdout)
+
+    def test_a_cleared_failure_that_is_deferred_or_capped_does_not_promise_a_scan_retry(self):
+        # the scan lists only failed units: an inactive one with the crash status is not seen again
+        erased = ("InvocationID=old\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode=1\nExecMainStatus=78\n"
+                  "FragmentPath=/usr/lib/systemd/user/wireplumber.service\nTransient=no\nType=oneshot\n")  # oneshot: no first aid
+        self.set_state(erased)
+        lock = subprocess.Popen(["flock", str(self.root / "state" / "lock"), "sleep", "5"]) if (self.root / "state").mkdir(exist_ok=True) is None else None
+        self.addCleanup(lock.terminate)
+        time.sleep(0.3)
+        self.repair("wireplumber.service")
+        self.assertNotIn("retried by the next scan", self.notifications()[0])
+        self.assertIn("restart it by hand", self.notifications()[0])
+
+    def test_a_numeric_success_status_does_not_clear_a_signal_death(self):
+        self.set_state()
+        (self.stub / "after-restart").write_text(
+            "InvocationID=new\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode=3\nExecMainStatus=6\nSuccessExitStatus=6\nTransient=no\n")
+        self.assertNotIn("finished successfully", self.repair("foo.service").stdout)
+
+    def test_a_service_killed_by_sigkill_after_the_restart_is_still_down(self):
+        # code killed with status 9 (the OOM killer) is a crash; only SIGHUP, SIGINT, SIGPIPE and SIGTERM are clean stops
+        self.set_state()
+        (self.stub / "after-restart").write_text(
+            "InvocationID=new\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainCode=2\nExecMainStatus=9\nTransient=no\n")
+        self.assertNotIn("finished successfully", self.repair("foo.service").stdout)
+        self.assertEqual(len(self.launches()), 1)
+
+    def test_a_claim_of_a_dead_run_is_delivered_and_a_down_notifier_is_tried_once(self):
+        pending = self.root / "state" / "notify" / "pending"
+        pending.mkdir(parents=True)
+        (pending / "a.service.sending.99999999").write_text("Service down: a.service\nbody a\n")
+        self.assertIn("0 notification(s)", self.flush().stdout)
+        self.assertEqual(self.notifications(), ["Service down: a.service | body a"])
+        counting = self.root / "counting-notifier"
+        counting.write_text('#!/bin/bash\necho try >> "$STUB/tries"\nexit 1\n')
+        counting.chmod(0o755)
+        for name in ("b.service", "c.service", "d.service"):
+            (pending / name).write_text(f"Service down: {name}\nbody\n")
+        env = {**self.env, "SERVICE_FAILOVER_NOTIFY": str(counting)}
+        out = subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True, env=env).stdout
+        self.assertIn("3 notification(s) still pending", out)
+        self.assertEqual((self.stub / "tries").read_text().split(), ["try"])
+
+    def test_a_restart_that_the_systemctl_refused_is_not_taken_for_a_start_limit(self):
+        # restart failed (authentication, bad setting, masked): the unit is still failed in the same invocation, but the
+        # start limit did not refuse anything, and reset-failed would erase the failure the scan looks for
+        self.set_state()
+        (self.stub / "restart-refused").write_text("")
+        self.repair("foo.service")
+        calls = self.calls()
+        self.assertNotIn("systemctl --user reset-failed foo.service", calls)
+        self.assertEqual(calls.count("systemctl --user restart --no-block foo.service"), 1)
+        self.assertNotIn("start limit refused", (self.stub / "brief-sent").read_text())
+
+    def test_the_lock_is_not_held_while_the_user_is_notified_of_a_cap_or_a_launcher_failure(self):
+        # a slow notifier must not make a concurrent run report "another session is running"
+        probe = self.root / "probe-notifier"
+        probe.write_text('#!/bin/bash\nif flock -n 8; then echo free >> "$STUB/lock-probe"; else echo held >> "$STUB/lock-probe"; fi 8>"$SERVICE_FAILOVER_STATE/lock"\n')
+        probe.chmod(0o755)
+        launches = self.root / "state" / "launches"
+        launches.mkdir(parents=True)
+        (launches / "1-old").write_text("")
+        self.set_state()
+        self.repair("foo.service", SERVICE_FAILOVER_DAILY_CAP="1", SERVICE_FAILOVER_NOTIFY=str(probe))
+        self.set_state()
+        failing = self.root / "failing-launcher"
+        failing.write_text("#!/bin/bash\nexit 3\n")
+        failing.chmod(0o755)
+        self.repair("bar.service", SERVICE_FAILOVER_LAUNCHER=str(failing), SERVICE_FAILOVER_NOTIFY=str(probe))
+        self.assertEqual((self.stub / "lock-probe").read_text().split(), ["free", "free"])
+
+    def test_a_unit_that_finished_with_status_0_after_the_restart_needs_nothing(self):
+        self.set_state()
+        (self.stub / "after-restart").write_text(
+            "InvocationID=new\nActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainStatus=0\nTransient=no\n")
+        self.assertIn("finished successfully after the restart", self.repair("foo.service").stdout)
+        self.assertEqual((self.launches(), self.notifications()), ([], []))
+
+    def test_a_unit_without_journal_entries_gets_a_plain_fallback_not_a_clipped_one(self):
+        self.set_state()
+        self.repair("foo.service")  # no journal at all
+        self.assertTrue(self.notifications()[0].endswith("Log: (no log line)"), self.notifications())
+        self.set_state()
+        (self.stub / "journal").write_text("-- No entries --\n")  # journalctl's own marker is not a log line
+        self.repair("bar.service")
+        self.assertTrue(self.notifications()[1].endswith("Log: (no log line)"), self.notifications())
+
+    def test_a_long_non_ascii_log_line_is_cut_on_a_character_boundary(self):
+        # `cut -c` counts bytes under the C locale (a service without LANG); the notifier (like GLib) refuses a body that
+        # is not valid UTF-8, and a refused message would stay pending for ever
+        self.set_state()
+        (self.stub / "journal").write_text("2026-11-11T01:36:44+01:00 pc foo[1]: x" + "ы" * 400 + "\n", encoding="utf-8")
+        self.repair("foo.service", LC_ALL="C")
+        notes = self.notifications()
+        self.assertEqual(len(notes), 1, notes)
+
+    def test_a_message_another_run_has_claimed_is_not_delivered_a_second_time(self):
+        pending = self.root / "state" / "notify" / "pending"
+        pending.mkdir(parents=True)
+        (pending / f"foo.service.sending.{os.getpid()}").write_text("Service down: foo.service\nbody\n")  # a live run
+        self.flush()
+        self.assertEqual(self.notifications(), [])
+
+    def test_a_pending_message_older_than_the_window_is_dropped_not_shown_hours_late(self):
+        pending = self.root / "state" / "notify" / "pending"
+        pending.mkdir(parents=True)
+        stale = pending / "foo.service"
+        stale.write_text("Service down: foo.service\nold news\n")
+        os.utime(stale, (1, 1))
+        self.flush()
+        self.assertEqual(self.notifications(), [])
+        self.assertFalse(stale.exists())
+
+    def test_generated_admin_and_distribution_units_are_all_told_not_to_edit_the_file(self):
+        for name, fragment in (("a", "/run/user/1000/systemd/generator.late/app-x.service"), ("b", "/etc/systemd/user/foo.service"),
+                               ("c", "/usr/lib/systemd/user/gnome-shell.service")):
+            self.set_state(FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", fragment))
+            self.repair(f"{name}.service")
+            self.assertIn("vendor unit", (self.stub / "brief-sent").read_text(), fragment)
+
+    def test_a_launcher_that_is_missing_or_fails_is_reported_to_the_user_and_in_the_exit_status(self):
+        self.set_state()
+        missing = self.repair("foo.service", SERVICE_FAILOVER_LAUNCHER=str(self.root / "no-launcher"))
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("launcher is not executable", self.notifications()[0])
+        failing = self.root / "failing-launcher"
+        failing.write_text("#!/bin/bash\nexit 3\n")
+        failing.chmod(0o755)
+        self.set_state()
+        failed = self.repair("bar.service", SERVICE_FAILOVER_LAUNCHER=str(failing))
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("exit 3", self.notifications()[1])
 
     def test_a_unit_still_inside_its_restart_budget_or_stopped_on_purpose_is_left_to_systemd(self):
         # OnFailure= fires on every crash of a unit that systemd is still restarting: only the end of the budget is a failure.
@@ -359,7 +622,7 @@ class RepairTest(Base):
         self.assertEqual(self.launches(), [])
         self.assertNotIn("systemctl --user restart --no-block service-failover-scan.service", self.calls())
 
-    def test_a_unit_gets_one_session_per_cooldown_also_when_it_is_a_remote_vendor_unit(self):
+    def test_a_unit_gets_one_session_per_cooldown_and_so_does_a_remote_vendor_unit(self):
         self.set_state()
         self.repair("foo.service")
         self.assertEqual(len(self.launches()), 1)
@@ -367,10 +630,14 @@ class RepairTest(Base):
         self.set_state()
         self.assertIn("already launched", self.repair("foo.service").stdout)
         self.assertEqual(len(self.launches()), 1)
-        self.set_state(FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", "/lib/systemd/system/vendor.service"))
+        vendor = FAILED_STATE.replace("/home/u/.config/systemd/user/foo.service", "/lib/systemd/system/vendor.service")
+        self.set_state(vendor)
         self.repair("odroidn2:system:vendor.service")
         self.assertEqual(len(self.launches()), 2)
         self.assertIn("vendor unit", (self.stub / "brief-sent").read_text())
+        self.set_state(vendor)
+        self.assertIn("already launched", self.repair("odroidn2:system:vendor.service").stdout)
+        self.assertEqual(len(self.launches()), 2)
 
     def test_escaped_unit_names_are_accepted(self):
         self.set_state()
@@ -568,6 +835,45 @@ class InstallTest(Base):
         self.assertEqual(check.returncode, 3)
         self.assertIn("missing: no-such-notifier", check.stdout)
         self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_a_missing_notifier_is_a_manual_step_of_the_install_too(self):
+        result = self.run_install(SERVICE_FAILOVER_NOTIFY="no-such-notifier")
+        self.assertEqual(result.returncode, 10)
+        self.assertIn("needs manual: no-such-notifier", result.stderr)
+
+    def test_a_symlinked_or_per_instance_drop_in_of_a_module_unit_is_drift_too(self):
+        self.run_install()
+        unit_dir = self.root / "u"
+        target = self.root / "smoke.conf"
+        target.write_text("[Service]\nEnvironment=SERVICE_FAILOVER_DRY_RUN=1\n")
+        link = unit_dir / "service-failover-repair@.service.d" / "90-link.conf"
+        link.symlink_to(target)
+        instance = unit_dir / "service-failover-repair@foo.service.service.d" / "10-x.conf"
+        instance.parent.mkdir()
+        instance.write_text("[Service]\nEnvironment=SERVICE_FAILOVER_DRY_RUN=1\n")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        for path in (link, instance):
+            self.assertIn(f"stale: {path}", check.stdout)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(link.is_symlink())
+        self.assertFalse(instance.exists())
+        self.assertTrue(target.exists(), "the link is removed, not what it points to")
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_a_leftover_test_variable_in_the_user_manager_is_drift_and_install_unsets_it(self):
+        self.run_install()
+        (self.stub / "env").write_text("HOME=/x\nSERVICE_FAILOVER_DRY_RUN=1\n")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        self.assertIn("set: SERVICE_FAILOVER_DRY_RUN", check.stdout)
+        install = self.run_install()
+        self.assertIn("unset: SERVICE_FAILOVER_DRY_RUN", install.stdout)
+        self.assertIn("systemctl --user unset-environment SERVICE_FAILOVER_DRY_RUN", self.calls())
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_help_prints_the_whole_header(self):
+        self.assertIn("names the desktop notifier", self.run_install("--help").stdout)
 
     def test_restart_only_installs_no_repair_stack(self):
         result = self.run_install("--restart-only")
