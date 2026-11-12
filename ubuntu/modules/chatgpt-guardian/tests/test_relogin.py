@@ -154,6 +154,50 @@ class DevTools:
         return bytes(b ^ mask[i % 4] for i, b in enumerate(exact(length)))
 
 
+class Replay:
+    """A socket whose first recv returns an HTTP head that was already read."""
+
+    def __init__(self, sock, head):
+        self.sock, self.head = sock, head
+
+    def recv(self, size):
+        if self.head:
+            data, self.head = self.head, b""
+            return data
+        return self.sock.recv(size)
+
+    def sendall(self, data):
+        self.sock.sendall(data)
+
+
+class TabbedDevTools(DevTools):
+    """DevTools that also serves PUT /json/new (a ChatGPT tab appears) and records /json/close/<id>."""
+
+    def __init__(self, tabs, answer, hang=False):
+        self.requests = []
+        super().__init__(tabs, answer, hang)
+
+    def handle(self, sock):
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return
+            head += chunk
+        method, path, _ = head.split(b"\r\n", 1)[0].decode().split(" ", 2)
+        if path.startswith("/json/new"):
+            self.requests.append((method, path))
+            self.tabs.append(dict(CHATGPT_TAB))
+            body = json.dumps({"id": "tab-new", "type": "page", "url": "https://chatgpt.com/"}).encode()
+        elif path.startswith("/json/close/"):
+            self.requests.append((method, path))
+            body = b"Target is closing"
+        else:
+            super().handle(Replay(sock, head))
+            return
+        sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+
+
 CHATGPT_TAB = {"type": "page", "url": "https://chatgpt.com/"}
 NEWTAB = {"type": "page", "url": "chrome://newtab/"}
 
@@ -166,8 +210,8 @@ def session(domain="glide.vc"):
 def devtools():
     servers = []
 
-    def make(tabs, answer, hang=False):
-        server = DevTools(tabs, answer, hang)
+    def make(tabs, answer, hang=False, kind=DevTools):
+        server = kind(tabs, answer, hang)
         servers.append(server)
         return server
 
@@ -713,6 +757,95 @@ def test_live_fails_when_signed_out(box, devtools):
     done = box.call("check", "--live", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **LIVE_FAST)
     assert done.returncode == 1
     assert "signed out" in done.stdout
+
+
+# -- check --refuse-other (the home guardian unit's ExecStartPre: only another account blocks the start) ------------------
+
+REFUSE = {"CHATGPT_RELOGIN_DOMAIN": "gmail.com", **LIVE_FAST}
+
+
+def test_refuse_other_passes_the_required_domain(box, devtools):
+    server = devtools([CHATGPT_TAB], session("gmail.com"))
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "gmail.com" in done.stdout and "glide.vc" not in done.stdout
+
+
+def test_refuse_other_blocks_another_domain_and_prints_domains_only(box, devtools):
+    server = devtools([CHATGPT_TAB], session("app.glide.vc"))
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 1
+    assert "app.glide.vc" in done.stdout and "gmail.com" in done.stdout
+    assert "@" not in done.stdout + done.stderr
+
+
+def test_refuse_other_never_blocks_for_want_of_a_tab_or_a_browser(box, devtools):
+    """The home browser restarts without a chatgpt.com tab and nothing opens one: `check --live` would keep the guardian down."""
+    server = devtools([NEWTAB], session("app.glide.vc"))
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "not known to be another one" in done.stdout
+    assert box.call("check", "--refuse-other", **NO_BROWSER, **REFUSE).returncode == 0
+
+
+def test_refuse_other_opens_a_chatgpt_tab_in_a_browser_that_has_none_and_refuses_the_account_it_shows(box, devtools):
+    """A restarted home browser holds chrome://newtab/ only and nothing opens a chatgpt.com tab for home (revive does it for glide):
+    without opening one the check would be blind exactly after a restart. The tab stays: the guardian itself needs it."""
+    server = devtools([NEWTAB], session("app.glide.vc"), kind=TabbedDevTools)
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "app.glide.vc" in done.stdout and "@" not in done.stdout + done.stderr
+    assert server.requests == [("PUT", "/json/new?https://chatgpt.com/")]
+    assert any(tab["url"] == "https://chatgpt.com/" for tab in server.tabs)
+
+
+def test_refuse_other_lets_the_required_domain_start_from_a_tab_it_opened(box, devtools):
+    server = devtools([NEWTAB], session("gmail.com"), kind=TabbedDevTools)
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert server.requests == [("PUT", "/json/new?https://chatgpt.com/")]
+
+
+def test_refuse_other_opens_no_tab_when_a_chatgpt_tab_is_already_there(box, devtools):
+    server = devtools([CHATGPT_TAB], session("gmail.com"), kind=TabbedDevTools)
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert server.requests == [] and len(server.tabs) == 1
+
+
+def test_refuse_other_keeps_asking_until_a_restored_tab_shows_a_wrong_account(box, devtools):
+    """Session restore brings the tabs back seconds after the start check begins: the check keeps asking for CHATGPT_RELOGIN_ACCOUNT_TIMEOUT
+    (a browser that cannot open a tab itself here: plain DevTools has no /json/new), so a wrong account that shows up late is still refused."""
+    server = devtools([NEWTAB], session("app.glide.vc"))
+    proc = box.start("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), CHATGPT_RELOGIN_DOMAIN="gmail.com",
+                     CHATGPT_RELOGIN_ACCOUNT_TIMEOUT="10", CHATGPT_RELOGIN_PROBE_TIMEOUT="1")
+    time.sleep(0.5)
+    assert proc.poll() is None, "still waiting for a chatgpt.com tab"
+    server.tabs[:] = [CHATGPT_TAB]
+    code, out, err = finish(proc, timeout=20)
+    assert code == 1, out + err
+    assert "app.glide.vc" in out and "gmail.com" in out
+
+
+def test_refuse_other_does_not_block_a_signed_out_browser(box, devtools):
+    server = devtools([CHATGPT_TAB], {"state": "none", "domain": ""})
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0
+    assert "signed out" in done.stdout
+
+
+def test_refuse_other_does_not_block_an_account_without_a_visible_domain(box, devtools):
+    server = devtools([CHATGPT_TAB], {"state": "user", "domain": ""})
+    done = box.call("check", "--refuse-other", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 0
+    assert "not visible" in done.stdout
+
+
+def test_refuse_other_speaks_russian_when_asked(box, devtools):
+    server = devtools([CHATGPT_TAB], session("app.glide.vc"))
+    done = box.call("check", "--refuse-other", UBUNTU_TWEAK_LANG="ru", CHATGPT_RELOGIN_DEVTOOLS_PORT=str(server.port), **REFUSE)
+    assert done.returncode == 1
+    assert "другой аккаунт" in done.stdout
 
 
 def test_plain_check_still_falls_back_to_the_marker(box):

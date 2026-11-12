@@ -25,6 +25,7 @@ from test_relogin import (
     FAKE_SYSTEMCTL,
     NEWTAB,
     DevTools,
+    TabbedDevTools,
     make_executable,
     session,
 )
@@ -466,6 +467,47 @@ def test_glide_accepts_only_its_configured_domain_as_an_expected_domain(glide_bo
     assert glide_box.call("pull", "glide", "--expect-domain", "App.Glide.vc").returncode == 0
 
 
+# the machine declares the home account's domain (module option home_email_domain): the home guardian unit's ExecStartPre refuses any other one
+HOME_REQUIRED = {"UBUNTU_TWEAK_MODULE_CONFIG": json.dumps({"glide_email_domain": "app.glide.vc", "home_email_domain": "gmail.com"})}
+
+
+def test_home_with_a_declared_domain_takes_only_that_domain(box):
+    """Any other account would be accepted here, then refused by the guardian's start check after the whole verify timeout."""
+    box.browser.answer = session("outlook.com")
+    done = box.call("pull", "home", **HOME_REQUIRED)
+    assert done.returncode == 4, done.stdout + done.stderr
+    assert "outlook.com" in done.stderr and "need gmail.com" in done.stderr
+    assert target_rows(box) == sorted(TARGET_ROWS)
+    assert box.active() == sorted(box.units)
+
+
+def test_home_with_a_declared_domain_confirms_that_domain(box):
+    done = box.call("pull", "home", **HOME_REQUIRED)  # the sandbox's home browser shows gmail.com
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "email domain gmail.com" in done.stdout
+
+
+def test_home_with_a_declared_domain_accepts_only_it_as_an_expected_domain(box):
+    done = box.call("pull", "home", "--expect-domain", "outlook.com", **HOME_REQUIRED)
+    assert done.returncode == 2
+    assert "cannot change that for home" in done.stderr
+    assert box.systemctl_events() == []
+    assert box.call("pull", "home", "--expect-domain", "@GMail.com", **HOME_REQUIRED).returncode == 0
+
+
+def test_the_plan_of_a_home_pull_names_the_declared_domain(box):
+    done = box.call("pull", "home", "--dry-run", **HOME_REQUIRED)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "the email domain must be gmail.com" in done.stdout
+
+
+def test_a_malformed_home_domain_option_is_a_config_error_before_anything_stops(box):
+    done = box.call("pull", "home", UBUNTU_TWEAK_MODULE_CONFIG=json.dumps({"home_email_domain": "not a domain"}))
+    assert done.returncode == 2
+    assert "home_email_domain" in done.stderr
+    assert box.systemctl_events() == []
+
+
 def test_a_second_pull_of_the_same_workspace_is_refused_while_one_runs(box):
     locks = box.root / "locks"
     locks.mkdir(parents=True)
@@ -548,50 +590,6 @@ def test_the_start_limits_are_reset_again_before_a_rollback_starts_the_units(gli
     last_start = max(i for i, line in enumerate(events) if " start " in line)
     last_stop = max(i for i, line in enumerate(events) if " stop " in line)
     assert any(" reset-failed " in line for line in events[last_stop:last_start])
-
-
-class Replay:
-    """A socket whose first recv returns an HTTP head that was already read."""
-
-    def __init__(self, sock, head):
-        self.sock, self.head = sock, head
-
-    def recv(self, size):
-        if self.head:
-            data, self.head = self.head, b""
-            return data
-        return self.sock.recv(size)
-
-    def sendall(self, data):
-        self.sock.sendall(data)
-
-
-class TabbedDevTools(DevTools):
-    """DevTools that also serves PUT /json/new (a ChatGPT tab appears) and records /json/close/<id>."""
-
-    def __init__(self, tabs, answer):
-        self.requests = []
-        super().__init__(tabs, answer)
-
-    def handle(self, sock):
-        head = b""
-        while b"\r\n\r\n" not in head:
-            chunk = sock.recv(4096)
-            if not chunk:
-                return
-            head += chunk
-        method, path, _ = head.split(b"\r\n", 1)[0].decode().split(" ", 2)
-        if path.startswith("/json/new"):
-            self.requests.append((method, path))
-            self.tabs.append(dict(CHATGPT_TAB))
-            body = json.dumps({"id": "tab-new", "type": "page", "url": "https://chatgpt.com/"}).encode()
-        elif path.startswith("/json/close/"):
-            self.requests.append((method, path))
-            body = b"Target is closing"
-        else:
-            super().handle(Replay(sock, head))
-            return
-        sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
 
 
 def test_a_browser_that_restarts_without_a_chatgpt_tab_gets_a_temporary_one(box):

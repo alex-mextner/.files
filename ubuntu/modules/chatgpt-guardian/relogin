@@ -10,6 +10,12 @@ type a password into it. This helper is the human part of the `glide-chatgpt-log
                   domain; an unreachable browser is retried within CHATGPT_RELOGIN_ACCOUNT_TIMEOUT, then exit 1
                   (never the marker). The glide guardian unit runs it as ExecStartPre, so the sender never starts
                   while the browser is signed in to another account.
+  relogin check --refuse-other
+                  the home guardian's start check (CHATGPT_RELOGIN_DOMAIN and CHATGPT_RELOGIN_DEVTOOLS_PORT from its unit): exit 1
+                  ONLY when the browser shows a signed-in account whose email domain is another one. Signed out, an email
+                  domain that is not visible, or a browser that cannot be asked (no DevTools answer, no chatgpt.com tab: a
+                  restarted browser has none, within CHATGPT_RELOGIN_ACCOUNT_TIMEOUT) are exit 0, so this check can never keep
+                  the guardian down for want of a tab, which `check --live` would.
   relogin run     stop the glide.vc guardian units, open the SAME profile in a visible Chrome window on the real
                   desktop, wait until that window is closed, start the units again in dependency order and verify
 
@@ -109,7 +115,7 @@ PAGE_SCRIPT = """(async () => {
 
 TEXT = {
     "en": {
-        "usage": "usage: relogin check [--live] | run",
+        "usage": "usage: relogin check [--live | --refuse-other] | run",
         "bad_option": "module option {name}: {why}",
         "ok_account": "glide.vc ChatGPT account is signed in (email domain {domain})",
         "wrong_account": "the guardian browser is signed in with another account (email domain {domain}, need {want})",
@@ -119,6 +125,8 @@ TEXT = {
         "marker_yes": "{asked}; the marker says the re-login was done on {when}",
         "marker_no": "{asked}; there is no marker of a finished re-login either",
         "live_unavailable": "{asked}; --live uses no marker fallback, so the account is unconfirmed",
+        "ok_domain": "the guardian browser account has the required email domain {domain}",
+        "not_another": "{asked}; the account is not known to be another one, so the start is not blocked",
         "why_port": "no DevTools answer on port {port}",
         "why_tab": "no chatgpt.com tab is open",
         "why_unreadable": "the session answer was not readable",
@@ -150,7 +158,7 @@ TEXT = {
         "wrong_after": "the window was closed, but the account is wrong: {what}",
     },
     "ru": {
-        "usage": "использование: relogin check [--live] | run",
+        "usage": "использование: relogin check [--live | --refuse-other] | run",
         "bad_option": "опция модуля {name}: {why}",
         "ok_account": "аккаунт ChatGPT glide.vc залогинен (домен почты {domain})",
         "wrong_account": "в браузере стража другой аккаунт (домен почты {domain}, нужен {want})",
@@ -160,6 +168,8 @@ TEXT = {
         "marker_yes": "{asked}; по метке перелогин был сделан {when}",
         "marker_no": "{asked}; и метки о выполненном перелогине тоже нет",
         "live_unavailable": "{asked}; --live не использует метку, поэтому аккаунт не подтверждён",
+        "ok_domain": "у аккаунта в браузере стража нужный домен почты {domain}",
+        "not_another": "{asked}; не известно, что аккаунт другой, поэтому запуск не блокируется",
         "why_port": "на порту DevTools {port} нет ответа",
         "why_tab": "нет открытой вкладки chatgpt.com",
         "why_unreadable": "ответ сессии не удалось прочитать",
@@ -523,6 +533,41 @@ def cmd_check_live(settings: Settings) -> int:
     return 1
 
 
+def open_chatgpt_tab(port: int) -> bool:
+    """Open one https://chatgpt.com/ tab through DevTools (PUT /json/new) and leave it open; whether the browser took it. Never raises."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(urllib.request.Request(f"http://127.0.0.1:{port}/json/new?https://chatgpt.com/", method="PUT"), timeout=10) as answer:
+            return isinstance(json.loads(answer.read() or b"{}"), dict)
+    except (OSError, ValueError):  # URLError is an OSError, JSONDecodeError a ValueError
+        return False
+
+
+def cmd_check_refuse_other(settings: Settings) -> int:
+    """Exit 1 only for a signed-in account of another email domain; every other answer, a silent browser included, passes.
+
+    A restarted browser shows no chatgpt.com tab (a profile whose tabs were closed restores to chrome://newtab/ only) and nothing
+    opens one for home, so an answerable browser without such a tab gets one for the question and keeps it (profile-sync and revive
+    do the same): otherwise the check would be blind exactly after a restart. Opening one costs one probe, not a second wait."""
+    answer = probe(settings.port, settings.probe_timeout)
+    if answer.kind == "unavailable" and answer.reason == "why_tab":
+        open_chatgpt_tab(settings.port)
+    if answer.kind == "unavailable":
+        answer = await_account(settings)
+    if answer.kind == "account" and answer.domain and answer.domain != settings.domain:
+        tell(describe_account(settings, answer))
+        return 1
+    if answer.kind == "account" and answer.domain:
+        tell(settings.say("ok_domain", domain=answer.domain))
+        return 0
+    if answer.kind == "unavailable":
+        asked = settings.say("no_answer", reason=settings.say(answer.reason, port=settings.port))
+    else:
+        asked = describe_account(settings, answer)
+    tell(settings.say("not_another", asked=asked))
+    return 0
+
+
 # -- run ----------------------------------------------------------------------------------------------------------------
 
 
@@ -833,7 +878,7 @@ def run_window(settings: Settings) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv not in (["check"], ["check", "--live"], ["run"]):
+    if argv not in (["check"], ["check", "--live"], ["check", "--refuse-other"], ["run"]):
         print(TEXT["en"]["usage"], file=sys.stderr)
         return 2
     try:
@@ -845,6 +890,8 @@ def main(argv: list[str]) -> int:
         code = cmd_run(settings)
     elif argv == ["check", "--live"]:
         code = cmd_check_live(settings)
+    elif argv == ["check", "--refuse-other"]:
+        code = cmd_check_refuse_other(settings)
     else:
         code = cmd_check(settings)
     for stream in (sys.stdout, sys.stderr):  # a hung-up terminal must not turn the exit code into 120 at shutdown

@@ -69,6 +69,11 @@
 #                      the home browser and guardian then run on their old definition until restarted (apply prints the command)
 #   glide_email_domain   email domain the glide.vc ChatGPT account must have (default glide.vc); `relogin` reads it, and the
 #                      glide guardian unit passes it to `relogin check --live` (ExecStartPre) as CHATGPT_RELOGIN_DOMAIN
+#   home_email_domain  email domain the home ChatGPT account must have (default empty: nothing declared, any account). When set, the home
+#                      guardian unit gets CHATGPT_RELOGIN_DOMAIN / CHATGPT_RELOGIN_DEVTOOLS_PORT and an ExecStartPre `relogin check --refuse-other`:
+#                      it stops the guardian from starting while the browser shows an account of ANOTHER domain, and never for want of
+#                      a chatgpt.com tab or an answer (unlike glide's `check --live`, which needs a tab revive opens for glide only).
+#                      Must differ from glide_email_domain. pm login-assist still accepts any home account (pm-cli#95)
 #   control_pass_dir   absolute path (or ~/...) of the directory the control pass runs from and writes its output to (default empty: the
 #                      pass is not managed by this module); the units' paths follow it
 #   audit_timers       true / false (default false): install the per-account pm audit timers of fact 10; needs a pm that merges a
@@ -104,7 +109,7 @@ import json, os, re, shlex, sys
 
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "", "pm_package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
-         "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc",
+         "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc", "home_email_domain": "",
          "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False, "login_assist": False}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
@@ -131,6 +136,11 @@ for key in ("repo", "dir", "package", "chrome", "xvfb", "pm_package", "control_p
 # read by `relogin` (passed to the glide guardian unit as CHATGPT_RELOGIN_DOMAIN), normalized here like there
 if not isinstance(opt["glide_email_domain"], str) or not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["glide_email_domain"]):
     fail("glide_email_domain must be a domain name such as glide.vc")
+# empty = no required domain for home (the default); else the same domain syntax as glide_email_domain
+if not isinstance(opt["home_email_domain"], str) or (opt["home_email_domain"] and not re.fullmatch(r"@?[A-Za-z0-9.-]+\.[A-Za-z]{2,}", opt["home_email_domain"])):
+    fail("home_email_domain must be empty or a domain name such as gmail.com")
+if opt["home_email_domain"] and opt["home_email_domain"].lstrip("@").lower() == opt["glide_email_domain"].lstrip("@").lower():
+    fail("home_email_domain must differ from glide_email_domain: the two accounts are told apart by it")
 if not isinstance(opt["home_private_display"], bool):
     fail("home_private_display must be true or false: %s" % opt["home_private_display"])
 if not isinstance(opt["audit_timers"], bool):
@@ -184,7 +194,8 @@ if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
 if not opt["package"]:
     opt["package"] = opt["dir"] + "/lib/agenttools_chatgpt"
 opt["glide_domain"] = opt["glide_email_domain"].lstrip("@").lower()
-for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain", "control_pass_dir"):
+opt["home_domain"] = opt["home_email_domain"].lstrip("@").lower()
+for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port", "glide_port", "home_memory_high", "home_memory_max", "glide_domain", "home_domain", "control_pass_dir"):
     print("opt_%s=%s" % (key, shlex.quote(str(opt[key]))))
 print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
 print("opt_audit_timers=%s" % ("true" if opt["audit_timers"] else "false"))
@@ -206,6 +217,7 @@ home_memory_high=$opt_home_memory_high
 home_memory_max=$opt_home_memory_max
 home_private_display=$opt_home_private_display
 glide_domain=$opt_glide_domain
+home_domain=$opt_home_domain
 control_dir=$opt_control_pass_dir
 audit_timers=$opt_audit_timers
 login_assist=$opt_login_assist
@@ -305,12 +317,21 @@ home_display_tokens() { # the template tokens that switch the home account betwe
     home_display_unit_lines=""; home_display_service_lines=""; home_private_flag=""; home_private_guard=""
   fi
 }
+home_relogin_tokens() { # the template tokens of the home account's required domain (home_email_domain); both empty without one
+  if [ -n "$home_domain" ]; then
+    home_relogin_env=$'# The email domain the home account must have (home_email_domain): the guardian does not start while the browser shows another one.\nEnvironment=CHATGPT_RELOGIN_DEVTOOLS_PORT='"$home_port"$'\nEnvironment=CHATGPT_RELOGIN_DOMAIN='"$home_domain"
+    home_relogin_guard="ExecStartPre=$here/relogin check --refuse-other"
+  else
+    home_relogin_env=""; home_relogin_guard=""
+  fi
+}
 render_unit() {
   home_display_tokens
+  home_relogin_tokens
   render "$here/units/$1.service" "CHROME=$chrome" "HOME_PORT=$home_port" "GLIDE_PORT=$glide_port" "XVFB=$xvfb" \
     "HOME_MEMORY_HIGH=$home_memory_high" "HOME_MEMORY_MAX=$home_memory_max" "GLIDE_DOMAIN=$glide_domain" "RELOGIN=$here/relogin" \
     "HOME_DISPLAY_UNIT=$home_display_unit_lines" "HOME_DISPLAY_SERVICE=$home_display_service_lines" "HOME_PRIVATE_FLAG=$home_private_flag" \
-    "HOME_PRIVATE_GUARD=$home_private_guard" "REVIVE=$here/revive"
+    "HOME_PRIVATE_GUARD=$home_private_guard" "HOME_RELOGIN_ENV=$home_relogin_env" "HOME_RELOGIN_GUARD=$home_relogin_guard" "REVIVE=$here/revive"
 }
 site_pkg() { # the installed package directory in the venv
   local d
@@ -369,11 +390,11 @@ PM
 }
 pm_link_ok() { [ -z "$pm_package" ] || { [ -L "$pm_link" ] && [ "$(readlink -f "$pm_link")" = "$(readlink -f "$venv/bin/pm")" ]; }; }
 # ./profile-sync is opt-in (nothing runs it); apply only installs this wrapper, which hands it the options of this machine
-# (the DevTools ports and the glide account's email domain) the way finish-setup hands them to ./relogin.
+# (the DevTools ports and the two accounts' email domains) the way finish-setup hands them to ./relogin.
 sync_wrapper="$HOME/.local/bin/chatgpt-guardian-profile-sync"
 sync_wrapper_text() {
   printf '#!/usr/bin/env bash\n# written by the chatgpt-guardian module (install.sh). Opt-in: nothing runs this by itself; see profile-sync in the module.\n'
-  printf "UBUNTU_TWEAK_MODULE_CONFIG='{\"home_port\": %s, \"glide_port\": %s, \"glide_email_domain\": \"%s\"}'\\n" "$((10#$home_port))" "$((10#$glide_port))" "$glide_domain"
+  printf "UBUNTU_TWEAK_MODULE_CONFIG='{\"home_port\": %s, \"glide_port\": %s, \"glide_email_domain\": \"%s\", \"home_email_domain\": \"%s\"}'\\n" "$((10#$home_port))" "$((10#$glide_port))" "$glide_domain" "$home_domain"
   printf 'export UBUNTU_TWEAK_MODULE_CONFIG\nexec %q "$@"\n' "$here/profile-sync"
 }
 sync_wrapper_ok() { [ -f "$sync_wrapper" ] && [ ! -L "$sync_wrapper" ] && [ -x "$sync_wrapper" ] && [ "$(cat "$sync_wrapper")" = "$(sync_wrapper_text)" ]; }
@@ -645,7 +666,7 @@ if [ "$mode" = plan ]; then
     if dep_ok "$ws"; then echo "$ws: deployment file present"; else echo "$ws: chatgpt-guardian init, write $(dep_file "$ws")"; fi
     chats_of "$ws" | while IFS= read -r url; do [ -z "$url" ] || echo "$ws: watch $url (when never seen)"; done
   done
-  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins + the $revive_unit service/timer and its 3 91-revive.conf drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers, enable the $revive_unit.timer"
+  echo "units: render ${#unit_names[@]} units + 2 lifecycle drop-ins + the $revive_unit service/timer and its 3 91-revive.conf drop-ins into $units_dir (home port $home_port, glide.vc port $glide_port, home browser MemoryHigh $home_memory_high MemoryMax $home_memory_max, home private display $home_private_display, glide domain $glide_domain, home domain ${home_domain:-not declared}), drop stale 90-pc.conf / 95-port.conf, daemon-reload, enable, start the stopped displays, browsers and observers, enable the $revive_unit.timer"
   if ! control_active; then echo "control pass: not managed (no control_pass_dir)"
   elif control_ok && timer_on "$control_unit"; then echo "control pass: $control_dir matches ./control-pass, $control_unit.service/.timer ok and enabled"
   else echo "control pass: copy ${control_files[*]} and the ${#quiet_names[@]} quiet stubs into $control_dir, render $control_unit.service/.timer, enable the timer (what differs)"; fi
@@ -911,6 +932,24 @@ for ws in "${workspaces[@]}"; do
   release_profile
 done
 
+# The home guardian refuses to start while the home browser shows another account (its ExecStartPre `relogin check --refuse-other`):
+# that unit is down for a reason apply can name, not for want of a display. Fails unless the check itself refuses (exit 1).
+home_refusal() {
+  local out rc=0
+  [ -n "$home_domain" ] || return 1
+  out=$(CHATGPT_RELOGIN_DOMAIN="$home_domain" CHATGPT_RELOGIN_DEVTOOLS_PORT="$((10#$home_port))" "$here/relogin" check --refuse-other 2>&1) || rc=$?
+  [ "$rc" = 1 ] || return 1
+  printf '%s' "$out"
+}
+down_hint() { # down_hint UNIT...: what to look at for the units that did not come up
+  local refusal
+  if [[ " $* " == *" chatgpt-guardian-home "* ]] && refusal=$(home_refusal); then
+    echo "journalctl --user -u <unit>; the home guardian refuses to start: $refusal; sign in to the home browser with an account of the email domain $home_domain (chatgpt-guardian-profile-sync pull home)"
+  else
+    echo "journalctl --user -u <unit>; the home browser needs the desktop session's DISPLAY"
+  fi
+}
+
 # the started units must come up (a browser waits for its display; give them time before judging)
 down=()
 for n in "${to_start[@]}"; do
@@ -925,7 +964,7 @@ if [ "$login_assist" = true ]; then
   done
 fi
 if [ ${#down[@]} -gt 0 ]; then
-  echo "not running after start: ${down[*]} (journalctl --user -u <unit>; the home browser needs the desktop session's DISPLAY)" >&2
+  echo "not running after start: ${down[*]} ($(down_hint "${down[@]}"))" >&2
   exit 1
 fi
 if [ ${#login_held[@]} -gt 0 ]; then

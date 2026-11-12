@@ -5,7 +5,7 @@ manual = "log in to ChatGPT once in each guardian browser profile (home account 
 
 # User level: writes $HOME and talks to the user's systemd, so it never runs as root. Options
 # ([modules.chatgpt-guardian] in profile.toml / machine.toml): repo, dir, package, chrome, home_port, glide_port,
-# xvfb, home_memory_high, home_memory_max, home_private_display, chats_home, chats_glide, glide_email_domain (see install.sh; the last one is read by ./relogin and passed to the glide guardian unit).
+# xvfb, home_memory_high, home_memory_max, home_private_display, chats_home, chats_glide, glide_email_domain, home_email_domain (see install.sh; the email domains are read by ./relogin and ./profile-sync (through its wrapper) and passed to the glide guardian unit (check --live) and, when home_email_domain is set, to the home guardian unit (check --refuse-other)).
 #
 # Personal module: the two accounts (workspaces `home` and `glide.vc`), their control ports 8790/8791 and the private
 # displays (:111 glide.vc, :112 home when home_private_display is true) are fixed in the units; only the DevTools ports, Chrome, Xvfb and the enrolled chats are options.
