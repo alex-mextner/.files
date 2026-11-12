@@ -1,0 +1,15 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): triggers tmux-autosave.service. The save interval itself is
+# tmux's @continuum-save-interval (rig tmux.continuum.save_interval, 15 min): each run saves only when that has passed
+# since the last save, so this timer only has to be at least as frequent.
+[Unit]
+Description=Fire tmux-continuum's autosave every few minutes (independent of tmux's status line and of attached clients)
+
+[Timer]
+# the first run is due 5 min after boot, so the server tmux-boot started has finished restoring; enabling the timer on
+# a machine that has been up longer fires it at once
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

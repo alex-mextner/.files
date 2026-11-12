@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# tmux-autosave: fire tmux-continuum's autosave from a systemd timer instead of from tmux's status line.
+#
+# continuum's autosave trigger is a `#(continuum_save.sh)` token it appends to the global `status-right` ONCE, when the
+# plugin loads. tmux evaluates it only while a client is attached and drawing, and anything that rewrites status-right
+# afterwards removes it for good. On this PC the Moshi iOS client does exactly that on every attach
+# (`tmux set -g status-right '' ; attach-session`, global, so it wipes the token for every client until the server
+# restarts), and a server with no client attached never draws a status line at all. Result: no snapshot between
+# 2026-10-23 and the 2026-11-08 reboot, so the reboot restored a 16-day-old layout and no omp/claude/codex map existed.
+#
+# This script runs continuum's OWN save entry point (continuum_save.sh: save interval, lock, last-save timestamp, then
+# tmux-resurrect's save.sh and rig's post-save-all hooks that write the omp/cc/codex session maps) from the timer. The
+# trigger no longer depends on status-right or on a client, and there is still exactly one saver pipeline: continuum's
+# interval check decides whether a run saves, so a 5-minute timer yields a save every @continuum-save-interval minutes.
+#
+# It only acts on a server in which continuum initialised its autosave (it stamps @continuum-save-last-timestamp at
+# load). continuum deliberately skips that when another tmux server is running at load, so that two servers never
+# overwrite each other's snapshot in the shared resurrect directory; this script keeps that rule instead of bypassing it.
+#
+# continuum starts resurrect's save in the background and discards its output, so success is verified here: when a run
+# triggered a save, tmux-resurrect must touch its snapshot directory within TMUX_AUTOSAVE_SAVE_WAIT seconds.
+#
+# Exit 0: a save is current (or not needed yet), or there is no server to save. Exit 1: autosave is NOT working
+# (continuum inactive in the server, no saver, unwritable snapshot directory, a save that wrote nothing, or no save
+# for TMUX_AUTOSAVE_STALE_MIN minutes); the unit then shows as failed in `systemctl --user --failed` and the reason is
+# in `journalctl --user -u tmux-autosave`.
+#
+#   TMUX_AUTOSAVE_TMUX            tmux executable, one word (default tmux); tests point it at a throwaway socket
+#   TMUX_AUTOSAVE_CONTINUUM_SAVE  continuum's save script (default ~/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh)
+#   TMUX_AUTOSAVE_STALE_MIN       minutes without a save after which the run fails (default 45 = three save intervals; a
+#                                 longer @continuum-save-interval raises the limit to three of its intervals)
+#   TMUX_AUTOSAVE_SAVE_WAIT       seconds to wait for a triggered save to show up in the snapshot directory (default 30)
+set -u
+
+tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
+continuum_save=${TMUX_AUTOSAVE_CONTINUUM_SAVE:-$HOME/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh}
+stale_min=${TMUX_AUTOSAVE_STALE_MIN:-45}
+case $stale_min in
+  ''|*[!0-9]*) echo "tmux-autosave: TMUX_AUTOSAVE_STALE_MIN must be a whole number of minutes, got '$stale_min'" >&2; exit 2 ;;
+esac
+save_wait=${TMUX_AUTOSAVE_SAVE_WAIT:-30}
+case $save_wait in
+  ''|*[!0-9]*) echo "tmux-autosave: TMUX_AUTOSAVE_SAVE_WAIT must be a whole number of seconds, got '$save_wait'" >&2; exit 2 ;;
+esac
+
+# a systemd user manager hands out a minimal PATH: add the user's tool dirs after it, as tmux-boot does, so the hooks
+# continuum's save script runs (rig, tg-ctl, lsof) resolve the same way as in a login shell
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+# always the default socket (or the one TMUX_AUTOSAVE_TMUX names), never whichever server a calling pane belongs to
+unset TMUX
+
+fail() { echo "tmux-autosave: $*" >&2; exit 1; }
+option() { "$tmux_bin" show-option -gqv "$1" 2>/dev/null; }
+mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+# same directory rule as tmux-resurrect's helpers.sh and tmux-boot (@resurrect-dir wins, then ~/.tmux/resurrect, then XDG)
+resurrect_dir() {
+  local dir
+  dir=$(option @resurrect-dir)
+  if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+  fi
+  dir=${dir//\$HOME/"$HOME"}
+  printf '%s\n' "${dir/#\~/"$HOME"}"
+}
+
+command -v "$tmux_bin" >/dev/null 2>&1 || fail "tmux is not installed"
+if ! "$tmux_bin" list-sessions >/dev/null 2>&1; then
+  echo "tmux-autosave: no tmux server, nothing to save"
+  exit 0
+fi
+[ -x "$continuum_save" ] || fail "tmux-continuum is not installed ($continuum_save)"
+
+interval=$(option @continuum-save-interval)
+interval=${interval:-15}
+case $interval in
+  *[!0-9]*) fail "@continuum-save-interval is '$interval', continuum wants a whole number of minutes" ;;
+esac
+if [ "$interval" = 0 ]; then
+  echo "tmux-autosave: @continuum-save-interval is 0, autosave is switched off on purpose"
+  exit 0
+fi
+
+before=$(option @continuum-save-last-timestamp)
+case $before in
+  ''|*[!0-9]*) fail "tmux-continuum is not active in this server: it was not loaded (the server was started without ~/.tmux.conf?) or it skipped autosave because another tmux server was running when it loaded, so nothing is autosaved" ;;
+esac
+
+saver=$(option @resurrect-save-script-path)
+[ -n "$saver" ] && [ -x "$saver" ] || fail "tmux-resurrect's save script is missing (@resurrect-save-script-path='$saver')"
+rdir=$(resurrect_dir)
+{ mkdir -p "$rdir" 2>/dev/null && [ -w "$rdir" ]; } || fail "the snapshot directory $rdir cannot be written"
+
+started=$(date +%s)
+# run-shell executes in the server, which also gives continuum's script the TMUX variable it names its lock after
+"$tmux_bin" run-shell "'$continuum_save'" || fail "tmux run-shell $continuum_save failed"
+
+last=$(option @continuum-save-last-timestamp)
+case $last in ''|*[!0-9]*) last=$before ;; esac
+if [ "$last" != "$before" ]; then
+  # this run triggered a save, which runs in the background: wait until resurrect has touched its directory
+  waited=0
+  while [ "$(mtime "$rdir")" -lt "$started" ] && [ "$waited" -lt "$save_wait" ]; do sleep 1; waited=$((waited + 1)); done
+  [ "$(mtime "$rdir")" -ge "$started" ] || fail "continuum started a save but tmux-resurrect wrote nothing into $rdir within $save_wait seconds"
+fi
+
+# three save intervals without a save is the failure, whatever the interval is (and never less than stale_min)
+limit=$((stale_min * 60))
+[ $((interval * 180)) -le "$limit" ] || limit=$((interval * 180))
+age=$(( $(date +%s) - last ))
+if [ "$age" -gt "$limit" ]; then
+  fail "the last autosave was $((age / 60)) minutes ago (> $((limit / 60))): continuum refuses to save (interval $interval min), see its lock under /tmp/tmux-continuum-*"
+fi
+
+if [ -z "$(option @resurrect-hook-post-save-all)" ]; then
+  echo "tmux-autosave: warning: no @resurrect-hook-post-save-all in this server, so the omp/claude/codex session maps are not written and a reboot cannot relaunch them (the server was started before rig's tmux config was applied)" >&2
+fi
+echo "tmux-autosave: ok, last autosave $((age / 60)) min ago (every $interval min)"
