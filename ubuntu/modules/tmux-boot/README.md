@@ -17,11 +17,13 @@ Tracking: dotfiles #142 · rig-cli #853 (Linux autosave) · rig-cli #854 (the om
 | watchdog | `tmux-watchdog` asserts the invariants, self-heals, alerts, and (opt-in) restarts a dead server | `tmux-watchdog.timer`, every 5 min |
 | shutdown | a save at shutdown/logout (`tmux-shutdown-*`, added by the shutdown-save work) | systemd |
 
-Scripts are installed to `~/.local/bin`, units to `~/.config/systemd/user`; `install.sh` finds every `tmux-*` asset
-next to it by glob — an extension-less file is a script whatever its mode (`install -m 755` sets it), a
-`tmux-*.service|timer` with an `[Install]` section is enabled and, except `tmux-boot.service` (which waits for the
-next boot so a running server is never touched), started, and any other `tmux-*.*` file is reported instead of
-silently skipped (`bash install.sh --plan` / `--check` / no argument; `--check` exits 3 on drift).
+Scripts are installed to `~/.local/bin`, units to `~/.config/systemd/user`; the `systemd-dropins/*.scope.d/*.conf`
+files land at `~/.config/systemd/user/<same path>` followed by a `daemon-reload` (they order the pane scopes after
+the shutdown save). `install.sh` finds every `tmux-*` asset next to it by glob — an extension-less file is a script
+whatever its mode (`install -m 755` sets it), a `tmux-*.service|timer` with an `[Install]` section is enabled and,
+except `tmux-boot.service` (which waits for the next boot so a running server is never touched), started, and any
+other `tmux-*.*` file is reported instead of silently skipped (`bash install.sh --plan` / `--check` / no argument;
+`--check` exits 3 on drift).
 
 ## Is it working? (status check)
 
@@ -90,6 +92,9 @@ after that the server starts WITHOUT a restore and an alert is sent.
 
 ```sh
 systemctl --user disable --now tmux-watchdog.timer tmux-autosave.timer       # stop the periodic layers
+systemctl --user disable --now tmux-boot-selfcheck.timer tmux-shutdown-save.service tmux-shutdown-watch.service  # and the shutdown/selfcheck layers
+rm -f ~/.config/systemd/user/tmux-spawn-.scope.d/10-tmux-shutdown-save.conf \
+      ~/.config/systemd/user/omp-.scope.d/10-tmux-shutdown-save.conf && systemctl --user daemon-reload  # only the module's own drop-ins
 tmux set-hook -gu 'window-linked[940]'                                       # (and the other hooks, see tmux-lib TL_*_HOOKS)
 tmux set -g @resurrect-save-script-path "$(tmux show-option -gv @tmux-boot-resurrect-save-script)"   # unguard continuum's trigger
 ```
@@ -101,10 +106,13 @@ names the module's assets exactly, so the leftover shows up as untracked coverag
 
 ```sh
 cd ubuntu/modules/tmux-boot
-python3 -m unittest tests.test_install tests.test_save_now tests.test_hooks tests.test_watchdog tests.test_boot_guard tests.test_e2e_procs
+python3 -m unittest tests.test_install tests.test_save_now tests.test_hooks tests.test_watchdog tests.test_boot_guard tests.test_e2e_procs tests.test_shutdown
+python3 tests/integration_installed.py    # the real installer into a temp HOME, then the deployed pieces, ~15 s
+python3 tests/e2e_shutdown_ordering.py    # real user systemd, throwaway scopes/targets, ~30 s
 python3 tests/e2e_isolated_restore.py    # real omp + rig, throwaway socket, ~6 min
 python3 tests/e2e_hardening.py           # real plugins, fake agent, throwaway socket, ~5 min
-shellcheck -x tmux-* install.sh
+shellcheck -x tmux-boot tmux-autosave tmux-lib tmux-save-now tmux-save-debounce tmux-resurrect-save \
+           tmux-watchdog tmux-recover tmux-alert tmux-boot-selfcheck tmux-shutdown-save tmux-shutdown-watch install.sh
 ```
 
 Only a real reboot proves: the units starting at boot with linger, the restore of the live workspace, and the shutdown

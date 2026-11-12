@@ -1,0 +1,12 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): runs tmux-boot-selfcheck.service once per boot.
+[Unit]
+Description=Check once per boot that the previous boot ended with a fresh tmux save
+
+[Timer]
+# 10 min after boot: tmux-boot has restored the sessions and the first autosave has run, and the previous boot's
+# journal is long since flushed
+OnBootSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# tmux-shutdown-watch: save the tmux sessions inside logind's shutdown delay.
+#
+# Why this and not only a unit's ExecStop: when the system shuts down or reboots, systemd-logind first emits
+# org.freedesktop.login1.Manager.PrepareForShutdown(true) and waits (up to InhibitDelayMaxSec) for every holder of a
+# "delay" shutdown inhibitor lock to release it, and only THEN stops units: the user manager, the tmux server and the
+# harness pane scopes (the tmux-spawn-*.scope units and omp-*.scope in omp.slice) all still run. This service holds
+# that lock for its whole life, and on the signal it runs tmux-shutdown-save (tmux-save-now: tmux-resurrect's save +
+# rig's post-save hooks that record the omp/claude/codex resume ids), then releases the lock so the shutdown goes on.
+# It covers `systemctl poweroff|reboot|halt|kexec`, the GNOME menu, `shutdown`, a power button. A plain ssh/Moshi
+# detach, `tmux detach`, closing a terminal or logging out emits no such signal and therefore triggers nothing.
+#
+# Time budget: the save must end before logind gives up waiting. Its budget is derived from the live
+# InhibitDelayMaxUSec (this host: 30 s, set by Ubuntu's unattended-upgrades drop-in; logind's own default is 5 s):
+# 5/6 of it when it is at least 10 s, else all of it minus 1 s. A save that overruns is killed by timeout and the
+# shutdown proceeds: the lock is always released, and this script never exits non-zero because of a failed save.
+# On a host whose delay is only 5 s a full save with many panes may not fit: raise it with the manual root step
+#   /etc/systemd/logind.conf.d/50-tmux-shutdown-save.conf :  [Login]  InhibitDelayMaxSec=30
+# (see tests/shutdown_proof.md; this module never writes it).
+#
+# Event source: /usr/bin/gdbus monitor on the system bus (the Linuxbrew gdbus does not find the system bus), else a
+# poll of logind's PreparingForShutdown property with busctl. Both are turned into one line per event in gdbus'
+# format ("... PrepareForShutdown (true,)"). TMUX_SHUTDOWN_EVENT_CMD replaces the source (tests), as a command line run
+# with bash -c.
+#
+#   TMUX_SHUTDOWN_EVENT_CMD       command whose stdout lines are the events; it must keep running while the watcher lives
+#   TMUX_SHUTDOWN_SAVE            the save step (default ~/.local/bin/tmux-shutdown-save)
+#   TMUX_SHUTDOWN_INHIBIT         the inhibitor wrapper (default systemd-inhibit)
+#   TMUX_SHUTDOWN_SAVE_TIMEOUT    seconds for the save (default: derived from InhibitDelayMaxUSec, see above)
+#   TMUX_SHUTDOWN_DELAY_MAX       InhibitDelayMaxSec in seconds when logind cannot be asked (tests; default 30 fallback)
+#   TMUX_BOOT_STATE_DIR           stamp directory, shared with tmux-shutdown-save
+#   TMUX_SHUTDOWN_WHO             the lock's "who" (default tmux-shutdown-watch); tests use a unique one
+set -u
+
+export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
+dir=$(dirname "$(readlink -f "$0")")
+# shellcheck source=tmux-lib
+. "$dir/tmux-lib" || { echo "tmux-shutdown-watch: cannot load $dir/tmux-lib" >&2; exit 1; }
+
+save_step=${TMUX_SHUTDOWN_SAVE:-$HOME/.local/bin/tmux-shutdown-save}
+inhibit_bin=${TMUX_SHUTDOWN_INHIBIT:-systemd-inhibit}
+state_dir=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+log() { echo "tmux-shutdown-watch: $*"; }
+
+# seconds logind waits for delay inhibitors; every number goes through tmux-lib's one shared normalisation, so a
+# leading zero ("08") is eight, never a bad octal literal
+delay_max() {
+  local usec
+  if usec=$(tl_number "${TMUX_SHUTDOWN_DELAY_MAX:-}"); then echo "$usec"; return; fi # already seconds
+  usec=$(busctl --system get-property org.freedesktop.login1 /org/freedesktop/login1 \
+           org.freedesktop.login1.Manager InhibitDelayMaxUSec 2>/dev/null | awk '$1 == "t" { print $2 }')
+  # InhibitDelayMaxSec=infinity prints as 18446744073709551615, which overflows bash arithmetic to a negative
+  # number (and a negative save budget): clamp to one hour BEFORE the conversion, which itself would overflow
+  [ "${#usec}" -le 18 ] || usec=3600000000
+  usec=$(tl_number "$usec") || { echo 30; return; }
+  echo $(( usec / 1000000 ))
+}
+
+# the save timeout is validated once, here, and kept as a plain decimal
+save_timeout=
+if [ -n "${TMUX_SHUTDOWN_SAVE_TIMEOUT:-}" ]; then
+  save_timeout=$(tl_number "$TMUX_SHUTDOWN_SAVE_TIMEOUT") || save_timeout=
+  if [ -z "$save_timeout" ] || [ "$save_timeout" -le 0 ]; then
+    echo "tmux-shutdown-watch: TMUX_SHUTDOWN_SAVE_TIMEOUT must be a positive whole number of seconds, got '${TMUX_SHUTDOWN_SAVE_TIMEOUT}'" >&2
+    exit 2
+  fi
+fi
+
+save_budget() {
+  local d
+  if [ -n "$save_timeout" ]; then echo "$save_timeout"; return; fi
+  d=$(delay_max)
+  # capped at the fallback ExecStop's own budget (60 s): an InhibitDelayMaxSec of minutes or "infinity" (clamped
+  # to 1 h) must not turn a hung save into a shutdown held up for the better part of an hour
+  if [ "$d" -ge 10 ]; then d=$(( d - d / 6 )); else d=$(( d > 1 ? d - 1 : 1 )); fi
+  [ "$d" -le 60 ] || d=60
+  echo "$d"
+}
+
+event_source() {
+  if [ -n "${TMUX_SHUTDOWN_EVENT_CMD:-}" ]; then exec bash -c "$TMUX_SHUTDOWN_EVENT_CMD"; fi
+  if [ -x /usr/bin/gdbus ]; then
+    exec /usr/bin/gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1
+  fi
+  # no gdbus: poll the property twice a second and print the change in gdbus' format
+  local last=false now
+  while sleep 0.5; do
+    now=$(busctl --system get-property org.freedesktop.login1 /org/freedesktop/login1 \
+            org.freedesktop.login1.Manager PreparingForShutdown 2>/dev/null | awk '{ print $2 }') || exit 1
+    [ -n "$now" ] || exit 1
+    if [ "$now" != "$last" ]; then echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown ($now,)"; last=$now; fi
+  done
+}
+
+lock_pid=
+take_lock() {
+  [ -z "$lock_pid" ] || return 0
+  "$inhibit_bin" --what=shutdown --mode=delay --who="${TMUX_SHUTDOWN_WHO:-tmux-shutdown-watch}" \
+    --why="Saving the tmux sessions and the omp/claude/codex resume ids" sleep infinity &
+  lock_pid=$!
+  sleep 0.3
+  if kill -0 "$lock_pid" 2>/dev/null; then
+    log "holding the logind shutdown delay lock (pid $lock_pid)"
+  else
+    lock_pid=
+    echo "tmux-shutdown-watch: warning: could not take the shutdown delay lock, a save will still run on the event but the shutdown will not wait for it" >&2
+  fi
+}
+release_lock() {
+  [ -n "$lock_pid" ] || return 0
+  kill "$lock_pid" 2>/dev/null
+  wait "$lock_pid" 2>/dev/null
+  lock_pid=
+  log "released the shutdown delay lock"
+}
+
+feed_pid=
+# shellcheck disable=SC2329  # reached through the traps below; shellcheck loses them because of the final `exit 1`
+cleanup() {
+  release_lock
+  [ -z "$feed_pid" ] || kill "$feed_pid" 2>/dev/null
+}
+# shellcheck disable=SC2329
+on_signal() { cleanup; exit 0; }
+trap 'on_signal' TERM INT
+trap 'cleanup' EXIT
+
+take_lock
+coproc SRC { event_source; }
+# shellcheck disable=SC2153  # SRC_PID is bash's own coproc variable
+feed_pid=$SRC_PID
+log "waiting for PrepareForShutdown (save budget $(save_budget)s)"
+
+while IFS= read -r line <&"${SRC[0]}"; do
+  case $line in
+    *PrepareForShutdown\ \(true*)
+      budget=$(save_budget)
+      log "PrepareForShutdown(true): saving before teardown (budget ${budget}s)"
+      "$save_step" --reason shutdown --timeout "$budget"
+      release_lock
+      ;;
+    *PrepareForShutdown\ \(false*)
+      # `shutdown -c` / a cancelled reboot: the machine stays up, so the save no longer covers it, and the lock is needed again
+      log "PrepareForShutdown(false): shutdown cancelled, re-arming"
+      rm -f "$state_dir/shutdown-save"
+      take_lock
+      ;;
+  esac
+done
+
+# the event source ended (the system bus went away, or the injected command finished): systemd restarts the unit
+echo "tmux-shutdown-watch: the event source ended, exiting" >&2
+exit 1

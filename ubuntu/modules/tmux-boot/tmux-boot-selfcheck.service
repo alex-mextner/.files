@@ -1,0 +1,8 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): did the previous boot end with a fresh tmux save? Run by tmux-boot-selfcheck.timer.
+[Unit]
+Description=Check that the previous boot ended with a fresh tmux snapshot and omp session map
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-boot-selfcheck
+TimeoutStartSec=60

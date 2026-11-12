@@ -1,0 +1,25 @@
+# Managed by ubuntu-tweaks (profile module tmux-boot): holds a logind shutdown delay lock and saves the tmux sessions
+# when logind announces a shutdown or reboot (PrepareForShutdown), before any unit is stopped.
+# See tmux-shutdown-watch for the design; tmux-shutdown-save.service is the fallback for a user manager stop.
+# The installer starts this unit as well as enabling it (as it does for every enabled unit except tmux-boot.service):
+# it protects only while it holds its lock.
+[Unit]
+Description=Save the tmux sessions during logind's shutdown delay (holds a delay inhibitor lock, waits for PrepareForShutdown)
+After=tmux-boot.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tmux-shutdown-watch
+# the watcher only ends when its event source dies (the system bus restarted): arm again
+Restart=always
+RestartSec=20
+# a save in progress must be allowed to finish when the stop comes during the shutdown it is saving for: the stop
+# signal (TERM) goes to the watcher only, which acts on it once the save step returns (the step is bounded by its own
+# timeout); the control-group default would TERM the save step itself in the middle of the save
+KillMode=mixed
+# the save step's budget is capped at 60 s: the stop must wait longer than that, or systemd would kill a save
+# that is still inside its own timeout
+TimeoutStopSec=70
+
+[Install]
+WantedBy=default.target
