@@ -11,8 +11,10 @@ Neither path depends on continuum or on `status-right` (the Moshi client wipes t
 | 1 (primary) | `tmux-shutdown-watch.service` | logind `PrepareForShutdown(true)`: `systemctl poweroff/reboot/halt/kexec`, GNOME menu, power button | logind emits the signal and waits for every *delay* inhibitor lock BEFORE any unit stops. The watcher holds a `shutdown` delay lock, saves with a hard timeout (5/6 of `InhibitDelayMaxUSec`, 25 s here), then releases the lock |
 | 2 (fallback) | `tmux-shutdown-save.service` | user manager stop without that signal (`loginctl terminate-user`, user manager restart) | `ExecStop` + `After=tmux-boot.service omp.slice`, and the `systemd-dropins/*.scope.d` files add `Before=tmux-shutdown-save.service` to every `tmux-spawn-*.scope` and `omp-*.scope`, so the pane and omp scopes stop AFTER the save |
 
-Both call `tmux-shutdown-save`, the shared step: refuses a dead server (never a degenerate save), skips if a shutdown save
-already succeeded in this boot (stamp), bounds `tmux-save-now` with `timeout`, always exits 0.
+Both call `tmux-shutdown-save`, the shared step: refuses a dead server (never a degenerate save), skips if a shutdown
+save already succeeded in this boot of the SAME tmux server (the stamp records boot id, time, the server's
+pid-start_time and the reason, so a user-manager restart that starts a new server still saves), bounds `tmux-save-now`
+with `timeout`, always exits 0.
 
 Detach/logout: nothing listens to detach, and this host has `Linger=yes`, so a GNOME logout or ssh/Moshi disconnect
 never stops the user manager or the tmux server; the units fire on neither. Only a machine shutdown (or an explicit

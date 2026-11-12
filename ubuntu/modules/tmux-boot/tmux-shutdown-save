@@ -33,13 +33,16 @@ while [ $# -gt 0 ]; do
     *) echo "tmux-shutdown-save: unknown argument '$1' (usage: tmux-shutdown-save [--reason NAME] [--timeout SECONDS])" >&2; exit 2 ;;
   esac
 done
-case $timeout_s in
-  ''|*[!0-9]*|0) echo "tmux-shutdown-save: --timeout must be a positive whole number of seconds, got '$timeout_s'" >&2; exit 2 ;;
-esac
+dir=$(dirname "$(readlink -f "$0")")
+# shellcheck source=tmux-lib
+. "$dir/tmux-lib" || { echo "tmux-shutdown-save: cannot load $dir/tmux-lib" >&2; exit 1; }
+# numbers are decimal through tmux-lib's one shared normalisation: a leading zero ("08") is eight, never a bad octal
+v=$(tl_number "$timeout_s") || { echo "tmux-shutdown-save: --timeout must be a positive whole number of seconds, got '$timeout_s'" >&2; exit 2; }
+timeout_s=$v
+[ "$timeout_s" -gt 0 ] || { echo "tmux-shutdown-save: --timeout must be a positive whole number of seconds, got '$timeout_s'" >&2; exit 2; }
 ttl=${TMUX_SHUTDOWN_STAMP_TTL:-300}
-case $ttl in
-  ''|*[!0-9]*) echo "tmux-shutdown-save: TMUX_SHUTDOWN_STAMP_TTL must be a whole number of seconds, got '$ttl'" >&2; exit 2 ;;
-esac
+v=$(tl_number "$ttl") || { echo "tmux-shutdown-save: TMUX_SHUTDOWN_STAMP_TTL must be a whole number of seconds, got '$ttl'" >&2; exit 2; }
+ttl=$v
 
 # a systemd user manager hands out a minimal PATH: add the user's tool dirs after it (rig, tg, tmux from Linuxbrew)
 export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
@@ -54,22 +57,43 @@ boot_id=${TMUX_SHUTDOWN_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/nu
 
 log() { echo "tmux-shutdown-save: $*"; }
 
-# the stamp: "<boot id> <epoch> <reason>", written only by a save that succeeded in this boot
-if [ -r "$stamp" ]; then
-  read -r s_boot s_time s_reason < "$stamp" || true
-  case ${s_time:-} in ''|*[!0-9]*) s_time=0 ;; esac
-  age=$(( $(date +%s) - s_time ))
-  if [ "${s_boot:-}" = "$boot_id" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
-    log "skipped ($reason): the '${s_reason:-?}' save ${age}s ago already covers this shutdown"
-    exit 0
-  fi
+# One bounded probe asks the server who it is (pid and start time): it is both the reachability check and the identity
+# a stamp is keyed on. A hung server must not eat the whole budget before the save even starts, so the probe gets a
+# share of the budget (a third, at least 5 s, never more than the budget itself), and what it used is taken off the
+# save's budget.
+began=$(date +%s)
+probe_s=$(( timeout_s / 3 ))
+[ "$probe_s" -ge 5 ] || probe_s=5
+[ "$probe_s" -le "$timeout_s" ] || probe_s=$timeout_s
+server_id=
+probe_rc=0
+if command -v "$tmux_bin" >/dev/null 2>&1; then
+  server_id=$(timeout -k 1 "$probe_s" "$tmux_bin" display-message -p '#{pid}-#{start_time}' 2>/dev/null) || probe_rc=$?
 fi
-
-if ! command -v "$tmux_bin" >/dev/null 2>&1 || ! "$tmux_bin" list-sessions >/dev/null 2>&1; then
+if [ "$probe_rc" = 124 ] || [ "$probe_rc" = 137 ]; then
+  # the server did not answer in time: slow under shutdown memory pressure, or hung. That is not "no server", and
+  # the journal must not read like an ordering bug (a save is skipped either way: the budget is best spent nowhere)
+  echo "tmux-shutdown-save: ERROR: the tmux server did not answer within ${probe_s}s ($reason): slow or hung, not gone; nothing saved" >&2
+  exit 0
+fi
+if [ -z "$server_id" ]; then
   # nothing to save is normal on a machine without a tmux server; at a shutdown it can also mean the server went down
   # before this ran, which is exactly what the ordering of both paths exists to prevent
   echo "tmux-shutdown-save: warning: no tmux server reachable ($reason), nothing saved" >&2
   exit 0
+fi
+
+# the stamp: "<boot id> <epoch> <server id> <reason>" — the free-text reason last, so `read`'s last-variable word
+# gathering can never smear it into the server id. Written only by a save that succeeded. It covers only the tmux
+# server it was taken from: a user manager restart in the same boot starts a new server, which must still be saved.
+if [ -r "$stamp" ]; then
+  read -r s_boot s_time s_server s_reason < "$stamp" || true
+  case ${s_time:-} in ''|*[!0-9]*) s_time=0 ;; esac
+  age=$(( $(date +%s) - s_time ))
+  if [ "${s_boot:-}" = "$boot_id" ] && [ "${s_server:-}" = "$server_id" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then
+    log "skipped ($reason): the '${s_reason:-?}' save ${age}s ago already covers this shutdown"
+    exit 0
+  fi
 fi
 
 if [ ! -x "$save_now" ]; then
@@ -78,15 +102,17 @@ if [ ! -x "$save_now" ]; then
 fi
 
 started=$(date +%s)
-timeout -k 2 "$timeout_s" "$save_now" --reason "$reason"
+budget=$(( timeout_s - (started - began) ))
+[ "$budget" -ge 1 ] || budget=1
+timeout -k 2 "$budget" "$save_now" --reason "$reason"
 rc=$?
 took=$(( $(date +%s) - started ))
 case $rc in
   0)
-    mkdir -p "$state_dir" 2>/dev/null && printf '%s %s %s\n' "$boot_id" "$(date +%s)" "$reason" > "$stamp" 2>/dev/null
+    mkdir -p "$state_dir" 2>/dev/null && printf '%s %s %s %s\n' "$boot_id" "$(date +%s)" "$server_id" "$reason" > "$stamp" 2>/dev/null
     log "saved ($reason) in ${took}s"
     ;;
-  124|137) echo "tmux-shutdown-save: ERROR: tmux-save-now ($reason) did not finish within ${timeout_s}s and was stopped, the sessions may NOT be saved" >&2 ;;
+  124|137) echo "tmux-shutdown-save: ERROR: tmux-save-now ($reason) did not finish within ${budget}s and was stopped, the sessions may NOT be saved" >&2 ;;
   *) echo "tmux-shutdown-save: ERROR: tmux-save-now ($reason) failed with exit $rc after ${took}s, the sessions may NOT be saved" >&2 ;;
 esac
 # never block a shutdown on a failed save

@@ -5,13 +5,15 @@
 #   tmux-*          files without an extension (any mode: install -m 755 sets the exec bit) -> $HOME/.local/bin (tmux-boot, tmux-autosave, tmux-lib, ...)
 #   tmux-*.service  systemd user units                     -> $HOME/.config/systemd/user
 #   tmux-*.timer
+#   systemd-dropins/<unit name prefix>.scope.d/<file>.conf -> $HOME/.config/systemd/user/<same path>, followed by a
+#     daemon-reload (which re-reads the drop-ins of scopes that already run): they order the tmux pane scopes and the
+#     omp session scopes after tmux-shutdown-save.service, so the shutdown save runs while the panes are alive
 #
 # A unit with an [Install] section is enabled and, except for tmux-boot.service, also started (`enable --now`: a timer
 # or a service the module ships only does its work while it runs, so an enabled-but-dead unit must show as drift).
 # tmux-boot.service alone is only enabled: the tmux server that may be running now must not be touched, and the unit
 # runs at the next boot. A unit without an [Install] section (the oneshot service a timer fires) is only copied.
 # Linger is switched on, so user units start at boot.
-#
 #   install.sh           install (idempotent: a second run changes nothing)
 #   install.sh --plan    read-only: what install would do
 #   install.sh --check   read-only: exit 0 = in place, 3 = drift, 10 = needs a manual step, anything else = broken checker
@@ -42,6 +44,11 @@ bin_dir=${TMUX_BOOT_BIN_DIR:-$HOME/.local/bin}
 unit_dir=${TMUX_BOOT_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}
 autostart_dir=${TMUX_BOOT_AUTOSTART_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/autostart}
 autostart_file="$autostart_dir/tmux-boot.desktop"
+# the module's own state, outside the three install locations: the daemon-reload retry marker and the selfcheck
+# first-fire guard live here (the scripts find it through the same default)
+state_dir=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+reload_marker=$state_dir/daemon-reload-pending
+watch_marker=$state_dir/watch-restart-pending
 boot_unit=tmux-boot.service
 
 # a unit has an [Install] section when a line of its own says so: systemd accepts it as the very first line and with
@@ -77,6 +84,11 @@ for f in "$here"/tmux-*; do
   esac
 done
 
+# systemd drop-ins that change how units this module does not own are ordered: systemd-dropins/<unit-name prefix>.scope.d/<file>.conf
+# is installed as $unit_dir/<same relative path> (relative names only)
+dropins=()
+for f in "$here"/systemd-dropins/*/*.conf; do [ -f "$f" ] && dropins+=("${f#"$here"/systemd-dropins/}"); done
+
 # every installable unit except the boot unit is bus-only: without the user systemd bus it has no failover at all
 bus_less=()
 for u in "${installable[@]}"; do [ "$u" = "$boot_unit" ] || bus_less+=("$u"); done
@@ -103,6 +115,7 @@ tmux_ok() { command -v tmux >/dev/null 2>&1; }
 is_timer() { [[ $1 == *.timer ]]; }
 script_ok() { same "$here/$1" "$bin_dir/$1" && [ -x "$bin_dir/$1" ]; }
 unit_file_ok() { same "$here/$1" "$unit_dir/$1"; }
+dropin_ok() { same "$here/systemd-dropins/$1" "$unit_dir/$1"; }
 unit_enabled() { [ "$(sc is-enabled "$1" 2>/dev/null)" = enabled ]; }
 # a timer, and every service except the boot unit, must also run now: only tmux-boot.service is enabled without
 # starting (the running tmux server must not be touched; the unit runs at the next boot)
@@ -118,7 +131,11 @@ autostart_ok() { [ -f "$autostart_file" ] && [ "$(desktop_text)" = "$(cat "$auto
 
 check_systemd() { # prints one line per unmet fact
   local u
+  [ ! -e "$reload_marker" ] || echo "a daemon-reload did not finish: run install.sh again so the drop-ins reach the already running scopes"
   for u in "${units[@]}"; do unit_file_ok "$u" || echo "$unit_dir/$u is missing or differs from the module copy"; done
+  [ ! -e "$watch_marker" ] || echo "a watcher restart did not finish: run install.sh again so the running service picks up the new script"
+  local d
+  for d in "${dropins[@]}"; do dropin_ok "$d" || echo "$unit_dir/$d is missing or differs from the module copy (the shutdown save would race the pane scopes' stop)"; done
   for u in "${installable[@]}"; do
     unit_ok "$u" && continue
     if starts_now "$u"; then echo "$u is not enabled and running ($(enable_cmd "$u")), so what it runs never runs"
@@ -130,6 +147,7 @@ check_systemd() { # prints one line per unmet fact
 check_autostart() {
   local u
   autostart_ok || echo "no user systemd bus: $autostart_file is the start path and it is missing or differs"
+  [ "${#dropins[@]}" = 0 ] || echo "no user systemd bus: the systemd drop-ins (${dropins[*]}) cannot be installed, so the shutdown save may find its panes already stopped"
   for u in "${bus_less[@]}"; do
     echo "no user systemd bus: $u cannot be installed, so what it runs never runs (run apply from a session that has the user bus)"
   done
@@ -157,12 +175,24 @@ if [ "$mode" = plan ]; then
   if bus_ok; then
     reload=0
     for u in "${units[@]}"; do unit_file_ok "$u" || { echo "install $here/$u -> $unit_dir/$u"; reload=1; }; done
-    [ "$reload" = 0 ] || echo "systemctl --user daemon-reload"
+    for d in "${dropins[@]}"; do dropin_ok "$d" || { echo "install $here/systemd-dropins/$d -> $unit_dir/$d"; reload=1; }; done
+    # a pending reload (a previous run's daemon-reload failed) shows up here like a copied file would
+    [ "$reload" = 0 ] && [ ! -e "$reload_marker" ] || echo "systemctl --user daemon-reload"
+    # the restart of a RUNNING watcher (it keeps executing the unlinked old file) is the one disruptive step:
+    # the plan shows exactly what install would do — pending marker, or a changed script/unit while active
+    watch_up=0
+    sc is-active --quiet tmux-shutdown-watch.service 2>/dev/null && watch_up=1
+    if [ -e "$watch_marker" ]; then
+      [ "$watch_up" = 1 ] && echo "systemctl --user try-restart tmux-shutdown-watch.service   (a pending restart from an earlier run)"
+    elif [ "$watch_up" = 1 ] && { ! script_ok tmux-shutdown-watch || ! unit_file_ok tmux-shutdown-watch.service; }; then
+      echo "systemctl --user try-restart tmux-shutdown-watch.service   (a running watcher would keep the old file)"
+    fi
     for u in "${installable[@]}"; do unit_ok "$u" || enable_cmd "$u"; done
     linger_ok || echo "loginctl enable-linger $(id -un)   (so the units start at boot, before any login)"
     [ ! -e "$autostart_file" ] || echo "remove the stale $autostart_file"
   else
     autostart_ok || echo "no user systemd bus: write the XDG autostart entry $autostart_file (the server starts at graphical login)"
+    [ "${#dropins[@]}" = 0 ] || echo "no user systemd bus: the systemd drop-ins (${dropins[*]}) cannot be installed here; --check reports them as drift"
     for u in "${bus_less[@]}"; do
       echo "no user systemd bus: $u cannot be installed here; it follows once apply runs where the user bus exists"
     done
@@ -176,12 +206,25 @@ if [ "${#unknown[@]}" -gt 0 ]; then
 fi
 tmux_ok || manual "tmux is not installed; run \`ubuntu-tweak apply --commit\` (packages.toml installs it) or \`sudo apt-get install -y tmux\`"
 mkdir -p "$bin_dir" || exit 1
-for s in "${scripts[@]}"; do script_ok "$s" || install -m 755 "$here/$s" "$bin_dir/$s" || exit 1; done
+# a replaced tmux-shutdown-watch script or unit must restart the RUNNING service (it keeps executing the unlinked
+# old file), and the restart must survive a run that fails part-way: the marker is cleared only by the restart
+# itself (or by finding nothing running), like the daemon-reload marker below
+watch_changed=0
+watch_mark() {
+  watch_changed=1
+  mkdir -p "$state_dir" 2>/dev/null && : > "$watch_marker" 2>/dev/null
+}
+for s in "${scripts[@]}"; do
+  script_ok "$s" && continue
+  install -m 755 "$here/$s" "$bin_dir/$s" || exit 1
+  [ "$s" = tmux-shutdown-watch ] && watch_mark
+done
 
 if ! bus_ok; then
   echo "tmux-boot: no user systemd bus, installing the XDG autostart entry instead (the server starts at graphical login)"
   mkdir -p "$autostart_dir" || exit 1
   autostart_ok || desktop_text > "$autostart_file" || exit 1
+  [ "${#dropins[@]}" = 0 ] || echo "tmux-boot: WARNING the systemd drop-ins (${dropins[*]}) were NOT installed (no user systemd bus): the shutdown save may find its panes already stopped; --check reports them as drift" >&2
   for u in "${bus_less[@]}"; do
     echo "tmux-boot: WARNING $u was NOT installed (no user systemd bus): what it runs never runs until apply runs where the user bus exists; --check reports it as drift" >&2
   done
@@ -189,9 +232,42 @@ if ! bus_ok; then
 fi
 
 mkdir -p "$unit_dir" || exit 1
+# a running watcher keeps executing the file `install` unlinked, so a replaced script or unit file never reaches it
+# until a reboot: remember whether it was already active, to restart it after the copies
+watch_unit=tmux-shutdown-watch.service
+watch_active=0
+sc is-active --quiet "$watch_unit" 2>/dev/null && watch_active=1
+# the timer's first-fire guard is armed BEFORE the enable loop: on a machine up past OnBootSec, `enable --now`
+# fires the service at once and it reaches its guard check within milliseconds, long before this script could
+# write the file afterwards. The guard carries the boot id, so it skips only a fire of THIS boot (whatever the
+# uptime: a first install always follows a boot this module did not cover); the next boot's check runs normally.
+selfcheck_timer=tmux-boot-selfcheck.timer
+selfcheck_was_active=0
+sc is-active --quiet "$selfcheck_timer" 2>/dev/null && selfcheck_was_active=1
+if [ "$selfcheck_was_active" = 0 ]; then
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+  mkdir -p "$state_dir" 2>/dev/null && printf '%s\n' "$boot_id" > "$state_dir/selfcheck-first-fire" 2>/dev/null
+fi
 reload=0
-for u in "${units[@]}"; do unit_file_ok "$u" || { install -m 644 "$here/$u" "$unit_dir/$u" || exit 1; reload=1; }; done
-[ "$reload" = 0 ] || sc daemon-reload || exit 1
+[ ! -e "$reload_marker" ] || reload=1 # a previous run wrote files but its daemon-reload never finished
+for u in "${units[@]}"; do
+  unit_file_ok "$u" && continue
+  install -m 644 "$here/$u" "$unit_dir/$u" || exit 1
+  reload=1
+  [ "$u" = "$watch_unit" ] && watch_mark
+done
+for d in "${dropins[@]}"; do
+  dropin_ok "$d" && continue
+  mkdir -p "$unit_dir/${d%/*}" && install -m 644 "$here/systemd-dropins/$d" "$unit_dir/$d" || exit 1
+  reload=1
+done
+# a reload also re-reads the drop-ins of scopes that already run, so they apply to the live panes without a restart.
+# The marker is written first and removed only after a successful reload, so a failed one (a transient bus error)
+# is retried by the next run instead of leaving the new files in place but unapplied forever.
+if [ "$reload" != 0 ]; then
+  mkdir -p "$state_dir" 2>/dev/null && : > "$reload_marker" 2>/dev/null
+  sc daemon-reload && rm -f "$reload_marker" || exit 1
+fi
 # the boot unit first, then the rest in glob order: a failing enable of an auxiliary unit must not leave the machine
 # without the boot path (alphabetical order would enable tmux-autosave.timer before tmux-boot.service)
 for u in "${installable[@]}"; do
@@ -202,6 +278,15 @@ for u in "${installable[@]}"; do
   [ "$u" != "$boot_unit" ] || continue
   unit_ok "$u" || sc enable --now "$u" || exit 1
 done
+# a replaced watcher must reach the RUNNING service: try-restart restarts it only if it is active, and taking the
+# delay lock again is all it loses; the marker (also one left by an interrupted earlier run) is cleared on success
+if [ -e "$watch_marker" ] || [ "$watch_changed" = 1 ]; then
+  if [ "$watch_active" = 1 ]; then
+    sc try-restart "$watch_unit" && rm -f "$watch_marker" || exit 1
+  else
+    rm -f "$watch_marker" # nothing is running the old file
+  fi
+fi
 rm -f "$autostart_file"
 # enabling does not start tmux-boot.service: the tmux server that may be running now must not be touched, and the
 # script would do nothing anyway. The unit runs at the next boot.

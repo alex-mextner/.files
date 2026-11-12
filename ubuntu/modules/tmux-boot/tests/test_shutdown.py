@@ -35,13 +35,14 @@ echo "save-end rc=0" >> "$STUB/events.log"
 """
 
 # systemd-inhibit stand-in: records the lock, then runs the command after its options like the real one does (exec
-# keeps the "lock" in the sleeper process); on TERM it records the release first
+# keeps the "lock" in the sleeper process); on TERM it ends the sleeper, then records the release
 INHIBIT = """#!/bin/sh
 echo "lock-take $*" >> "$STUB/events.log"
-trap 'echo lock-release >> "$STUB/events.log"; exit 0' TERM
 while [ "$1" != sleep ]; do shift; done
 "$@" &
-wait $!
+child=$!
+trap 'kill $child 2>/dev/null; wait $child 2>/dev/null; echo lock-release >> "$STUB/events.log"; exit 0' TERM
+wait $child
 """
 
 # the real tmux, pinned to the throwaway socket
@@ -176,7 +177,8 @@ class ShutdownSaveStep(unittest.TestCase):
         self.assertEqual(e.log(), ["save-start --reason shutdown", "alive=1", "save-end rc=0"])
         with open(os.path.join(e.state, "shutdown-save")) as f:
             stamp = f.read().split()
-        self.assertEqual((stamp[0], stamp[2]), ("boot-A", "shutdown"))
+        self.assertEqual((stamp[0], stamp[3]), ("boot-A", "shutdown"))
+        self.assertRegex(stamp[2], r"^\d+-\d+$")  # the server id sits between the time and the reason
 
     def test_save_after_the_server_is_gone_is_never_run(self):
         # the regression this module exists to prevent: a save after teardown would see no panes. The step must refuse
@@ -202,13 +204,61 @@ class ShutdownSaveStep(unittest.TestCase):
     def test_stamp_of_another_boot_or_an_old_stamp_does_not_skip(self):
         e = Env(self)
         e.start_server()
+        sid = e.tmux("display-message", "-p", "#{pid}-#{start_time}").stdout.strip()
+        self.assertTrue(sid)
         with open(os.path.join(e.state, "shutdown-save"), "w") as f:
-            f.write("boot-OLD %d shutdown\n" % int(time.time()))
+            f.write("boot-OLD %d %s shutdown\n" % (int(time.time()), sid))
         self.assertIn("saved", e.script("tmux-shutdown-save").stdout)
         with open(os.path.join(e.state, "shutdown-save"), "w") as f:
-            f.write("boot-A %d shutdown\n" % (int(time.time()) - 4000))
+            f.write("boot-A %d %s shutdown\n" % (int(time.time()) - 4000, sid))
         self.assertIn("saved", e.script("tmux-shutdown-save").stdout)
         self.assertEqual(len([l for l in e.log() if l.startswith("save-start")]), 2)
+
+    def test_stamp_of_another_tmux_server_does_not_skip(self):
+        # a user manager restart in the same boot starts a new tmux server: a fresh stamp of the OLD one must not
+        # suppress the save of the new one
+        e = Env(self)
+        e.start_server()
+        with open(os.path.join(e.state, "shutdown-save"), "w") as f:
+            f.write("boot-A %d 1-1 shutdown\n" % int(time.time()))
+        r = e.script("tmux-shutdown-save", "--reason", "user-manager-stop")
+        self.assertIn("saved (user-manager-stop)", r.stdout)
+        self.assertEqual(len([l for l in e.log() if l.startswith("save-start")]), 1)
+
+    def test_hung_tmux_server_is_bounded_by_the_timeout_too(self):
+        # the reachability probe runs before the save: an unresponsive server must not outlive --timeout
+        e = Env(self)
+        hung = os.path.join(e.dir, "hung-tmux")
+        write_exe(hung, "#!/bin/sh\nexec sleep 30\n")
+        t0 = time.time()
+        r = e.script("tmux-shutdown-save", "--timeout", "1", TMUX_AUTOSAVE_TMUX=hung)
+        self.assertEqual(r.returncode, 0)
+        self.assertLess(time.time() - t0, 5, "an unresponsive tmux server blocked the shutdown step")
+        self.assertEqual(e.log(), [])
+        self.assertIn("did not answer within 1s", r.stderr)
+        self.assertIn("slow or hung", r.stderr)
+
+    def test_the_probe_time_is_taken_off_the_save_budget(self):
+        # a slow (not hung) server: the probe succeeds after 2 s, and only timeout - probe remains for the save
+        e = Env(self)
+        e.start_server()
+        slow = os.path.join(e.dir, "slow-tmux")
+        write_exe(slow, '#!/bin/sh\nsleep 2\nexec "%s" -L "$TMUX_TEST_SOCKET" "$@"\n' % REAL_TMUX)
+        t0 = time.time()
+        r = e.script("tmux-shutdown-save", "--timeout", "3", FAKE_SAVE="hang", TMUX_AUTOSAVE_TMUX=slow, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.time() - t0, 6, "the step must end within the probe plus the reduced budget")
+        self.assertIn("did not finish within 1s", r.stderr)  # 3 s budget minus the probe's 2 s
+
+    def test_a_slow_server_probe_gets_a_share_of_the_budget(self):
+        # --timeout 30 gives the probe 10 s (a third), not the old fixed 5 s: a server that answers at 7 s is saved
+        e = Env(self)
+        e.start_server()
+        slow = os.path.join(e.dir, "slow-tmux")
+        write_exe(slow, '#!/bin/sh\nsleep 7\nexec "%s" -L "$TMUX_TEST_SOCKET" "$@"\n' % REAL_TMUX)
+        r = e.script("tmux-shutdown-save", "--timeout", "30", TMUX_AUTOSAVE_TMUX=slow, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("saved (shutdown)", r.stdout)
 
     def test_failed_save_never_blocks_and_leaves_no_stamp(self):
         e = Env(self)
@@ -237,9 +287,17 @@ class ShutdownSaveStep(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("is not installed, the sessions were NOT saved", r.stderr)
 
+    def test_leading_zero_timeout_is_decimal_not_octal(self):
+        e = Env(self)
+        e.start_server()
+        r = e.script("tmux-shutdown-save", "--timeout", "08", TMUX_SHUTDOWN_STAMP_TTL="09")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("saved (shutdown)", r.stdout)
+
     def test_bad_arguments_are_a_usage_error(self):
         e = Env(self)
         self.assertEqual(e.script("tmux-shutdown-save", "--timeout", "0").returncode, 2)
+        self.assertEqual(e.script("tmux-shutdown-save", "--timeout", "00").returncode, 2)
         self.assertEqual(e.script("tmux-shutdown-save", "--bogus").returncode, 2)
         self.assertEqual(e.script("tmux-shutdown-save", "--reason").returncode, 2)
 
@@ -353,6 +411,30 @@ class ShutdownWatcher(unittest.TestCase):
         self.assertEqual(self.stop(w), 0)
         self.assertIn("lock-release", e.log())
 
+    def test_sigterm_during_a_slow_save_waits_for_the_save_to_finish(self):
+        # KillMode=mixed TERMs only the watcher: bash must hold the trap until the foreground save step returns, so
+        # the save always completes before the lock goes (a & wait refactor here would break this test)
+        e = Env(self)
+        w = e.spawn("tmux-shutdown-watch", TMUX_SHUTDOWN_EVENT_CMD=self.source(TRUE_EVENT), FAKE_STEP="slow")
+        self.assertTrue(e.wait_log("step "), e.log())
+        w.send_signal(signal.SIGTERM)
+        self.assertEqual(self.stop(w), 0)
+        lines = e.log()
+        self.assertLess(lines.index("step-end"), lines.index("lock-release"),
+                        "the lock was released while the save was still running")
+
+    def test_an_infinite_logind_delay_is_clamped_and_the_budget_stays_bounded(self):
+        # InhibitDelayMaxSec=infinity prints as 18446744073709551615 usec: naive bash arithmetic overflows to a
+        # negative budget; the clamp turns it into 1 h and the budget cap keeps the save inside 60 s (a hung save
+        # must never hold the shutdown for the better part of an hour)
+        e = Env(self)
+        write_exe(os.path.join(e.bin, "busctl"),
+                  '#!/bin/sh\necho "t 18446744073709551615"\n')
+        w = e.spawn("tmux-shutdown-watch", TMUX_SHUTDOWN_EVENT_CMD=self.source(TRUE_EVENT), TMUX_SHUTDOWN_DELAY_MAX="")
+        self.assertTrue(e.wait_log("lock-release"), e.log())
+        self.assertIn("step --reason shutdown --timeout 60", e.log())
+        self.stop(w)
+
     def test_event_source_ending_is_a_failure_so_systemd_restarts_the_unit(self):
         e = Env(self)
         w = e.spawn("tmux-shutdown-watch", TMUX_SHUTDOWN_EVENT_CMD="exit 0")
@@ -364,6 +446,20 @@ class ShutdownWatcher(unittest.TestCase):
         e = Env(self)
         r = e.script("tmux-shutdown-watch", TMUX_SHUTDOWN_SAVE_TIMEOUT="soon")
         self.assertEqual(r.returncode, 2)
+        self.assertEqual(e.script("tmux-shutdown-watch", TMUX_SHUTDOWN_SAVE_TIMEOUT="00").returncode, 2)
+
+    def test_leading_zero_numbers_are_decimal_not_octal(self):
+        # "08" and "09" are invalid octal: they must reach the save as 8 and 9 seconds, not skip the save silently
+        e = Env(self)
+        w = e.spawn("tmux-shutdown-watch", TMUX_SHUTDOWN_EVENT_CMD=self.source(TRUE_EVENT), TMUX_SHUTDOWN_SAVE_TIMEOUT="08")
+        self.assertTrue(e.wait_log("lock-release"), e.log())
+        self.assertIn("step --reason shutdown --timeout 8", e.log())
+        self.stop(w)
+        e = Env(self)
+        w = e.spawn("tmux-shutdown-watch", TMUX_SHUTDOWN_EVENT_CMD=self.source(TRUE_EVENT), TMUX_SHUTDOWN_DELAY_MAX="09")
+        self.assertTrue(e.wait_log("lock-release"), e.log())
+        self.assertIn("step --reason shutdown --timeout 8", e.log())
+        self.stop(w)
 
 
 class BootSelfcheck(unittest.TestCase):
@@ -457,6 +553,37 @@ class BootSelfcheck(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("omp map was rewritten in this boot", r.stdout)
 
+    def test_every_fire_of_the_install_boot_is_skipped_until_the_next_boot(self):
+        # the installer arms the guard (with the boot id) right before it first starts the timer: a fire that
+        # follows a first install must not judge a previous boot this module never covered
+        marker = os.path.join(self.e.state, "selfcheck-first-fire")
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot_id = f.read().strip()
+        with open(marker, "w") as f:
+            f.write(boot_id + "\n")
+        self.snapshot("20260101T000000", self.prev_end - 5 * 3600)  # would fail loudly if judged
+        r = self.run_check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("first fire", r.stdout)
+        self.assertTrue(os.path.exists(marker), "the guard stays armed for the whole install boot")
+        self.assertEqual(self.alerts(), [])
+        self.assertEqual(self.run_check().returncode, 0)  # a later fire in the SAME boot skips too
+        with open(marker, "w") as f:  # the next boot: guard stale, the check judges again
+            f.write("00000000-0000-0000-0000-000000000000\n")
+        self.assertEqual(self.run_check().returncode, 1)
+        self.assertEqual(len(self.alerts()), 1)
+
+    def test_a_guard_left_over_from_another_boot_is_dropped_and_the_check_runs(self):
+        # its boot ended without the fire ever being skipped: the next boot's check must run normally
+        marker = os.path.join(self.e.state, "selfcheck-first-fire")
+        with open(marker, "w") as f:
+            f.write("00000000-0000-0000-0000-000000000000\n")
+        self.snapshot("20260101T000000", self.prev_end - 5 * 3600)
+        r = self.run_check()
+        self.assertEqual(r.returncode, 1, r.stderr)  # judged, not skipped
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(len(self.alerts()), 1)
+
     def test_no_previous_boot_is_not_an_error(self):
         open(os.path.join(self.e.stub, "no-prev-boot"), "w").close()
         self.snapshot("20260101T000000", self.prev_end - 5 * 3600)
@@ -480,6 +607,11 @@ class BootSelfcheck(unittest.TestCase):
 
     def test_bad_threshold_is_a_usage_error(self):
         self.assertEqual(self.run_check(TMUX_BOOT_SELFCHECK_MAX_MIN="soon").returncode, 2)
+
+    def test_leading_zero_threshold_is_decimal(self):
+        self.snapshot("20260101T000000", self.prev_end - 95)
+        r = self.run_check(TMUX_BOOT_SELFCHECK_MAX_MIN="08")
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class Units(unittest.TestCase):
@@ -512,6 +644,8 @@ class Units(unittest.TestCase):
     def test_watcher_is_a_restarting_default_target_service(self):
         u = self.unit("tmux-shutdown-watch.service")
         self.assertEqual(u["Service"]["Restart"], ["always"])
+        # a stop during a shutdown save must not TERM the save step itself: only the watcher gets the signal
+        self.assertEqual(u["Service"]["KillMode"], ["mixed"])
         self.assertEqual(u["Install"]["WantedBy"], ["default.target"])
 
     def test_selfcheck_timer_fires_once_ten_minutes_after_boot(self):

@@ -36,6 +36,7 @@ TMUX = shutil.which("tmux", path="/usr/bin:/bin") or shutil.which("tmux")
 P = "zzsd%d" % os.getpid()
 DOWN = P + "-down.target"
 SAVE = P + "-save.service"
+WHO = P + "-lock"  # the watcher's lock identity: an installed tmux-shutdown-watch must never be mistaken for ours
 failures = []
 
 
@@ -264,6 +265,7 @@ def watcher():
         env.update({
             "TMUX_SHUTDOWN_EVENT_CMD": "exec tail -n 0 -F %s" % events,
             "TMUX_SHUTDOWN_SAVE": os.path.join(MODULE, "tmux-shutdown-save"),
+            "TMUX_SHUTDOWN_WHO": WHO,
         })
         args = ["systemd-run", "--user", "--unit=" + unit, "--collect", "--quiet"]
         for k, v in env.items():
@@ -272,10 +274,10 @@ def watcher():
         check(r.returncode == 0, "[watch] watcher started as a transient unit (%s)" % (r.stderr.strip() or "ok"))
 
         def lock_listed():
-            return "tmux-shutdown-watch" in sh("systemd-inhibit", "--list", "--no-pager").stdout
+            return WHO in sh("systemd-inhibit", "--list", "--no-pager").stdout
 
         check(wait_for(lock_listed), "[watch] a logind delay lock is held while the watcher runs")
-        listing = [l for l in sh("systemd-inhibit", "--list", "--no-pager").stdout.splitlines() if "tmux-shutdown-watch" in l]
+        listing = [l for l in sh("systemd-inhibit", "--list", "--no-pager").stdout.splitlines() if WHO in l]
         print("  inhibit : " + " ".join(listing[0].split()) if listing else "  inhibit : (none)")
         check(bool(listing) and "shutdown" in listing[0] and "delay" in listing[0], "[watch] the lock is a shutdown/delay lock")
         time.sleep(1)

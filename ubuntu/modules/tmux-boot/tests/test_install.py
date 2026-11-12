@@ -6,6 +6,7 @@ into a temp dir with TMUX_BOOT_*_DIR, and every stub keeps its state in files un
 
 import os
 import re
+import glob
 import shutil
 import stat
 import subprocess
@@ -21,8 +22,8 @@ echo "systemctl $*" >> "$STUB/calls.log"
 shift
 [ -e "$STUB/no-bus" ] && exit 1
 case "$1" in
-  show-environment) exit 0 ;;
-  daemon-reload) exit 0 ;;
+  daemon-reload) [ -e "$STUB/fail-reload" ] && exit 1 ;;
+  try-restart) : > "$STUB/active-$2" 2>/dev/null ;;
   is-enabled)
     if [ -e "$STUB/enabled-$2" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;
   is-active) for last; do :; done; [ -e "$STUB/active-$last" ]; exit $? ;;
@@ -113,6 +114,9 @@ class Base(unittest.TestCase):
             "TMUX_BOOT_BIN_DIR": self.bin_dir,
             "TMUX_BOOT_UNIT_DIR": self.unit_dir,
             "TMUX_BOOT_AUTOSTART_DIR": self.autostart_dir,
+            # the installer writes state (retry/guard markers): keep it inside the throwaway HOME even when the
+            # runner exports XDG_STATE_HOME or TMUX_BOOT_STATE_DIR
+            "TMUX_BOOT_STATE_DIR": os.path.join(self.home, ".local", "state", "tmux-boot"),
             "FAKE_RESURRECT_DIR": self.resurrect,
             "FAKE_RESTORE_SCRIPT": self.restore,
             **extra,
@@ -212,8 +216,8 @@ class Installer(Base):
         self.install_ok()
         before = len(self.calls())
         self.assertEqual(self.run_script("install.sh").returncode, 0)
-        changed = [c for c in self.calls()[before:] if " enable " in c or "daemon-reload" in c or "enable-linger" in c]
-        self.assertEqual(changed, [])
+        changed = [c for c in self.calls()[before:] if " enable " in c or "daemon-reload" in c or "enable-linger" in c or "try-restart" in c]
+        self.assertEqual(changed, [], "a second install must not enable, reload, linger or restart anything")
 
     def test_a_modified_script_is_drift_and_install_repairs_it(self):
         self.install_ok()
@@ -453,12 +457,12 @@ class Installer(Base):
         self.assertTrue(os.path.exists(os.path.join(self.stub, "enabled-tmux-boot.service")))
 
     def test_module_toml_claims_exactly_the_assets_the_module_ships(self):
-        # coverage names every script and unit explicitly (a glob would also claim leftovers and unrelated tmux-*
-        # files as tracked), so the list must grow with the module: this is the test that fails when it does not
+        # every coverage block names its assets explicitly (a glob would also claim leftovers and unrelated tmux-*
+        # files as tracked), so the lists must grow with the module: this is the test that fails when they do not
         with open(os.path.join(MODULE, "module.toml")) as fh:
-            first_coverage = fh.read().split("[[coverage]]")[1]
-        claimed = set(re.findall(r'"((?:unit|file):[^"]+)"', first_coverage))
-        expected = set()
+            text = fh.read()
+        claimed = set(re.findall(r'"((?:unit|file):[^"]+)"', text))
+        expected = {"file:~/.config/autostart/tmux-boot.desktop"}  # the failover entry (not found by the globs)
         for name in os.listdir(MODULE):
             if not name.startswith("tmux-"):
                 continue
@@ -466,6 +470,10 @@ class Installer(Base):
                 expected.add(f"unit:{name}")
             elif "." not in name:
                 expected.add(f"file:~/.local/bin/{name}")
+        # one level only, exactly like the installer's own glob (install.sh: systemd-dropins/*/*.conf)
+        for path in glob.glob(os.path.join(MODULE, "systemd-dropins", "*", "*.conf")):
+            rel = os.path.relpath(path, MODULE).replace("systemd-dropins/", "", 1)
+            expected.add("file:~/.config/systemd/user/" + rel)
         self.assertEqual(claimed, expected)
 
     def test_a_script_whose_library_is_missing_fails_loudly(self):
@@ -477,6 +485,180 @@ class Installer(Base):
             res = subprocess.run(["bash", os.path.join(lonely, script)], env=self.env(), capture_output=True, text=True, check=False)
             self.assertEqual(res.returncode, 1, script)
             self.assertIn("cannot load", res.stderr)
+
+
+class ShutdownWiring(Base):
+    """The shutdown save assets (watcher, save unit, selfcheck, scope drop-ins) come out of the installer."""
+
+    SHUTDOWN_UNITS = ("tmux-shutdown-save.service", "tmux-shutdown-watch.service")
+    DROPINS = ("tmux-spawn-.scope.d/10-tmux-shutdown-save.conf", "omp-.scope.d/10-tmux-shutdown-save.conf")
+
+    def install_ok(self):
+        self.touch("linger")
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_scripts_units_and_dropins_are_deployed(self):
+        self.install_ok()
+        for s in ("tmux-shutdown-save", "tmux-shutdown-watch", "tmux-boot-selfcheck"):
+            self.assertTrue(os.access(os.path.join(self.bin_dir, s), os.X_OK), s)
+        for u in self.SHUTDOWN_UNITS + ("tmux-boot-selfcheck.service", "tmux-boot-selfcheck.timer"):
+            self.assertTrue(os.path.exists(os.path.join(self.unit_dir, u)), u)
+        for d in self.DROPINS:
+            with open(os.path.join(MODULE, "systemd-dropins", d)) as want, open(os.path.join(self.unit_dir, d)) as got:
+                self.assertEqual(got.read(), want.read(), d)
+        self.assertIn("systemctl --user daemon-reload", self.calls())
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_the_shutdown_services_are_started_the_boot_service_is_not(self):
+        self.install_ok()
+        calls = self.calls()
+        for u in self.SHUTDOWN_UNITS:
+            self.assertIn("systemctl --user enable --now " + u, calls)
+        self.assertIn("systemctl --user enable --now tmux-boot-selfcheck.timer", calls)
+        self.assertIn("systemctl --user enable tmux-boot.service", calls)
+        self.assertNotIn("systemctl --user enable --now tmux-boot.service", calls)
+        # nothing is stopped or restarted, and installing never talks to tmux (a running server stays untouched)
+        self.assertEqual([c for c in calls if " stop " in c or " restart " in c or " kill " in c], [])
+        self.assertEqual([c for c in calls if c.startswith("tmux ")], [])
+
+    def test_a_disabled_shutdown_service_is_drift_and_an_enabled_active_one_is_ok(self):
+        self.install_ok()
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+        for u in self.SHUTDOWN_UNITS:
+            os.remove(os.path.join(self.stub, "enabled-" + u))
+            os.remove(os.path.join(self.stub, "active-" + u))
+            res = self.run_script("install.sh", "--check")
+            self.assertEqual(res.returncode, 3, u)
+            self.assertIn("%s is not enabled and running (systemctl --user enable --now %s)" % (u, u), res.stdout)
+            self.assertIn("enable --now " + u, self.run_script("install.sh", "--plan").stdout)
+            self.assertEqual(self.run_script("install.sh").returncode, 0)
+            self.assertEqual(self.run_script("install.sh", "--check").returncode, 0, u)
+
+    def test_an_enabled_but_stopped_shutdown_service_is_drift(self):
+        # enabled without running protects nothing until the next boot
+        self.install_ok()
+        os.remove(os.path.join(self.stub, "active-tmux-shutdown-watch.service"))
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("tmux-shutdown-watch.service is not enabled and running", res.stdout)
+
+    def test_a_missing_or_modified_dropin_is_drift_and_install_repairs_it(self):
+        self.install_ok()
+        for d in self.DROPINS:
+            path = os.path.join(self.unit_dir, d)
+            os.remove(path)
+            res = self.run_script("install.sh", "--check")
+            self.assertEqual(res.returncode, 3, d)
+            self.assertIn(d + " is missing or differs", res.stdout)
+            before = len(self.calls())
+            self.assertEqual(self.run_script("install.sh").returncode, 0)
+            self.assertIn("systemctl --user daemon-reload", self.calls()[before:])
+            with open(path, "a") as fh:
+                fh.write("# local edit\n")
+            self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+            self.assertEqual(self.run_script("install.sh").returncode, 0)
+            self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_a_second_install_changes_nothing(self):
+        self.install_ok()
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertEqual([c for c in self.calls()[before:] if " enable " in c or "daemon-reload" in c or "try-restart" in c], [])
+
+    def test_plan_names_the_dropins_and_writes_nothing(self):
+        res = self.run_script("install.sh", "--plan")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for d in self.DROPINS:
+            self.assertIn(os.path.join(self.unit_dir, d), res.stdout)
+        self.assertEqual(os.listdir(self.home), [])
+
+
+    def test_without_a_user_bus_plan_and_install_mention_the_dropins_like_check_does(self):
+        self.touch("no-bus")
+        self.touch("linger")
+        self.assertIn("the systemd drop-ins", self.run_script("install.sh", "--check").stdout)
+        self.assertIn("the systemd drop-ins", self.run_script("install.sh", "--plan").stdout)
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("the systemd drop-ins", res.stderr)
+
+    def test_a_failed_daemon_reload_is_retried_by_the_next_run_and_reported_as_drift(self):
+        # run 1 writes the drop-ins but the reload fails on a transient bus error; without a marker the next run
+        # would find the files identical and the running scopes would never get the ordering
+        self.install_ok()
+        os.remove(os.path.join(self.unit_dir, self.DROPINS[0]))
+        self.touch("fail-reload")
+        self.assertEqual(self.run_script("install.sh").returncode, 1)
+        marker = os.path.join(self.home, ".local", "state", "tmux-boot", "daemon-reload-pending")
+        self.assertTrue(os.path.exists(marker), "a failed reload must leave the retry marker")
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("daemon-reload did not finish", res.stdout)
+        self.assertIn("systemctl --user daemon-reload", self.run_script("install.sh", "--plan").stdout)
+        os.remove(os.path.join(self.stub, "fail-reload"))
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("systemctl --user daemon-reload", self.calls()[before:])
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_an_update_of_the_watcher_script_restarts_the_running_service(self):
+        # `install` unlinks the old script, so a running watcher would keep the old code until a reboot
+        self.install_ok()
+        with open(os.path.join(self.bin_dir, "tmux-shutdown-watch"), "a") as fh:
+            fh.write("# local edit\n")
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("systemctl --user try-restart tmux-shutdown-watch.service", self.calls()[before:])
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_a_watcher_update_interrupted_by_a_failed_reload_is_restarted_by_the_next_run(self):
+        # the restart must survive a run that fails part-way, like the daemon-reload retry does
+        self.install_ok()
+        with open(os.path.join(self.bin_dir, "tmux-shutdown-watch"), "a") as fh:
+            fh.write("# local edit\n")
+        os.remove(os.path.join(self.unit_dir, self.DROPINS[0]))  # a drop-in change forces the reload that fails
+        self.touch("fail-reload")
+        self.assertEqual(self.run_script("install.sh").returncode, 1)
+        marker = os.path.join(self.home, ".local", "state", "tmux-boot", "watch-restart-pending")
+        self.assertTrue(os.path.exists(marker), "an interrupted watcher update must leave the restart marker")
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("try-restart tmux-shutdown-watch.service", self.run_script("install.sh", "--plan").stdout)
+        os.remove(os.path.join(self.stub, "fail-reload"))
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("systemctl --user try-restart tmux-shutdown-watch.service", self.calls()[before:])
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_an_unchanged_watcher_is_never_restarted(self):
+        self.install_ok()
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertNotIn("try-restart", " ".join(self.calls()[before:]))
+
+    def test_a_selfcheck_timer_first_started_by_install_is_guarded_for_its_first_fire(self):
+        # OnBootSec=10min: `enable --now` can fire the timer at once (a machine up past that), and that fire would
+        # judge a previous boot this module never covered. The guard is armed BEFORE the enable, whatever the
+        # uptime, and carries the boot id.
+        self.install_ok()
+        marker = os.path.join(self.home, ".local", "state", "tmux-boot", "selfcheck-first-fire")
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            boot_id = fh.read().strip()
+        with open(marker) as fh:
+            self.assertEqual(fh.read().strip(), boot_id, "the guard names the boot it was armed in")
+        os.remove(marker)
+        self.assertEqual(self.run_script("install.sh").returncode, 0)  # the timer is already active: no re-arm
+        self.assertFalse(os.path.exists(marker))
+
+    def test_without_a_user_bus_the_dropins_are_reported_as_not_installable(self):
+        self.touch("no-bus")
+        self.touch("linger")
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("the systemd drop-ins", res.stdout)
 
 
 class Runtime(Base):

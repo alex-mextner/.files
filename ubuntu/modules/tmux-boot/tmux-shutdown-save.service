@@ -6,6 +6,8 @@
 # stop; the tmux-spawn-*.scope panes and omp-*.scope sessions are ordered before this unit by the drop-ins
 # tmux-spawn-.scope.d and omp-.scope.d (Before=tmux-shutdown-save.service), since a unit cannot name scopes that
 # do not exist yet.
+# The installer starts this unit as well as enabling it (as it does for every enabled unit except tmux-boot.service,
+# which waits for the next boot): its ExecStop only exists once it runs.
 [Unit]
 Description=Save the tmux sessions (snapshot + omp/claude/codex resume ids) before the tmux server and the pane scopes stop
 After=tmux-boot.service omp.slice

@@ -32,10 +32,14 @@ preview = "install.sh --plan"
 [[coverage]]
 match = [
   "unit:tmux-autosave.service", "unit:tmux-autosave.timer", "unit:tmux-boot.service",
+  "unit:tmux-boot-selfcheck.service", "unit:tmux-boot-selfcheck.timer",
+  "unit:tmux-shutdown-save.service", "unit:tmux-shutdown-watch.service",
   "unit:tmux-watchdog.service", "unit:tmux-watchdog.timer",
   "file:~/.local/bin/tmux-alert", "file:~/.local/bin/tmux-autosave", "file:~/.local/bin/tmux-boot",
+  "file:~/.local/bin/tmux-boot-selfcheck",
   "file:~/.local/bin/tmux-lib", "file:~/.local/bin/tmux-recover", "file:~/.local/bin/tmux-resurrect-save",
   "file:~/.local/bin/tmux-save-debounce", "file:~/.local/bin/tmux-save-now", "file:~/.local/bin/tmux-watchdog",
+  "file:~/.local/bin/tmux-shutdown-save", "file:~/.local/bin/tmux-shutdown-watch",
 ]
 class = "tracked"
 reason = "written by the tmux-boot module: install.sh installs exactly these named scripts and units (tests/test_install.py keeps this list equal to what the module ships), so a leftover copy of an asset the module dropped, or an unrelated tmux-* file, shows up as untracked instead of being claimed by a glob"
@@ -44,3 +48,11 @@ reason = "written by the tmux-boot module: install.sh installs exactly these nam
 match = ["file:~/.config/autostart/tmux-boot.desktop"]
 class = "tracked"
 reason = "the tmux-boot module's failover entry when there is no user systemd bus"
+
+[[coverage]]
+match = [
+  "file:~/.config/systemd/user/tmux-spawn-.scope.d/10-tmux-shutdown-save.conf",
+  "file:~/.config/systemd/user/omp-.scope.d/10-tmux-shutdown-save.conf",
+]
+class = "tracked"
+reason = "the tmux-boot module's drop-ins that order every tmux pane scope and omp session scope after tmux-shutdown-save.service, so the shutdown save runs while the panes are alive: named exactly like the other assets (tests/test_install.py keeps this list equal to systemd-dropins/*/*.conf), so a renamed leftover drop-in or a foreign one shows up as untracked instead of being claimed by a glob"

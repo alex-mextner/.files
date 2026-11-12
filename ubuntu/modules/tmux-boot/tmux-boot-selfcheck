@@ -21,11 +21,13 @@
 #   TMUX_BOOT_SELFCHECK_OMP_MAP       omp map (default ~/.config/rig/tmux/omp-sessions.map)
 #   TMUX_BOOT_SELFCHECK_BOOT_START    epoch seconds this boot began (default now - uptime), tests set it
 set -u
+dir=$(dirname "$(readlink -f "$0")")
+# shellcheck source=tmux-lib
+. "$dir/tmux-lib" || { echo "tmux-boot-selfcheck: cannot load $dir/tmux-lib" >&2; exit 1; }
 
 max_min=${TMUX_BOOT_SELFCHECK_MAX_MIN:-20}
-case $max_min in
-  ''|*[!0-9]*) echo "tmux-boot-selfcheck: TMUX_BOOT_SELFCHECK_MAX_MIN must be a whole number of minutes, got '$max_min'" >&2; exit 2 ;;
-esac
+v=$(tl_number "$max_min") || { echo "tmux-boot-selfcheck: TMUX_BOOT_SELFCHECK_MAX_MIN must be a whole number of minutes, got '$max_min'" >&2; exit 2; }
+max_min=$v
 export PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin"
 unset TMUX
 
@@ -35,6 +37,21 @@ tmux_bin=${TMUX_AUTOSAVE_TMUX:-tmux}
 
 log() { echo "tmux-boot-selfcheck: $*"; }
 mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+# the installer arms this right before it first starts the timer: a fire that follows a first install judges a boot
+# this module never covered (a false incident alert). The guard names the boot it was armed in and stays armed for
+# that WHOLE boot (a manual run, a user-manager restart that re-fires the timer: all of them would judge the same
+# uncovered previous boot); a guard left over from another boot is stale and dropped.
+state_dir=${TMUX_BOOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot}
+guard=$state_dir/selfcheck-first-fire
+if [ -e "$guard" ]; then
+  armed_boot=$(cat "$guard" 2>/dev/null)
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+  if [ "$armed_boot" = "$boot_id" ]; then
+    log "first fire of this boot right after the install: the previous boot was not this module's, nothing to compare"
+    exit 0
+  fi
+  rm -f "$guard"
+fi
 
 resurrect_dir() {
   local dir=${TMUX_BOOT_SELFCHECK_RESURRECT_DIR:-}
