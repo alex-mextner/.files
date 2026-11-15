@@ -2,11 +2,14 @@
 # restart: unless-stopped it already backs off and never gives up on a container that exits). Containers without a
 # HEALTHCHECK are not touched. The docker socket is mounted: autoheal can restart any container on the host.
 # The image is pinned by digest, not by tag: a re-pushed tag would run as root on the host (the socket is mounted).
+# The container AND the compose service carry the module's name: an `autoheal` container of an older copy of this file
+# (same project, service `autoheal`) is an orphan next to the new service, not the container that compose would recreate
+# under another name, so it keeps running until its replacement is up and is then removed by id (see install.sh).
 name: service-failover-autoheal
 services:
-  autoheal:
+  service-failover-autoheal:
     image: willfarrell/autoheal:1.2.0@sha256:31f580ef0279eaced5b38d631b08c474d70d8403c1c2fdd6ddcf2e879d5f3f7c
-    container_name: autoheal
+    container_name: service-failover-autoheal
     restart: always
     network_mode: none
     environment:

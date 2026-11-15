@@ -27,7 +27,7 @@ and first aid clears the counter, which is what would have saved `ha-host-action
 | Piece | Where | What it does |
 |---|---|---|
 | `service.d/10-failover.conf` | user manager (every user service of the PC and the odroid) and, with sudo, `/etc/systemd/system/service.d/` | `RestartSteps=8`, `RestartMaxDelaySec=5min`: the delay between restarts grows from the unit's own `RestartSec` to 5 minutes over 8 steps. systemd counts the steps in `NRestarts`, which only a manual start or `reset-failed` clears, so a service that crashes rarely drifts toward the 5 minute delay over weeks |
-| `service.d/15-failover-repair.conf` | user manager of the PC only (needs omp) | `OnFailure=service-failover-repair@%n.service`. systemd fires it on every crash, also while it is still restarting the unit; the script below decides |
+| `service.d/15-failover-repair.conf` | user manager of the PC only (needs omp) | `OnFailure=service-failover-repair@%n.service`. systemd fires it on every crash, also while it is still restarting the unit; the script below decides. The instance is the unit name (it may hold colons), or `HOST:SCOPE:UNIT` for a unit of an ssh host (`odroidn2:system:caddy.service`; the host is a plain ssh alias, no `user@`) |
 | `service-failover-repair@.service` + `.d/20-limits.conf` | PC | oneshot template; `OnFailure=` reset (checked with `systemctl --user show`) so a failing repair cannot start a repair of the repair; `StartLimitIntervalSec=0`, because a fast crash loop of the watched unit starts its repair instance once per crash and systemd's default limit (5 starts in 10 s) refused the start that reports the final `failed` state (2026-11-10 22:55:09, `wireplumber.service`). The script ignores `service-failover-*` units as well. The template's drop-in directory belongs to the module: `install.sh --check` lists a drop-in it did not install as `stale` and an install removes it (a leftover smoke-test drop-in set `SERVICE_FAILOVER_DRY_RUN=1` and made every repair on the PC a dry run) |
 | `bin/service-failover-repair` | PC | leaves a unit alone that is healthy (running, or a one-shot that finished with `Result=success`), still inside its restart backoff, stopped on purpose, transient, or one that exited with a status it declares final (`RestartPreventExitStatus=`) (only `failed`, or 10 or more restarts in `auto-restart`, counts as a failure); a vendor or generated unit (the distribution's, or from a generator) is handled like any other, and its brief tells the session not to edit the vendor file; first aid at most once per hour per unit (`restart --no-block`; `reset-failed` first only when `Result=start-limit-hit`, or after a restart that started nothing: same invocation, still `failed`, and the restart added a "Start request repeated too quickly" journal line (the original failure's line does not count; a failed dependency refuses a start the same way and must not trigger `reset-failed`), because `--no-block` exits 0 for it and the limit keeps `Result=exit-code`; `reset-failed` would otherwise hide a failure the restart cannot undo; wait 20 s; a start still in progress is left to systemd; a unit that ends `inactive` with `Result=success` after the restart counts as finished only with exit status 0, a clean stop signal (SIGHUP, SIGINT, SIGPIPE, SIGTERM) or a status the unit lists in SuccessExitStatus=, because a crashed service whose failed state was cleared keeps its crash status; one-shot jobs are left untouched because re-running them may repeat a side effect); if still down, writes a brief (host, scope, unit file, what was tried, last 50 journal lines with secrets masked and fenced as untrusted data, instructions to diagnose, fix at the source, verify for 5 minutes, look for an existing ticket, report) and starts the sanctioned launcher `~/.agents/skills/rig-detached-omp/rig-detached-omp`. One session at a time (`flock`, inherited by the session), one per unit per 12 hours and 4 per 24 hours in total (stamp files in `~/.local/state/service-failover/launches`: systemd forgets a unit's counters once it unloads, so it cannot carry the limit). A session that hangs holds the lock until it ends: later repairs are deferred (the launcher gives the session no time limit), and the user is told so by the notification below. Units stopped on purpose whose stop ended `failed` (a stop timeout) look like failures and are restarted once by first aid. **Tells the user** (see *What the user sees*) |
 | `service-failover-scan.timer` / `.service` / `bin/service-failover-scan` | PC, every 5 minutes | finds failed units and units in `auto-restart` with 10 or more restarts (a unit that never reaches `failed`, such as one with `StartLimitIntervalSec=0`, or any unit under the backoff) on this host and on each host of `~/.config/service-failover/hosts`, over ssh with no sudo, user and system units, and starts the repair template for each; at the end of every run it delivers the notifications that were waiting for the desktop (`service-failover-repair --flush-notifications`) |
@@ -39,7 +39,19 @@ get `Restart=on-failure` from the module option `restart_units` (`<unit>.d/30-fa
 
 The PC's `wyoming-whisper.service` (`StartLimitIntervalSec=0`) never reaches `failed`; the scan catches it as a restart
 loop instead. Turning an option off removes what it installed: `--check` lists such files as `stale` and an install removes
-them (and disables the scan timer when `repair = false`).
+them (disables the scan timer when `repair = false`; removes the `autoheal` container when `autoheal = false` is set
+explicitly, and only a container docker compose created from a copy of this module's compose file, found by its config-file
+label, never one that merely has the name, and by its id). A host that never sets the option (the odroid, run by hand with
+`--autoheal`) keeps its container when the flag is left out. Options that are not valid JSON abort before anything is touched.
+The container is `service-failover-autoheal` (compose service of the same name). The earlier copy of the file named both
+`autoheal`; that container, when it carries this module's compose file label, is removed by id once the new one is up
+(`docker compose up -d --wait`); if the new one does not start, the old one keeps running. An install that cannot confirm a
+removal (the daemon went away) reports it and exits non-zero instead of claiming it. A host without a docker client has
+nothing to remove, so `autoheal = false` is satisfied there.
+
+A repair run whose query after the first aid fails (a host that does not answer) cannot tell whether the unit is up. It
+writes a file under `~/.local/state/service-failover/recheck/`, and the next scan starts that repair again, because the
+scan itself lists only failed and restart-looping units and would never come back to a unit that first aid left inactive.
 
 ## What the user sees
 
@@ -94,7 +106,9 @@ there: whatever needs root goes into a ticket with the exact command.
 
 PC (profile module, `[modules.service-failover] enabled = true` in `machines/ubuntu-pc/machine.toml`):
 `ubuntu-tweak apply --commit`, or by hand `bash install.sh` (`--plan`, `--check` are read-only). It writes user files,
-runs `daemon-reload` and enables the scan timer. It restarts nothing: a unit takes the new backoff at its next start.
+runs `daemon-reload`, enables the scan timer and starts it again when it is enabled but stopped. It restarts nothing: a unit
+takes the new backoff at its next start. A repair run bounds every `systemctl`/`journalctl`/ssh query (30 s) and
+closes its lock descriptor for them, so a hung host cannot keep the one-session lock.
 
 Odroid, user level, once (no repository checkout there, so copy the module):
 

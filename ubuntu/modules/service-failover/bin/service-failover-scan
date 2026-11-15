@@ -28,18 +28,20 @@ probe='set -o pipefail; flag=; [ "$1" = user ] && flag=--user
 failed=$(systemctl $flag list-units --type=service --state=failed --plain --no-legend) || exit 1
 printf "%s\n" "$failed" | awk "NF {print \$1}"
 looping=$(systemctl $flag list-units --type=service --state=activating --plain --no-legend) || exit 1
-for u in $(printf "%s\n" "$looping" | awk "\$4==\"auto-restart\" {print \$1}"); do
+for u in $(printf "%s\n" "$looping" | awk "\$4 ~ /^auto-restart/ {print \$1}"); do
   n=$(systemctl $flag show -p NRestarts --value "$u") || exit 1; [ "${n:-0}" -ge "$2" ] && echo "$u"
 done; exit 0'
 
 scan() { # scan HOST SCOPE
   if [ "$1" = local ]; then bash -c "$probe" _ "$2" "$min_restarts"
-  else ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(printf '%q ' bash -c "$probe" _ "$2" "$min_restarts")"; fi
+  else ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(printf '%q ' bash -c "$probe" _ "$2" "$min_restarts")"; fi
 }
 
 errs=$(mktemp); trap 'rm -f "$errs"' EXIT
 status=0
 for host in "${hosts[@]}"; do
+  # a remote instance is HOST:SCOPE:UNIT, so a host has to be a plain name (an ssh alias), never `user@host` or `-option`
+  [ "$host" = local ] || [[ "$host" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || { echo "service-failover-scan: $host: not a plain ssh host name (use an alias of ~/.ssh/config), skipped"; status=1; continue; }
   scopes=(user); [ "$host" != local ] && scopes=(user system)
   for scope in "${scopes[@]}"; do
     # stderr (ssh banners, locale warnings, systemctl errors) is kept apart from the unit list.
@@ -57,6 +59,20 @@ for host in "${hosts[@]}"; do
       systemctl --user start --no-block "$repair" || status=1
     done <<<"$found"
   done
+done
+# A repair that could not query its unit again after the first aid (the host did not answer) leaves a recheck file: that
+# unit may be down without being failed or looping, which the listing above never reports. Each one is requested again on
+# every scan until a repair run has been able to read the unit (that run deletes the file; a request that is refused or
+# finds the repair already running leaves it).
+state=${SERVICE_FAILOVER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/service-failover}
+for f in "$state"/recheck/*; do
+  [ -f "$f" ] || continue
+  inst=$(head -n1 "$f")
+  [[ "$inst" =~ ^[A-Za-z0-9:_.@\\-]+$ ]] || continue
+  repair="service-failover-repair@$inst.service"
+  case "$(systemctl --user show -p ActiveState --value "$repair" 2>/dev/null)" in active|activating) continue ;; esac
+  echo "service-failover-scan: $inst could not be queried after its first aid: looking again, requesting $repair"
+  systemctl --user start --no-block "$repair" || status=1
 done
 "$(dirname "$0")/service-failover-repair" --flush-notifications >/dev/null || status=1
 exit "$status"
