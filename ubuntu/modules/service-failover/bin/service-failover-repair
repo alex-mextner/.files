@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # service-failover-repair INSTANCE: what service-failover-repair@.service runs for one failed or restart-looping unit.
 #
-# INSTANCE is the unit name for a user unit of this host (OnFailure= passes %n), or HOST:SCOPE:UNIT for a unit of a
-# host reached over ssh (service-failover-scan), SCOPE being user or system.
+# INSTANCE is the unit name for a user unit of this host (OnFailure= passes %n; the name may hold colons, such as
+# tunnel@127.0.0.1:8787:localhost.service), or HOST:SCOPE:UNIT for a unit of a host reached over ssh (service-failover-scan),
+# HOST a plain ssh host name (letters, digits, dot, dash, underscore; no `@`), SCOPE user or system.
 #
 # 1. Skips what is not worth a session: the module's own units, a unit that is healthy (running, or a one-shot that
 #    finished with Result=success), still inside its restart backoff, stopped on purpose, transient, or one that
@@ -30,7 +31,8 @@
 # SERVICE_FAILOVER_DAILY_CAP (default 4), SERVICE_FAILOVER_SETTLE_S (wait after the first aid, default 20),
 # SERVICE_FAILOVER_MIN_RESTARTS (restart-loop size, default 10), SERVICE_FAILOVER_COOLDOWN_MIN (per unit, default 720),
 # SERVICE_FAILOVER_AID_MIN (first aid per unit, default 60), SERVICE_FAILOVER_WORKDIR (default $HOME),
-# SERVICE_FAILOVER_NOTIFY (the notifier, default notify-send), SERVICE_FAILOVER_NOTIFY_MIN (per unit, default 720).
+# SERVICE_FAILOVER_NOTIFY (the notifier, default notify-send), SERVICE_FAILOVER_NOTIFY_MIN (per unit, default 720),
+# SERVICE_FAILOVER_PROBE_S (longest a systemctl/journalctl/ssh query may run, default 30).
 set -uo pipefail
 
 launcher=${SERVICE_FAILOVER_LAUNCHER:-$HOME/.agents/skills/rig-detached-omp/rig-detached-omp}
@@ -42,7 +44,8 @@ cooldown=${SERVICE_FAILOVER_COOLDOWN_MIN:-720}
 aid_min=${SERVICE_FAILOVER_AID_MIN:-60}
 workdir=${SERVICE_FAILOVER_WORKDIR:-$HOME}
 dry=${SERVICE_FAILOVER_DRY_RUN:-0}
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=8)
+ssh_opts=(-n -o BatchMode=yes -o ConnectTimeout=8)
+probe_s=${SERVICE_FAILOVER_PROBE_S:-30}
 
 notifier=${SERVICE_FAILOVER_NOTIFY:-notify-send}
 notify_min=${SERVICE_FAILOVER_NOTIFY_MIN:-720}
@@ -88,9 +91,9 @@ inst=${1:-}
 if [ "$inst" = --flush-notifications ]; then deliver_notifications; echo "service-failover-repair: $undelivered notification(s) still pending"; exit 0; fi
 [ -n "$inst" ] || { echo "usage: $0 (INSTANCE (UNIT | HOST:SCOPE:UNIT) | --flush-notifications)" >&2; exit 2; }
 
-if [[ "$inst" == *:*:* ]]; then host=${inst%%:*}; rest=${inst#*:}; scope=${rest%%:*}; unit=${rest#*:}
+# Only a plain host name followed by user or system is a remote instance: any other colon belongs to the unit name.
+if [[ "$inst" =~ ^([A-Za-z0-9._][A-Za-z0-9._-]*):(user|system):(.+)$ ]]; then host=${BASH_REMATCH[1]}; scope=${BASH_REMATCH[2]}; unit=${BASH_REMATCH[3]}
 else host=local; scope=user; unit=$inst; fi
-case "$scope" in user|system) ;; *) echo "bad scope '$scope' in $inst" >&2; exit 2 ;; esac
 # A backslash is allowed: systemd escapes unit names that way (systemd-fsck@dev-disk-by\x2duuid-....service).
 case "$unit" in *[!A-Za-z0-9:_.@\\-]*|"") echo "bad unit name in $inst" >&2; exit 2 ;; esac
 key=$(printf %s "$inst" | tr -c 'A-Za-z0-9._-' _)
@@ -98,28 +101,46 @@ key=$(printf %s "$inst" | tr -c 'A-Za-z0-9._-' _)
 log() { echo "service-failover-repair: $host/$scope/$unit: $*"; }
 # The module's own units (the scan fails while a host is unreachable) are never repaired by a session about themselves.
 case "$unit" in service-failover-*) log "the module's own unit, not repaired"; exit 0 ;; esac
+# A marker left by an earlier run that could not query the unit after its first aid (see there): its second line is the
+# invocation of the failure that run saw. It stays until this run has read the unit, so a host that still does not
+# answer keeps it for the next scan.
+# (the key is a sanitized instance, so `h:user:foo.service` and a local `h_user_foo.service` share one: the marker's name
+# adds a checksum of the exact instance, and its first line is checked as well)
+rkey="$key.$(printf %s "$inst" | cksum | cut -d' ' -f1)"
+recheck_inv=; recheck_file="$state/recheck/$rkey"
+if [ -f "$recheck_file" ] && [ "$(sed -n 1p "$recheck_file")" = "$inst" ]; then recheck_inv=$(sed -n 2p "$recheck_file" | tr -cd 'A-Za-z0-9._:/@+-'); else recheck_file=; fi
 
 # sctl ARGS...: systemctl for the unit's manager, on the host that has it. Remote words are quoted for the remote shell.
+# Every query is bounded (a hung ssh or journal must not outlive the repair) and runs without the lock descriptor 9, so a
+# leftover child cannot keep the one-session-at-a-time lock after this script is gone.
 sctl() {
   local flag=(--no-ask-password); [ "$scope" = user ] && flag=(--user)
-  if [ "$host" = local ]; then systemctl "${flag[@]}" "$@"
-  else ssh "${ssh_opts[@]}" "$host" "$(printf '%q ' systemctl "${flag[@]}" "$@")"; fi
+  if [ "$host" = local ]; then timeout -k 5 "$probe_s" systemctl "${flag[@]}" "$@" 9>&-
+  else timeout -k 5 "$probe_s" ssh "${ssh_opts[@]}" "$host" "$(printf '%q ' systemctl "${flag[@]}" "$@")" 9>&-; fi
 }
 jctl() {
   local flag=(); [ "$scope" = user ] && flag=(--user)
-  if [ "$host" = local ]; then journalctl "${flag[@]}" "$@"
-  else ssh "${ssh_opts[@]}" "$host" "$(printf '%q ' journalctl "${flag[@]}" "$@")"; fi
+  if [ "$host" = local ]; then timeout -k 5 "$probe_s" journalctl "${flag[@]}" "$@" 9>&-
+  else timeout -k 5 "$probe_s" ssh "${ssh_opts[@]}" "$host" "$(printf '%q ' journalctl "${flag[@]}" "$@")" 9>&-; fi
 }
-# Masks what looks like a secret: key=value and "key": "value" pairs named like one, Authorization/Bearer/Basic values,
-# credentials in URLs, Telegram bot tokens, well-known token prefixes, long hex.
+# Masks what looks like a secret: key=value and "key": "value" pairs named like one (a quoted value to its closing quote,
+# spaces included), Authorization values (scheme and credential, whatever the scheme), Bearer/Basic values, credentials in
+# URLs, Telegram bot tokens, whole JWTs, well-known token prefixes, long hex. The pairs named like a secret go first: an
+# Authorization value that carries one (OAuth oauth_token="...") is then already masked, and the Authorization rules
+# stop at a comma, a quote or `=`, so they never swallow a second credential after the first.
 redact() {
   sed -E \
-    -e 's/((proxy-)?authorization["\x27]?[=: ]+((bearer|basic|token|digest) +)?)[^ ,;"\x27]+/\1<redacted>/Ig' \
+    -e 's/((token|secret|passw(or)?d|api[_-]?key|credential)[A-Za-z_-]*["\x27]?[ ]*[=:][ ]*)"[^"]*"/\1"<redacted>"/Ig' \
+    -e 's/((token|secret|passw(or)?d|api[_-]?key|credential)[A-Za-z_-]*["\x27]?[ ]*[=:][ ]*)\x27[^\x27]*\x27/\1\x27<redacted>\x27/Ig' \
     -e 's/((token|secret|passw(or)?d|api[_-]?key|credential)[A-Za-z_-]*["\x27]?[=: ]+["\x27]?)[^ ,;"\x27]+/\1<redacted>/Ig' \
+    -e 's/((proxy-)?authorization["\x27]?[=: ]+)"[^"]*"/\1"<redacted>"/Ig' \
+    -e 's/((proxy-)?authorization["\x27]?[=: ]+)\x27[^\x27]*\x27/\1\x27<redacted>\x27/Ig' \
+    -e 's/((proxy-)?authorization["\x27]?[=: ]+)[^,;"\x27]+/\1<redacted>/Ig' \
     -e 's/\b(bearer|basic) +[A-Za-z0-9._~+\/=-]{8,}/\1 <redacted>/Ig' \
     -e 's#(://[^/:@ ]+:)[^@/ ]+@#\1<redacted>@#g' \
     -e 's/(bot[0-9]{6,}:)[A-Za-z0-9_-]{20,}/\1<redacted>/g' \
     -e 's/(X-[A-Za-z-]*(Token|Key|Auth)[A-Za-z-]*: )[^ ]+/\1<redacted>/Ig' \
+    -e 's/\beyJ[A-Za-z0-9_+\/=-]{8,}(\.[A-Za-z0-9_+\/=-]*){1,2}/<redacted-token>/g' \
     -e 's/\b(sk|ghp|gho|ghs|xox[bpa]|AKIA|eyJ)[A-Za-z0-9_-]{16,}/<redacted-token>/g' \
     -e 's/\b[A-Fa-f0-9]{32,}\b/<redacted-hex>/g'
 }
@@ -164,7 +185,7 @@ notify_down() {
 
 # scan_sees: the scan lists only failed units and units stuck in auto-restart; for any other state "retried by the next
 # scan" is a promise nobody keeps.
-scan_sees() { [ "$active" = failed ] || { [ "$active" = activating ] && [ "$(prop NRestarts)" -ge "$min_restarts" ] 2>/dev/null; }; }
+scan_sees() { [ "$active" = failed ] || { [ "$active" = activating ] && [[ "$sub" == auto-restart* ]] && [ "$(prop NRestarts)" -ge "$min_restarts" ] 2>/dev/null; }; }
 # clean_status: the last run's end counts as a success: status 0 (or none), a clean stop signal (code killed: SIGHUP, SIGINT,
 # SIGPIPE, SIGTERM; any other signal is a crash), or a status the unit lists in SuccessExitStatus=.
 clean_status() {
@@ -190,6 +211,7 @@ limit_since() {
 query() { sctl show -p ActiveState -p SubState -p Result -p NRestarts -p UnitFileState -p FragmentPath -p Transient -p Type -p InvocationID -p ExecMainStatus -p ExecMainCode -p SuccessExitStatus -p RestartPreventExitStatus "$unit" 2>&1; }
 props=$(query) \
   || { log "cannot query the unit ($(redact <<<"$props" | plain | tr '\n' ' ' | cut -c1-200)); host unreachable or unit unknown"; exit 0; }
+[ -z "$recheck_file" ] || rm -f "$recheck_file"
 active=$(prop ActiveState); sub=$(prop SubState); fragment=$(prop FragmentPath); invocation=$(prop InvocationID)
 
 if [ "$active" = active ] && [[ "$sub" == running || "$sub" == exited || "$sub" == waiting ]]; then log "healthy again ($active/$sub), nothing to repair"; exit 0; fi
@@ -198,7 +220,10 @@ if [ "$active" = active ] && [[ "$sub" == running || "$sub" == exited || "$sub" 
 # incident's own state; it is repaired like a failed unit)
 erased=0
 if [ "$active" = inactive ] && [ "$(prop Result)" = success ]; then
-  if clean_status; then log "finished successfully ($active/$sub), nothing to repair"; exit 0; fi
+  # (a recheck run, whether or not the marker holds an invocation: the same one inactive with Result=success is the failure
+  # that first aid cleared with reset-failed while a dependency kept the restart from starting. A run that finished has a
+  # new, non-empty invocation: an empty one is a unit systemd unloaded in the meantime, with no run behind it)
+  if clean_status && { [ -z "$recheck_file" ] || { [ -n "$(prop InvocationID)" ] && [ "$(prop InvocationID)" != "$recheck_inv" ]; }; }; then log "finished successfully ($active/$sub), nothing to repair"; exit 0; fi
   erased=1
 fi
 # OnFailure= fires on EVERY crash of a unit that is still being restarted, not only when systemd gives up. A unit is a
@@ -207,7 +232,7 @@ fi
 # Anything else (still inside its backoff, or deliberately stopped) is left to systemd.
 nrestarts=$(prop NRestarts)
 seen="$active/$sub, Result=$(prop Result), NRestarts=${nrestarts:-0}"
-if [ "$active" != failed ] && [ "$erased" != 1 ] && ! { [ "$active" = activating ] && [ "${nrestarts:-0}" -ge "$min_restarts" ]; }; then
+if [ "$active" != failed ] && [ "$erased" != 1 ] && ! { [ "$active" = activating ] && [[ "$sub" == auto-restart* ]] && [ "${nrestarts:-0}" -ge "$min_restarts" ]; }; then
   log "not failed ($active/$sub, NRestarts=${nrestarts:-0} of $min_restarts): left to systemd"; exit 0
 fi
 if [ "$(prop Transient)" = yes ]; then log "transient unit, not repaired"; exit 0; fi
@@ -220,10 +245,23 @@ vendor=
 if [[ "$fragment" == /usr/* || "$fragment" == /lib/* || "$fragment" == */generator*/* || ( "$scope" = user && "$fragment" == /etc/systemd/user/* ) ]]; then
   vendor=1
 fi
-# The unit declares this exit status final (RestartPreventExitStatus=, e.g. 75 for "another worker holds the lock").
-for code in $(sed -n "s/^RestartPreventExitStatus=//p" <<<"$props" | head -n1 | tr -cd "A-Za-z0-9 ,"); do
-  if [ "$code" = "$(prop ExecMainStatus)" ]; then log "exited with $code, which the unit declares final (RestartPreventExitStatus=), not repaired"; exit 0; fi
-done
+# The unit declares its last exit final (RestartPreventExitStatus=, e.g. 75 for "another worker holds the lock"). The
+# list holds exit codes (ExecMainCode=1 and ExecMainStatus is the code) and signal names (ExecMainCode=2 or 3 and
+# ExecMainStatus is the signal number): a code is never read as a signal or the other way round.
+declares_final() {
+  local want tok
+  case "$(prop ExecMainCode)" in
+    1) want=$(prop ExecMainStatus) ;;
+    2|3) want=$(kill -l "$(prop ExecMainStatus)" 2>/dev/null) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$want" ] || return 1
+  for tok in $(sed -n "s/^RestartPreventExitStatus=//p" <<<"$props" | head -n1 | tr -cd "A-Za-z0-9 "); do
+    [ "${tok#SIG}" = "$want" ] && { final=$tok; return 0; }
+  done
+  return 1
+}
+if declares_final; then log "exited with $final, which the unit declares final (RestartPreventExitStatus=), not repaired"; exit 0; fi
 
 # One session per unit per COOLDOWN_MIN minutes. The stamps are files, not systemd start counters: systemd forgets the
 # counter of an instance as soon as it is unloaded, which happens when the repair exits.
@@ -245,6 +283,10 @@ elif [ "$(prop Type)" = oneshot ]; then
 elif [ -n "$(find "$state/aid" -type f -name "$key" -mmin "-$aid_min" 2>/dev/null)" ]; then
   tried+=("first aid: skipped, it already ran within $aid_min min and the unit failed again")
 else
+  # The incident is written down BEFORE its failed state is cleared: if this run is stopped by its deadline, or cannot read
+  # the unit afterwards, the scan starts a repair again (it lists only failed and looping units, and this one may be neither
+  # after reset-failed). The marker goes when the unit has been read after the first aid.
+  mkdir -p "$state/recheck" && printf '%s\n%s\n' "$inst" "$invocation" >"$state/recheck/$rkey"
   : >"$state/aid/$key"
   # reset-failed turns a failed unit into inactive/success, which would hide a failure that the restart does not undo:
   # it is needed only to get past a refused start. A unit whose start limit hit while it was being restarted keeps
@@ -260,17 +302,20 @@ else
     cursor=$(journal_cursor)
     if out=$(sctl restart --no-block "$unit" 2>&1); then restart_ok=1; tried+=("systemctl restart: ok"); else tried+=("systemctl restart: refused ($(redact <<<"$out" | plain | tr '\n' ' ' | cut -c1-160))"); fi
     sleep "$settle"
-    props=$(query)
+    # (the unit may be down for good while the host does not answer: the marker stays and the next scan starts this repair again;
+    # it goes with every conclusive exit below, and once this run owns the incident, after the last attempt)
+    props=$(query) || { log "cannot query the unit after the first aid ($(redact <<<"$props" | plain | tr '\n' ' ' | cut -c1-200)); host unreachable or too slow, the next scan looks again"; exit 0; }
     active=$(prop ActiveState); sub=$(prop SubState)
-    if [ "$active" = active ]; then log "back up after reset-failed and restart ($active/$sub), no session needed"; exit 0; fi
+    if declares_final; then rm -f "$state/recheck/$rkey"; log "after the restart it exited with $final, which the unit declares final (RestartPreventExitStatus=), not repaired"; exit 0; fi
+    if [ "$active" = active ]; then rm -f "$state/recheck/$rkey"; log "back up after reset-failed and restart ($active/$sub), no session needed"; exit 0; fi
     # reset-failed alone turns a failed unit into inactive/success: only a NEW run (another invocation) that finished
     # successfully counts. A service that was reset or stopped after it crashed keeps its failure status; but a clean
     # signal stop (ExecMainCode killed) and a status listed in SuccessExitStatus= are successes by systemd's own verdict.
     if [ "$active" = inactive ] && [ "$(prop Result)" = success ] && [ -n "$(prop InvocationID)" ] && [ "$(prop InvocationID)" != "$invocation" ] \
        && clean_status; then
-      log "finished successfully after the restart, no session needed"; exit 0
+      rm -f "$state/recheck/$rkey"; log "finished successfully after the restart, no session needed"; exit 0
     fi
-    if [ "$active" = activating ] && [ "$sub" != auto-restart ]; then log "the start is still in progress ($active/$sub), left to systemd"; exit 0; fi
+    if [ "$active" = activating ] && [[ "$sub" != auto-restart* ]]; then rm -f "$state/recheck/$rkey"; log "the start is still in progress ($active/$sub), left to systemd"; exit 0; fi
     # (a failed dependency refuses a start the same way; only the journal's "Start request repeated too quickly" names the limit)
     if [ "$attempt" = 1 ] && [ "$restart_ok" = 1 ] && [ "$active" = failed ] && [ "$(prop InvocationID)" = "$invocation" ] \
        && limit_since "$cursor"; then
@@ -279,6 +324,7 @@ else
     fi
     break
   done
+  rm -f "$state/recheck/$rkey"  # read after the last attempt: the incident is in this run's hands again
   tried+=("after ${settle} s the unit is still $active/$sub (Result=$(prop Result), NRestarts=$(prop NRestarts))")
 fi
 

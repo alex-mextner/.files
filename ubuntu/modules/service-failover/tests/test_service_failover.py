@@ -6,6 +6,7 @@ files under a temp dir, and the omp launcher is a stub that only records its arg
 """
 import fcntl
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -32,7 +33,11 @@ case "$1" in
     # real systemd no longer reports a timer whose unit file is gone as enabled
     [ -n "${SERVICE_FAILOVER_UNIT_DIR:-}" ] && [ ! -e "$SERVICE_FAILOVER_UNIT_DIR/service-failover-scan.timer" ] && { echo not-found; exit 1; }
     [ -e "$STUB/timer-enabled" ] && { echo enabled; exit 0; }; echo disabled; exit 1 ;;
-  enable) : > "$STUB/timer-enabled" ;;
+  is-active) [ -e "$STUB/timer-enabled" ] && [ ! -e "$STUB/timer-stopped" ] && { echo active; exit 0; }; echo inactive; exit 3 ;;
+  enable)
+    : > "$STUB/timer-enabled"
+    [ -e "$STUB/enable-fails" ] && { : > "$STUB/timer-stopped"; echo "Failed to start the timer" >&2; exit 1; }
+    rm -f "$STUB/timer-stopped" ;;
   disable) rm -f "$STUB/timer-enabled" ;;
   reset-failed)
     [ -e "$STUB/reset-refused" ] && { echo "Access denied" >&2; exit 1; }
@@ -42,6 +47,7 @@ case "$1" in
     mv "$STUB/state.new" "$STUB/state" ;;
   restart)
     [ -e "$STUB/restart-refused" ] && { echo "Interactive authentication required" >&2; exit 1; }
+    [ -e "$STUB/show-fails-after-restart" ] && : > "$STUB/show-fails"
     # $STUB/start-limited: the unit's start limit is still in force, so `restart --no-block` exits 0 and starts nothing
     # (same invocation, still failed) until reset-failed. Otherwise a restart is a new invocation.
     # $STUB/dep-refused: a failed dependency refused the start job: also exit 0, nothing started, no limit in the journal
@@ -53,8 +59,9 @@ case "$1" in
       [ -e "$STUB/heals" ] && printf 'ActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n' > "$STUB/state"
       [ -e "$STUB/after-restart" ] && cp "$STUB/after-restart" "$STUB/state"
     fi ;;
-  start) ;;
+  start) rm -f "$STUB/timer-stopped" ;;
   show)
+    [ -e "$STUB/show-fails" ] && { echo "Connection timed out" >&2; exit 124; }
     if [ "$2" = -p ] && [ "$3" = ActiveState ] && [ "$4" = --value ]; then
       if [ -e "$STUB/instance-state" ]; then cat "$STUB/instance-state"; fi; exit 0
     fi
@@ -70,6 +77,8 @@ exit 0
 # the lines after the Nth, like the real one
 JOURNALCTL = r"""#!/bin/bash
 echo "journalctl $*" >> "$STUB/calls"
+# a hung journal: a child in its own session survives the timeout and must not hold the repair lock
+[ -e "$STUB/journal-hangs" ] && { setsid sleep 6 >/dev/null 2>&1 & exec sleep 6; }
 after=
 for ((i = 1; i <= $#; i++)); do [ "${!i}" = --after-cursor ] && { j=$((i + 1)); after=${!j}; }; done
 if [ -n "$after" ]; then tail -n "+$((after + 1))" "$STUB/journal" 2>/dev/null; exit 0; fi
@@ -79,7 +88,7 @@ exit 0
 """
 # ssh: log, then run the remote command string locally (the stubs above stand in for the remote systemctl).
 SSH = r"""#!/bin/bash
-while [ "$#" -gt 0 ]; do case "$1" in -o) shift 2 ;; *) break ;; esac; done
+while [ "$#" -gt 0 ]; do case "$1" in -o) shift 2 ;; -n) shift ;; *) break ;; esac; done
 host=$1; shift
 echo "ssh $host $*" >> "$STUB/calls"
 exec bash -c "$*"
@@ -87,6 +96,45 @@ exec bash -c "$*"
 LAUNCHER = r"""#!/bin/bash
 echo "launcher $1 $3" >> "$STUB/calls"
 cp "$2" "$STUB/brief-sent"
+"""
+# docker keeps each container in $STUB/containers/NAME as `id|project|compose file|image|running` (absent = no container).
+# $STUB/no-docker: the daemon is not reachable; $STUB/up-fails a `compose up` that fails, $STUB/wait-fails one whose
+# container did not stay up under --wait (it is left stopped); $STUB/rm-disconnects: the daemon is lost during `rm`;
+# $STUB/inspect-denied: `inspect` is refused while the daemon still lists containers; COMPOSE_REMOVE_ORPHANS=true as in compose.
+DOCKER = r"""#!/bin/bash
+echo "docker $*" >> "$STUB/calls"
+C=$STUB/containers
+find_container() { # NAME|ID -> its file, like `docker inspect` / `docker rm`
+  local f
+  for f in "$C"/*; do [ -e "$f" ] || continue; { [ "$(basename "$f")" = "$1" ] || [ "$(cut -d'|' -f1 "$f")" = "$1" ]; } && { echo "$f"; return 0; }; done
+  return 1
+}
+[ "$1" = container ] && shift
+case "$1" in
+  info) [ -e "$STUB/no-docker" ] && exit 1; exit 0 ;;
+  inspect) [ -e "$STUB/no-docker" ] || [ -e "$STUB/inspect-denied" ] && exit 1; f=$(find_container "${!#}") || exit 1; cat "$f" ;;
+  ls) [ -e "$STUB/no-docker" ] && exit 1
+      for a in "$@"; do case "$a" in
+        name=*) n=${a#name=^/}; n=${n%\$}; [ -e "$C/$n" ] && cut -d'|' -f1 "$C/$n" ;;
+        id=*) for f in "$C"/*; do [ -e "$f" ] && [ "$(cut -d'|' -f1 "$f")" = "${a#id=}" ] && echo "${a#id=}"; done ;;
+      esac; done ;;
+  rm) [ -e "$STUB/rm-disconnects" ] && { : > "$STUB/no-docker"; exit 1; }  # the daemon goes away during the removal
+      f=$(find_container "${!#}") && rm -f "$f" ;;
+  compose)
+    while [ "$#" -gt 0 ]; do case "$1" in -f) file=$2; shift 2 ;; -p) project=$2; shift 2 ;; up) action=$1; break ;; *) shift ;; esac; done
+    wait=0; case " $* " in *" --wait "*) wait=1 ;; esac
+    orphans=${COMPOSE_REMOVE_ORPHANS:-false}; case " $* " in *" --remove-orphans=false "*) orphans=false ;; *" --remove-orphans "*) orphans=true ;; esac
+    if [ "$action" = up ]; then
+      name=$(sed -n 's/^ *container_name: *//p' "$file"); image=$(sed -n 's/^ *image: *//p' "$file"); mkdir -p "$C"
+      # compose removes the orphans of the project (containers of services the file no longer has) before it creates anything
+      [ "$orphans" = true ] && for f in "$C"/*; do [ -e "$f" ] && [ "$(basename "$f")" != "$name" ] && [ "$(cut -d'|' -f2 "$f")" = "$project" ] && rm -f "$f"; done
+      [ -e "$STUB/up-fails" ] && exit 1
+      running=true; [ "$wait" = 1 ] && [ -e "$STUB/wait-fails" ] && running=false
+      printf 'id-%s|%s|%s|%s|%s\n' "$RANDOM" "$project" "$file" "$image" "$running" > "$C/$name"
+      [ "$running" = true ] || exit 1
+    fi ;;
+esac
+exit 0
 """
 # notify-send: records "title | body" per call; $STUB/notify-down makes it fail the way it does while no notification
 # daemon is running yet (early in the login).
@@ -125,7 +173,7 @@ class Base(unittest.TestCase):
         self.bin = self.root / "bin"
         for d in (self.stub, self.bin):
             d.mkdir()
-        for name, text in (("systemctl", SYSTEMCTL), ("journalctl", JOURNALCTL), ("ssh", SSH)):
+        for name, text in (("systemctl", SYSTEMCTL), ("journalctl", JOURNALCTL), ("ssh", SSH), ("docker", DOCKER)):
             (self.bin / name).write_text(text)
             (self.bin / name).chmod(0o755)
         launcher = self.root / "launcher"
@@ -154,6 +202,12 @@ class Base(unittest.TestCase):
 
     def set_state(self, text=FAILED_STATE):
         (self.stub / "state").write_text(text)
+
+    def recheck_marker(self, instance):
+        # the repair script names it after the sanitized instance plus the checksum of the exact instance
+        key = re.sub(r"[^A-Za-z0-9._-]", "_", instance)
+        crc = subprocess.run(["cksum"], input=instance.encode(), capture_output=True, check=True).stdout.split()[0].decode()
+        return self.root / "state" / "recheck" / f"{key}.{crc}"
 
 
 class RepairTest(Base):
@@ -204,7 +258,7 @@ class RepairTest(Base):
         self.assertNotIn("systemctl --user restart --no-block bar.service", self.calls())
 
     def test_a_unit_that_declares_its_exit_status_final_is_not_repaired(self):
-        self.set_state(FAILED_STATE + "ExecMainStatus=75\nRestartPreventExitStatus=75\n")
+        self.set_state(FAILED_STATE + "ExecMainCode=1\nExecMainStatus=75\nRestartPreventExitStatus=75\n")
         self.assertIn("declares final", self.repair("foo.service").stdout)
         self.assertEqual(self.launches(), [])
 
@@ -686,9 +740,176 @@ class RepairTest(Base):
 
     def test_bad_instances_are_refused(self):
         self.assertEqual(self.repair("").returncode, 2)
-        self.assertEqual(self.repair("h:bogus:foo.service").returncode, 2)
-        self.assertEqual(self.repair("foo;rm.service").returncode, 2)
-        self.assertEqual(self.repair("foo`x`.service").returncode, 2)
+        # not a remote HOST:SCOPE:UNIT (no plain host before user/system), so a unit name of this host, and not a valid one
+        for bad in ("foo;rm.service", "foo`x`.service", "-oProxyCommand=x:user:foo.service", "a b:user:foo.service", "me@host:user:foo.service=x"):
+            self.assertEqual(self.repair(bad).returncode, 2, bad)
+        self.assertEqual(self.launches(), [])
+        self.assertEqual(self.repair("h:bogus:foo.service").stdout.count("local/user/h:bogus:foo.service"), 1)  # a local unit with colons
+        self.assertEqual(self.repair("odroidn2:system:foo.service").stdout.count("odroidn2/system/foo.service"), 1)  # a remote one
+
+    def test_a_unit_name_with_colons_is_repaired(self):
+        self.set_state()
+        unit = "tunnel@127.0.0.1:8787:localhost.service"
+        result = self.repair(unit)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Unit: {unit}", (self.stub / "brief-sent").read_text())
+        self.assertIn(f"systemctl --user restart --no-block {unit}", self.calls())
+
+    def test_a_restart_that_has_reached_startup_is_not_a_restart_loop(self):
+        # NRestarts is high, but the unit left auto-restart and is starting: first aid would interrupt that start
+        self.set_state(FAILED_STATE.replace("failed\nSubState=failed", "activating\nSubState=start").replace("NRestarts=9", "NRestarts=12"))
+        self.assertIn("left to systemd", self.repair("foo.service").stdout)
+        self.assertEqual(self.launches(), [])
+        self.assertNotIn("systemctl --user restart --no-block foo.service", self.calls())
+
+    def test_final_exit_statuses_and_final_signals_are_told_apart(self):
+        cases = (("1", "75", "75", False), ("1", "6", "ABRT", True), ("2", "6", "75 ABRT", False), ("2", "9", "9", True), ("3", "6", "3 SEGV", True))
+        for i, (code, status, final, repaired) in enumerate(cases):
+            with self.subTest(code=code, status=status, final=final):
+                before = len(self.launches())
+                self.set_state(FAILED_STATE + f"ExecMainCode={code}\nExecMainStatus={status}\nRestartPreventExitStatus={final}\n")
+                self.repair(f"case{i}.service")
+                self.assertEqual(len(self.launches()) - before, 1 if repaired else 0)
+
+    def test_a_final_status_reached_during_first_aid_is_not_repaired(self):
+        self.set_state(FAILED_STATE + "ExecMainCode=1\nExecMainStatus=1\nRestartPreventExitStatus=75\n")
+        (self.stub / "after-restart").write_text("ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=10\nExecMainCode=1\nExecMainStatus=75\nRestartPreventExitStatus=75\n")
+        result = self.repair("foo.service")
+        self.assertIn("after the restart it exited with 75", result.stdout)
+        self.assertEqual(self.launches(), [])
+
+    def test_whole_credentials_are_masked_whatever_their_shape(self):
+        self.set_state()
+        jwt = ".".join(["eyJ" + "hbGciOiJIUzI1NiJ9", "eyJ" + "zdWIiOiJ0ZXN0LXVzZXIifQ", "c2lnbmF0" + "dXJlLXZhbHVl"])
+        scheme_credential = "opaque" + "credential" + "9876"
+        bearer = "fakebearer" + "123456"
+        oauth = "opaque" + "oauthvalue"
+        bare = "AbCdEf" + "0123456789xyz"
+        (self.stub / "journal").write_text(
+            f'Nov 10 {{"password": " two words and {PASSWORD_VALUE}"}}\n'
+            f"Nov 10 token: ' spaced {PASSWORD_VALUE} '\n"
+            f'Nov 10 {{"Authorization": "SSWS {scheme_credential}", "x": 1}}\n'
+            f"Nov 10 Authorization: SSWS {scheme_credential} and more\n"
+            f'Nov 10 Authorization: Bearer {bearer}, password="{PASSWORD_VALUE}x"\n'
+            f'Nov 10 Authorization: OAuth oauth_token="{oauth}", oauth_nonce="n"\n'
+            f"Nov 10 Cookie: session={jwt} end\n"
+            f"Nov 10 Authorization={bare} request failed\n"
+            f"Nov 10 Authorization: {bare}2 (cached)\n"
+            f"Nov 10 Authorization: key={bare}3\n")
+        self.repair("foo.service")
+        brief = (self.stub / "brief-sent").read_text()
+        for secret in (PASSWORD_VALUE, "two words", "spaced", scheme_credential, bearer, oauth, bare, *jwt.split(".")):
+            self.assertNotIn(secret, brief)
+
+    def test_an_authorization_value_is_masked_to_the_end_of_its_field_whatever_the_scheme(self):
+        self.set_state()
+        ticket = "opaque" + "ticket" + "0123456789"
+        digest = "digest" + "response" + "4567"
+        (self.stub / "journal").write_text(
+            f"Nov 10 Authorization: Negotiate {ticket}\n"
+            f"Nov 10 Proxy-Authorization: Digest {digest}, realm=keep\n"
+            f"Nov 10 authorization='Custom {ticket}9' end\n")
+        self.repair("foo.service")
+        brief = (self.stub / "brief-sent").read_text()
+        for secret in (ticket, digest, "Negotiate", "Custom", "Digest"):
+            self.assertNotIn(secret, brief)
+        self.assertIn("realm=keep", brief)  # the next field after the comma is not part of the credential
+
+    def test_a_recheck_run_does_not_take_a_unit_without_an_invocation_for_one_that_finished(self):
+        # the marker names the failure's invocation: inactive/success with the SAME or with NO invocation is not a run that
+        # finished (reset-failed cleared the failure, or systemd unloaded the unit), only a NEW invocation is
+        gone = "ActiveState=inactive\nSubState=dead\nResult=success\nNRestarts=0\nExecMainStatus=0\nTransient=no\nInvocationID={}\n"
+        marker = self.recheck_marker("foo.service")
+        # (a marker whose invocation is empty is written by a run that saw the unit already unloaded: it is still a marker)
+        for recorded, invocation, finished in (("old", "", False), ("old", "old", False), ("old", "new", True), ("", "", False), ("", "new", True)):
+            with self.subTest(recorded=recorded, invocation=invocation):
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(f"foo.service\n{recorded}\n")
+                (self.stub / "calls").unlink(missing_ok=True)
+                (self.root / "state" / "aid" / "foo.service").unlink(missing_ok=True)  # one first aid per unit per hour
+                self.set_state(gone.format(invocation))
+                result = self.repair("foo.service")
+                self.assertEqual("finished successfully (inactive/dead), nothing to repair" in result.stdout, finished, result.stdout)
+                self.assertEqual("systemctl --user restart --no-block foo.service" in self.calls(), not finished)
+                self.assertFalse(marker.exists())
+        # without a marker the same state is a unit that finished
+        self.set_state(gone.format(""))
+        self.assertIn("finished successfully (inactive/dead), nothing to repair", self.repair("foo.service").stdout)
+
+    def test_a_query_that_fails_after_first_aid_is_left_to_the_next_scan(self):
+        self.set_state()
+        (self.stub / "show-fails-after-restart").write_text("")
+        result = self.repair("foo.service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cannot query the unit after the first aid", result.stdout)
+        self.assertEqual(self.launches(), [])
+
+    def test_a_unit_whose_state_could_not_be_read_after_first_aid_is_looked_at_again_by_the_scan(self):
+        # the incident must not be lost: first aid may have left the unit inactive, and the scan lists only failed and looping units
+        self.set_state()
+        (self.stub / "show-fails-after-restart").write_text("")
+        self.repair("odroidn2:system:foo.service")
+        recheck = self.recheck_marker("odroidn2:system:foo.service")
+        self.assertEqual(recheck.read_text().split(), ["odroidn2:system:foo.service", "old"])  # the instance and the invocation of the failure it saw
+        (self.stub / "show-fails").unlink()
+        result = subprocess.run(["bash", str(SCAN)], capture_output=True, text=True,
+                                env={**self.env, "SERVICE_FAILOVER_HOSTS": str(self.root / "no-such-hosts")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("service-failover-repair@odroidn2:system:foo.service.service", [c.split("--no-block ")[1] for c in self.calls() if "--no-block" in c and "repair@" in c])
+        self.assertTrue(recheck.exists())  # kept: only a repair run that has read the unit takes it away
+        # a refused request or a repair that is already running leaves it as well; a run that can read the unit consumes it
+        (self.stub / "instance-state").write_text("activating\n")
+        subprocess.run(["bash", str(SCAN)], capture_output=True, text=True, env={**self.env, "SERVICE_FAILOVER_HOSTS": str(self.root / "no-such-hosts")})
+        (self.stub / "instance-state").unlink()
+        self.assertTrue(recheck.exists())
+        (self.stub / "show-fails").write_text("")  # the host still does not answer: the marker survives that run too
+        self.repair("odroidn2:system:foo.service")
+        self.assertTrue(recheck.exists())
+        (self.stub / "show-fails").unlink()
+        self.repair("odroidn2:system:foo.service")
+        self.assertFalse(recheck.exists())
+
+    def test_instances_that_sanitize_to_one_key_keep_their_own_recheck_markers(self):
+        # `odroidn2:system:foo.service` (a unit of the host odroidn2) and a local unit `odroidn2_system_foo.service` share a key
+        self.set_state()
+        (self.stub / "show-fails-after-restart").write_text("")
+        self.repair("odroidn2:system:foo.service")
+        remote = self.recheck_marker("odroidn2:system:foo.service")
+        self.assertTrue(remote.exists())
+        (self.stub / "show-fails-after-restart").unlink()
+        (self.stub / "show-fails").unlink()
+        (self.root / "state" / "aid" / "odroidn2_system_foo.service").unlink()  # the aid interval of the first run is over
+        self.repair("odroidn2_system_foo.service")
+        self.assertTrue(remote.exists(), "a run for another instance must not remove the marker of the remote one")
+        self.assertEqual(remote.read_text().split(), ["odroidn2:system:foo.service", "old"])
+
+    def test_a_recheck_does_not_mistake_the_failure_first_aid_cleared_for_a_run_that_finished(self):
+        # failed before the main process ran (no exit status), the start limit refused the unit, reset-failed cleared the failed state,
+        # a failed dependency kept the restart from starting, and then the host did not answer: inactive/success, same invocation
+        self.set_state(FAILED_STATE.replace("Result=exit-code", "Result=start-limit-hit"))
+        (self.stub / "dep-refused").write_text("")
+        (self.stub / "show-fails-after-restart").write_text("")
+        self.repair("foo.service")
+        self.assertEqual(self.launches(), [])
+        (self.stub / "show-fails").unlink()
+        self.assertIn("InvocationID=old", (self.stub / "state").read_text())
+        self.repair("foo.service")
+        self.assertEqual(len(self.launches()), 1)
+        # without the marker the same state is a unit that finished
+        self.set_state("InvocationID=old\nActiveState=inactive\nSubState=dead\nResult=success\nFragmentPath=/home/u/.config/systemd/user/bar.service\nTransient=no\n")
+        self.assertIn("finished successfully", self.repair("bar.service").stdout)
+
+    def test_a_hung_journal_neither_stalls_the_repair_nor_keeps_its_lock(self):
+        self.set_state()
+        (self.stub / "journal-hangs").write_text("")
+        started = time.monotonic()
+        result = self.repair("foo.service", SERVICE_FAILOVER_PROBE_S="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(self.launches()), 1)
+        # the child that outlived the timeout (a new session, still sleeping) must not hold the one-session lock
+        with open(self.root / "state" / "lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class ScanTest(Base):
@@ -778,7 +999,8 @@ class InstallTest(Base):
     def setUp(self):
         super().setUp()
         self.dirs = {"SERVICE_FAILOVER_UNIT_DIR": str(self.root / "u"), "SERVICE_FAILOVER_BIN_DIR": str(self.root / "b"),
-                     "SERVICE_FAILOVER_CONFIG_DIR": str(self.root / "c"), "SERVICE_FAILOVER_ETC_DIR": str(self.root / "etc")}
+                     "SERVICE_FAILOVER_CONFIG_DIR": str(self.root / "c"), "SERVICE_FAILOVER_ETC_DIR": str(self.root / "etc"),
+                     "SERVICE_FAILOVER_INSTALL_LOCK": str(self.root / "install.lock")}
         skill = self.root / "home" / ".agents" / "skills" / "rig-detached-omp"
         skill.mkdir(parents=True)
         (skill / "rig-detached-omp").write_text("#!/bin/sh\n")
@@ -930,6 +1152,219 @@ class InstallTest(Base):
         self.assertEqual(self.run_install(config='{"nope": 1}').returncode, 1)
         self.assertEqual(self.run_install(config='{"restart_units": ["a b"]}').returncode, 1)
         self.assertEqual(self.run_install(config='{"repair": "yes"}').returncode, 1)
+        self.assertEqual(self.run_install(config='[]').returncode, 1)
+
+    def test_options_that_are_not_valid_json_change_nothing(self):
+        config = '{"hosts": ["odroidn2"]}'
+        self.run_install(config=config)
+        before = sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*") if p.is_file() and "stub" not in p.parts)
+        result = self.run_install(config="{bad json")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not valid JSON", result.stderr)
+        self.assertEqual(sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*") if p.is_file() and "stub" not in p.parts), before)
+        self.assertEqual(self.run_install("--check", config=config).returncode, 0)
+
+    def test_an_enabled_but_stopped_timer_is_started_again(self):
+        self.run_install()
+        (self.stub / "timer-stopped").write_text("")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        self.assertIn("not active: service-failover-scan.timer", check.stdout)
+        self.assertIn("started: service-failover-scan.timer", self.run_install().stdout)
+        self.assertIn("systemctl --user start service-failover-scan.timer", self.calls())
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    def test_a_timer_that_failed_its_first_start_is_started_by_the_next_run(self):
+        (self.stub / "enable-fails").write_text("")
+        self.assertEqual(self.run_install().returncode, 1)
+        (self.stub / "enable-fails").unlink()
+        retry = self.run_install()
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIn("started: service-failover-scan.timer", retry.stdout)
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
+    NAME = "service-failover-autoheal"
+    COMPOSE = str(MODULE / "docker" / "autoheal.compose.yaml")
+
+    def autoheal(self, name=NAME):
+        path = self.stub / "containers" / name
+        return path.read_text().strip().split("|") if path.exists() else None  # id, project, compose file, image, running
+
+    def put_container(self, name, line):
+        (self.stub / "containers").mkdir(exist_ok=True)
+        (self.stub / "containers" / name).write_text(line + "\n")
+
+    def docker_changes(self, since=0):
+        return [c for c in self.calls()[since:] if c.startswith(("docker compose", "docker rm", "docker rename"))]
+
+    def test_autoheal_is_brought_up_once_and_only_an_explicit_false_removes_it(self):
+        on = '{"autoheal": true}'
+        self.assertIn(f"not running: docker container {self.NAME}", self.run_install("--check", config=on).stdout)
+        self.assertEqual(self.run_install(config=on).returncode, 0)
+        container = self.autoheal()
+        self.assertEqual(container[1:3], [self.NAME, self.COMPOSE])
+        # the project is named explicitly: COMPOSE_PROJECT_NAME of the caller's environment cannot rename it, and the
+        # start waits until the container is up (a container that dies at once is not "started")
+        self.assertTrue(any(c.startswith(f"docker compose -p {self.NAME} -f ") and " up -d --wait" in c for c in self.calls()))
+        self.assertEqual(self.run_install("--check", config=on).returncode, 0)
+        calls = len(self.calls())
+        self.assertEqual(self.run_install(config=on).returncode, 0)
+        self.assertEqual(self.docker_changes(calls), [])
+        # an option that was never set (the odroid is run by hand with --autoheal only) does not remove it
+        for args, config in ((("--restart-only",), None), ((), "{}")):
+            self.assertEqual(self.run_install(*args, config=config).returncode, 0)
+            self.assertEqual(self.run_install("--check", *args, config=config).returncode, 0)
+        self.assertEqual(self.docker_changes(calls), [])
+        off = '{"autoheal": false}'
+        check = self.run_install("--check", config=off)
+        self.assertEqual(check.returncode, 3)
+        self.assertIn(f"running: docker container {self.NAME} (the autoheal option is off)", check.stdout)
+        self.assertEqual(self.run_install(config=off).returncode, 0)
+        self.assertIn(f"docker rm -f {container[0]}", self.calls())  # by id: the name may have been taken by another container meanwhile
+        self.assertIsNone(self.autoheal())
+        self.assertEqual(self.run_install("--check", config=off).returncode, 0)
+
+    def test_a_legacy_autoheal_container_of_this_module_is_removed_after_the_replacement_runs(self):
+        on = '{"autoheal": true}'
+        # what the previous version of this module's file created: the same project, service and container name `autoheal`
+        legacy = f"id-old|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.2.0@sha256:{'1' * 64}|true"
+        self.put_container("autoheal", legacy)
+        self.assertIn("stale: docker container autoheal (an earlier copy", self.run_install("--check", config=on).stdout)
+        self.assertEqual(self.run_install(config=on).returncode, 0)
+        calls = self.calls()
+        self.assertLess(calls.index(next(c for c in calls if " up -d" in c)), calls.index("docker rm -f id-old"))  # removed once the new one runs
+        self.assertEqual(self.autoheal()[1], self.NAME)
+        self.assertIsNone(self.autoheal("autoheal"))
+        self.assertFalse([c for c in calls if c.startswith("docker rename")])  # nothing is ever set aside
+        self.assertEqual(self.run_install("--check", config=on).returncode, 0)
+        # a replacement that does not start, or does not stay up: the old container is not removed
+        for failing in ("up-fails", "wait-fails"):
+            with self.subTest(failing=failing):
+                (self.stub / "containers" / self.NAME).unlink(missing_ok=True)
+                self.put_container("autoheal", legacy)
+                (self.stub / failing).write_text("")
+                since = len(self.calls())
+                result = self.run_install(config=on)
+                self.assertEqual(result.returncode, 10, result.stderr)
+                self.assertIn("docker compose up", result.stderr)
+                self.assertEqual(self.autoheal("autoheal"), legacy.split("|"))
+                self.assertNotIn("docker rm -f id-old", self.calls()[since:])
+                (self.stub / failing).unlink()
+        # with autoheal off, the legacy container goes too
+        (self.stub / "containers" / self.NAME).unlink(missing_ok=True)
+        off = '{"autoheal": false}'
+        self.assertIn("running: docker container autoheal (the autoheal option is off)", self.run_install("--check", config=off).stdout)
+        self.assertEqual(self.run_install(config=off).returncode, 0)
+        self.assertIsNone(self.autoheal("autoheal"))
+
+    def test_a_removal_that_could_not_be_confirmed_is_not_reported_as_done(self):
+        self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 0)
+        container = self.autoheal()
+        (self.stub / "rm-disconnects").write_text("")
+        result = self.run_install(config='{"autoheal": false}')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("removed:", result.stdout)
+        self.assertEqual(self.autoheal(), container)
+        # a legacy container is treated the same way
+        (self.stub / "no-docker").unlink()
+        self.put_container("autoheal", f"id-old|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.2.0|true")
+        result = self.run_install(config='{"autoheal": true}')  # the replacement starts; removing the legacy one loses the daemon
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertNotIn("removed:", result.stdout)
+        self.assertIsNotNone(self.autoheal("autoheal"))
+
+    def test_a_failed_inspection_is_not_taken_for_an_absent_container(self):
+        self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 0)
+        container = self.autoheal()
+        (self.stub / "inspect-denied").write_text("")  # the daemon answers and lists the container, but inspect is refused
+        check = self.run_install("--check", config='{"autoheal": false}')
+        self.assertEqual(check.returncode, 3, check.stdout)
+        self.assertIn("unknown: docker is not reachable", check.stdout)
+        result = self.run_install(config='{"autoheal": false}')
+        self.assertEqual(result.returncode, 10, result.stdout)
+        self.assertNotIn("removed:", result.stdout)
+        self.assertEqual(self.autoheal(), container)
+        # a legacy container that cannot be inspected is not "not there" either
+        self.put_container("autoheal", f"id-old|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.2.0|true")
+        (self.stub / "containers" / self.NAME).unlink()
+        result = self.run_install(config='{"autoheal": true}')  # the new one starts; whether the old one exists cannot be told
+        self.assertEqual(result.returncode, 10, result.stdout)
+        self.assertIn("docker cannot tell whether an earlier autoheal container exists", result.stderr)
+        self.assertIsNotNone(self.autoheal("autoheal"))
+        (self.stub / "inspect-denied").unlink()
+        (self.stub / "containers" / self.NAME).unlink()
+        self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 0)  # the new container is up, the old one removed
+        self.assertIsNone(self.autoheal("autoheal"))
+
+    def test_compose_is_told_not_to_remove_orphans_so_the_legacy_container_survives_a_failed_replacement(self):
+        legacy = f"id-old|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.2.0|true"
+        self.put_container("autoheal", legacy)
+        (self.stub / "up-fails").write_text("")
+        result = self.run_install(config='{"autoheal": true}', COMPOSE_REMOVE_ORPHANS="true")
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertTrue(any("--remove-orphans=false" in c for c in self.calls() if " up " in c))
+        self.assertEqual(self.autoheal("autoheal"), legacy.split("|"))
+
+    def test_a_stopped_or_changed_container_of_this_project_is_left_to_compose(self):
+        # compose finds a container by its project labels: `up` restarts or recreates it, nothing is removed or set aside by hand
+        for state in (f"id-s|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.2.0@sha256:{'0' * 64}|false",
+                      f"id-s|{self.NAME}|{self.COMPOSE}|willfarrell/autoheal:1.1.0|true"):
+            with self.subTest(container=state):
+                self.put_container(self.NAME, state)
+                since = len(self.calls())
+                self.assertIn(f"stale: docker container {self.NAME}", self.run_install("--check", config='{"autoheal": true}').stdout)
+                self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 0)
+                changes = self.docker_changes(since)
+                self.assertEqual([c.split(" ")[1] for c in changes], ["compose"])
+                self.assertIn(" up -d", changes[0])
+                self.assertEqual(self.autoheal()[4], "true")
+
+    def test_a_container_that_only_carries_the_name_is_never_touched(self):
+        for foreign in ("id-x||someone/else:latest|true", "id-y|monitoring|/srv/monitoring/autoheal.compose.yaml|someone/else:latest|true"):
+            with self.subTest(container=foreign):
+                self.put_container(self.NAME, foreign)
+                since = len(self.calls())
+                self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 10)
+                self.assertEqual(self.run_install(config='{"autoheal": false}').returncode, 0)
+                self.assertEqual(self.autoheal(), foreign.split("|"))
+                self.assertEqual(self.docker_changes(since), [])
+
+    def test_an_unreachable_docker_is_reported_when_autoheal_is_switched_on_or_off_and_ignored_otherwise(self):
+        (self.stub / "no-docker").write_text("")
+        self.assertEqual(self.run_install(config='{"autoheal": true}').returncode, 10)
+        # off explicitly: the container may still be running, so a daemon that cannot be asked is not "removed"
+        off = self.run_install("--check", config='{"autoheal": false}')
+        self.assertEqual(off.returncode, 3)
+        self.assertIn("unknown: docker is not reachable", off.stdout)
+        self.assertEqual(self.run_install(config='{"autoheal": false}').returncode, 10)
+        # never configured: docker is not even asked
+        since = len(self.calls())
+        for config in (None, "{}"):
+            self.assertEqual(self.run_install(config=config).returncode, 0)
+        self.assertEqual([c for c in self.calls()[since:] if c.startswith("docker")], [])
+
+    def test_a_host_without_a_docker_client_needs_manual_work_only_when_autoheal_is_switched_on(self):
+        # every real tool but docker, so `command -v docker` finds nothing (the machine running the tests may have one)
+        bare = self.root / "no-docker-bin"
+        bare.mkdir()
+        for directory in os.environ["PATH"].split(":"):
+            if not os.path.isdir(directory):
+                continue
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name != "docker" and not os.path.lexists(bare / entry.name):
+                        (bare / entry.name).symlink_to(entry.path)
+        for name in ("systemctl", "journalctl", "ssh"):
+            (bare / name).unlink(missing_ok=True)
+            (bare / name).symlink_to(self.bin / name)
+        env = {"PATH": str(bare)}
+        on = self.run_install(config='{"autoheal": true}', **env)
+        self.assertEqual(on.returncode, 10, on.stderr)
+        self.assertIn("docker is missing or not accessible", on.stderr)
+        # no client: no container can be running, so switching it off has nothing to remove
+        self.assertEqual(self.run_install("--check", config='{"autoheal": false}', **env).returncode, 0)
+        self.assertEqual(self.run_install(config='{"autoheal": false}', **env).returncode, 0)
+        self.assertEqual([c for c in self.calls() if c.startswith("docker")], [])
 
 
 if __name__ == "__main__":

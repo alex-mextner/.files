@@ -17,7 +17,7 @@
 #   repair         bool     install the repair stack (OnFailure=, repair template, scan timer, scripts)   (default true)
 #   hosts          [string] ssh hosts the scan watches besides this one; written to ~/.config/service-failover/hosts
 #   restart_units  [string] user units that need Restart=on-failure from this module because they have none
-#   autoheal       bool     docker autoheal container                                                    (default false)
+#   autoheal       bool     docker autoheal container; false removes the one this module created          (default false)
 #
 # Test hooks: SERVICE_FAILOVER_UNIT_DIR / _BIN_DIR / _CONFIG_DIR / _ETC_DIR move the install locations; SERVICE_FAILOVER_NOTIFY
 # names the desktop notifier --check looks for (default notify-send).
@@ -50,17 +50,21 @@ print("\n".join(map(str, v)) if isinstance(v, list) else str(v).lower() if isins
 }
 bad=$("$py" -B -c 'import json, os, re
 t = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
+assert isinstance(t, dict), "options must be a table"
 p = [f"unknown option {k}" for k in sorted(set(t) - {"repair", "hosts", "restart_units", "autoheal"})]
 p += [f"{k} must be a boolean" for k in ("repair", "autoheal") if k in t and not isinstance(t[k], bool)]
-for k, pat in (("hosts", r"[A-Za-z0-9._@-]+"), ("restart_units", r"[A-Za-z0-9:_.@-]+\.service")):
+for k, pat in (("hosts", r"[A-Za-z0-9._][A-Za-z0-9._-]*"), ("restart_units", r"[A-Za-z0-9:_.@-]+\.service")):
     if k in t and not (isinstance(t[k], list) and all(isinstance(x, str) and re.fullmatch(pat, x) for x in t[k])):
         p.append(f"{k} must be a list of plain names")
-print("; ".join(p))')
+print("; ".join(p))') || { echo "[modules.service-failover] the options are not valid JSON; nothing was changed" >&2; exit 1; }
 [ -z "$bad" ] || { echo "[modules.service-failover] $bad" >&2; exit 1; }
 [ "$(cfg repair true)" = true ] && repair=1 || repair=0
 [ "$cli_restart_only" = 1 ] && repair=0
 [ "$(cfg autoheal false)" = true ] && autoheal=1 || autoheal=0
 [ "$cli_autoheal" = 1 ] && autoheal=1
+# Only an explicit `autoheal = false` removes the container: a host that never configured the option (the odroid, run by
+# hand with --autoheal) is not told to drop it by leaving the flag out.
+autoheal_off=0; [ "$autoheal" = 0 ] && [ "$(cfg autoheal '"absent"')" = false ] && autoheal_off=1
 mapfile -t hosts < <(cfg hosts '[]' | sed '/^$/d')
 mapfile -t user_units < <(cfg restart_units '[]' | sed '/^$/d')
 
@@ -70,6 +74,12 @@ cfg_dir=${SERVICE_FAILOVER_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/service
 etc_dir=${SERVICE_FAILOVER_ETC_DIR:-/etc/systemd/system}
 launcher=$HOME/.agents/skills/rig-detached-omp/rig-detached-omp
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# One install at a time (two `ubuntu-tweak apply` runs, or one by hand beside it): what is inspected below is what is changed.
+if [ "$mode" = install ] && command -v flock >/dev/null; then
+  lock=${SERVICE_FAILOVER_INSTALL_LOCK:-${XDG_RUNTIME_DIR:-$HOME/.cache}/service-failover-install.lock}
+  mkdir -p "$(dirname "$lock")" && exec 8>"$lock" \
+    && { flock -w "${SERVICE_FAILOVER_INSTALL_LOCK_WAIT:-120}" 8 || { echo "another install of this module holds $lock; nothing was changed" >&2; exit 1; }; }
+fi
 
 # The wanted files: "SRC|DEST|MODE" (SRC is a module file or a generated one under $tmp).
 want=()
@@ -144,6 +154,61 @@ leftover_env=()
 if [ "$level" = user ] && command -v systemctl >/dev/null; then
   mapfile -t leftover_env < <(systemctl --user show-environment 2>/dev/null | sed -n 's/^\(SERVICE_FAILOVER_[A-Za-z0-9_]*\)=.*/\1/p')
 fi
+# The module's container is the compose file's container_name. It is "ours" when docker compose created it from a copy of
+# this module's compose file (its config-file label ends in service-failover/docker/autoheal.compose.yaml: the repository
+# checkout or the odroid's copy); a container that merely carries the name is somebody else's and is never touched.
+# ok = in place; stale = ours, but stopped or another image than the file declares (docker compose up starts or recreates
+# it). Earlier copies of the file named the container `autoheal`: one of those (same label rule) is the module's too and goes
+# once its replacement runs; any other container named autoheal is not ours and not our business.
+compose_file=$here/docker/autoheal.compose.yaml
+compose_project=$(sed -n 's/^name: *//p' "$compose_file" | head -n1); compose_image=$(sed -n 's/^ *image: *//p' "$compose_file" | head -n1)
+compose_name=$(sed -n 's/^ *container_name: *//p' "$compose_file" | head -n1)
+container_info() { # container_info NAME|ID -> id|project|config file|image|running
+  timeout 20 docker container inspect -f '{{.Id}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.config_files"}}|{{.Config.Image}}|{{.State.Running}}' "$1" 2>/dev/null
+}
+# Absent only when docker answers and lists nothing: an inspect that failed for any other reason (timeout, no permission, a
+# daemon that went away) says nothing about whether the container is still there.
+container_absent() { # container_absent NAME|ID
+  local by_name by_id
+  by_name=$(timeout 20 docker container ls -aq --no-trunc --filter "name=^/$1\$") && by_id=$(timeout 20 docker container ls -aq --no-trunc --filter "id=$1") && [ -z "$by_name$by_id" ]
+}
+autoheal_state() { # -> "nodocker" | "noaccess" | "none" | "foreign" | "ok ID" | "stale ID" (ID: handled by id, not by name)
+  command -v docker >/dev/null || { echo nodocker; return; }
+  local info id proj files image running
+  info=$(container_info "$compose_name") || { container_absent "$compose_name" && echo none || echo noaccess; return; }
+  IFS='|' read -r id proj files image running <<<"$info"
+  case "$files" in */service-failover/docker/autoheal.compose.yaml) ;; *) echo foreign; return ;; esac
+  if [ "$proj" = "$compose_project" ] && [ "$image" = "$compose_image" ] && [ "$running" = true ]; then echo "ok $id"; else echo "stale $id"; fi
+}
+legacy_autoheal() { # the id of an `autoheal` container that an earlier copy of this module's compose file created, if any; ? when docker cannot say
+  local info id proj files rest
+  info=$(container_info autoheal) || { container_absent autoheal || echo '?'; return 0; }
+  IFS='|' read -r id proj files rest <<<"$info"
+  case "$files" in */service-failover/docker/autoheal.compose.yaml) echo "$id" ;; esac
+}
+remove_container() { # remove_container ID: removed, or confirmed gone (another run was first); a docker that cannot be asked is neither
+  docker rm -f "$1" >/dev/null 2>&1 && return 0
+  container_absent "$1"
+}
+legacy_drift() { # legacy_drift TEXT: the drift line for a present earlier `autoheal` container
+  case "$lg_id" in "") ;; "?") drift+=("unknown: docker cannot tell whether an earlier autoheal container exists") ;; *) drift+=("$1") ;; esac
+}
+legacy_remove() { # legacy_remove WHAT: removes the earlier `autoheal` container
+  case "$lg_id" in
+    "") ;;
+    "?") echo "needs manual: docker cannot tell whether an earlier autoheal container exists, so it was not removed" >&2; rc=10 ;;
+    *) if remove_container "$lg_id"; then echo "removed: $1"; else echo "cannot remove the earlier autoheal container" >&2; rc=1; fi ;;
+  esac
+}
+# docker is asked only when the option is being switched on or off explicitly: an install that never configured autoheal
+# must not wait for (or fail on) a docker daemon it does not use.
+# No docker client at all means nothing to remove when the option is off (a host that never had docker must not be
+# reported as needing manual work for ever); an unreachable daemon behind an installed client is "unknown", see below.
+ah=none; ah_id=; lg_id=
+if [ "$level" = user ] && { [ "$autoheal" = 1 ] || [ "$autoheal_off" = 1 ]; }; then
+  read -r ah ah_id <<<"$(autoheal_state)"
+  case "$ah" in none|ok|stale|foreign) lg_id=$(legacy_autoheal) ;; esac
+fi
 drift=()
 for w in "${want[@]}"; do
   IFS='|' read -r src dest m <<<"$w"
@@ -156,12 +221,27 @@ if [ "$level" = user ]; then
     [ -x "$launcher" ] || drift+=("missing: $launcher (the sanctioned omp launcher, installed by rig apply; the repair stack cannot start a session without it)")
     command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null || drift+=("missing: ${SERVICE_FAILOVER_NOTIFY:-notify-send} (package libnotify-bin: without it the repair stack cannot tell the user that a service is down)")
     command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ] || drift+=("not enabled: service-failover-scan.timer")
+    # enabled is not running: a stopped timer (a failed first start, a manual stop) leaves the hosts unwatched
+    if command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ] \
+       && [ "$(systemctl --user is-active service-failover-scan.timer 2>/dev/null)" != active ]; then drift+=("not active: service-failover-scan.timer"); fi
   fi
   if [ "$repair" = 0 ] && command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ]; then
     drift+=("enabled: service-failover-scan.timer (the repair stack is off)")
   fi
   if [ "$autoheal" = 1 ]; then
-    [ "$(docker inspect -f '{{.State.Running}}' autoheal 2>/dev/null)" = true ] || drift+=("not running: docker container autoheal")
+    case "$ah" in
+      ok) ;;
+      foreign) drift+=("needs manual: a container named $compose_name exists that this module did not create") ;;
+      stale) drift+=("stale: docker container $compose_name (stopped, or not the image of docker/autoheal.compose.yaml)") ;;
+      *) drift+=("not running: docker container $compose_name") ;;
+    esac
+    legacy_drift "stale: docker container autoheal (an earlier copy of the compose file named it so; $compose_name replaces it)"
+  elif [ "$autoheal_off" = 1 ]; then
+    case "$ah" in
+      ok|stale) drift+=("running: docker container $compose_name (the autoheal option is off)") ;;
+      noaccess) drift+=("unknown: docker is not reachable, so the autoheal container cannot be checked (the autoheal option is off)") ;;
+    esac
+    legacy_drift "running: docker container autoheal (the autoheal option is off)"
   fi
 fi
 
@@ -212,12 +292,31 @@ for v in "${leftover_env[@]}"; do systemctl --user unset-environment "$v" && ech
 if [ "$repair" = 1 ]; then
   if [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" != enabled ]; then
     systemctl --user enable --now service-failover-scan.timer >/dev/null && echo "enabled: service-failover-scan.timer" || rc=1
+  elif [ "$(systemctl --user is-active service-failover-scan.timer 2>/dev/null)" != active ]; then
+    systemctl --user start service-failover-scan.timer && echo "started: service-failover-scan.timer" || rc=1
   fi
   if [ ! -x "$launcher" ]; then echo "needs manual: $launcher is missing (rig apply installs the rig-detached-omp skill); the repair stack is in place but cannot start a session" >&2; rc=10; fi
   if ! command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null; then echo "needs manual: ${SERVICE_FAILOVER_NOTIFY:-notify-send} is missing (apt install libnotify-bin); the repair stack is in place but cannot tell you that a service is down" >&2; rc=10; fi
 fi
-if [ "$autoheal" = 1 ] && [ "$(docker inspect -f '{{.State.Running}}' autoheal 2>/dev/null)" != true ]; then
-  if docker compose -f "$here/docker/autoheal.compose.yaml" up -d >/dev/null 2>&1; then echo "started: docker container autoheal"
-  else echo "needs manual: docker compose up of docker/autoheal.compose.yaml failed (docker missing or no access)" >&2; rc=10; fi
+if [ "$autoheal" = 1 ]; then
+  up_ok=0
+  case "$ah" in
+    ok) up_ok=1 ;;
+    foreign) echo "needs manual: a container named $compose_name exists that this module did not create; remove it, then run this again" >&2; rc=10 ;;
+    nodocker|noaccess) echo "needs manual: docker is missing or not accessible" >&2; rc=10 ;;
+    *)
+      # stale: docker compose starts it, or recreates it for another image. The earlier `autoheal` container is an orphan of this
+      # project: COMPOSE_REMOVE_ORPHANS (environment or .env) must not make compose delete it before its replacement runs.
+      if docker compose -p "$compose_project" -f "$compose_file" up -d --wait --wait-timeout 60 --remove-orphans=false >/dev/null 2>&1; then echo "started: docker container $compose_name"; up_ok=1
+      else echo "needs manual: docker compose up of docker/autoheal.compose.yaml failed, or the container did not stay up (no docker access, or the image cannot be pulled)" >&2; rc=10; fi ;;
+  esac
+  # the earlier `autoheal` container goes only once its replacement runs: until then it is the one that is working
+  if [ "$up_ok" = 1 ]; then legacy_remove "docker container autoheal (replaced by $compose_name)"; fi
+elif [ "$autoheal_off" = 1 ]; then
+  case "$ah" in
+    ok|stale) if remove_container "$ah_id"; then echo "removed: docker container $compose_name"; else echo "cannot remove the $compose_name container" >&2; rc=1; fi ;;
+    noaccess) echo "needs manual: docker is not reachable, so the autoheal container could not be checked or removed (the autoheal option is off)" >&2; rc=10 ;;
+  esac
+  legacy_remove "docker container autoheal"
 fi
 exit "$rc"
