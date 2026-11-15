@@ -1,5 +1,5 @@
 [Unit]
-Description=Every 30 min: refresh HSW editor preview if inputs changed
+Description=Every 30 min: refresh the HSW editor preview if hsw-editor main moved
 
 [Timer]
 OnBootSec=3min

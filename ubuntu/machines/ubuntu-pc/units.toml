@@ -18,4 +18,10 @@ enable = [
   "dc-mcp-bridge.service",
   "dc-mcp-shim.service",
   "dc-mcp-tunnel.service",
+  # HSW editor preview on the tailnet (issue #183): files/.local/bin/hsw-editor-preview-refresh builds hsw-editor main from
+  # GitHub into ~/.local/state/hsw-editor-preview (no local checkout needed). On a new machine the preview start is skipped
+  # by its condition (so it shows pending) until the timer's first good build, which starts it. That build needs tailscale
+  # logged in (the proxy binds the tailnet address); until then the refresh fails with exit 1 every 30 minutes.
+  "hsw-editor-preview-refresh.timer",
+  "hsw-editor-preview.service",
 ]

@@ -1,21 +1,28 @@
+# Ticket https://github.com/alex-mextner/.files/issues/183. `current` is the last build hsw-editor-preview-refresh smoke
+# tested and swapped in; until the first refresh there is none and the start is skipped (the refresh restarts it).
+# tailnet-bind-exec resolves this PC's tailnet address at start (100.75.131.84 when written) and fails until tailscaled
+# has one; StartLimitIntervalSec=0 keeps Restart= retrying that long (as ha-host-actions does).
 [Unit]
-Description=HSW editor WIP preview (daemon on loopback, proxy on tailnet IP)
-After=network-online.target tailscaled.service
+Description=HSW editor preview of hsw-editor main (daemon on 127.0.0.1:8944, proxy on the tailnet address port 8943)
+ConditionPathExists=%h/.local/state/hsw-editor-preview/current/src/apps/server/src/preview.ts
+StartLimitIntervalSec=0
 
 [Service]
-WorkingDirectory=%h/.cache/hsw-editor/preview/current/src
-ExecStart=%h/.local/bin/bun apps/server/src/preview.ts
+WorkingDirectory=%h/.local/state/hsw-editor-preview/current/src
+# bun is looked up in PATH by tailnet-bind-exec: ~/.bun/bin (bun's own installer) or Linuxbrew.
+ExecStart=%h/.local/bin/tailnet-bind-exec HSW_PREVIEW_PUBLIC_HOST bun apps/server/src/preview.ts
 Restart=always
 RestartSec=2
-Environment=PATH=/home/ultra/.local/bin:/home/ultra/.local/bin:/home/ultra/.bun/bin:/home/ultra/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.nvm/versions/node/v24.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
-Environment=HSW_EDITOR_HOME=%h/.cache/hsw-editor/preview/home
-Environment=HSW_EDITOR_DATA_DIR=%h/.cache/hsw-editor/preview/home/data
-Environment=HSW_EDITOR_CACHE_DIR=%h/.cache/hsw-editor/preview/home/cache
-Environment=HSW_BANK_DIR=%h/.cache/hsw-editor/preview/home/data/bank
+# PATH and the values below are mirrored in hsw-editor-preview-refresh (its PATH and daemon_env), which starts the smoke
+# run and bank adopt with them.
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HSW_EDITOR_HOME=%h/.local/state/hsw-editor-preview/home
+Environment=HSW_EDITOR_DATA_DIR=%h/.local/state/hsw-editor-preview/home/data
+Environment=HSW_EDITOR_CACHE_DIR=%h/.local/state/hsw-editor-preview/home/cache
+Environment=HSW_BANK_DIR=%h/.local/state/hsw-editor-preview/home/data/bank
 Environment=HSW_EDITOR_PORT=8944
 Environment=HSW_EDITOR_HOST=127.0.0.1
-Environment=HSW_EDITOR_WEB_DIST=%h/.cache/hsw-editor/preview/current/src/apps/web/dist
-Environment=HSW_PREVIEW_PUBLIC_HOST=100.75.131.84
+Environment=HSW_EDITOR_WEB_DIST=%h/.local/state/hsw-editor-preview/current/src/apps/web/dist
 Environment=HSW_PREVIEW_PUBLIC_PORT=8943
 
 [Install]

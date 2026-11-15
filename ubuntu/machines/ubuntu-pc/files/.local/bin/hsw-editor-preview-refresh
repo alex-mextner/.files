@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# hsw-editor-preview-refresh: keeps the HSW editor preview (hsw-editor-preview.service) on the newest main of
+# hsw-editor, with near-zero downtime. Ticket https://github.com/alex-mextner/.files/issues/183.
+#
+#   hsw-editor-preview-refresh [check]   timer entry: build when main or this profile's preview.ts changed since the
+#                                        last good build, or when nothing serves (state wiped); a candidate rejected
+#                                        before is not retried while a previous build serves
+#   hsw-editor-preview-refresh build     build now, also a rejected candidate
+#   HSW_PREVIEW_REPO_URL=<url> ...       build the main branch of another repository (default: hsw-editor on GitHub);
+#                                        a throwaway local repository with a broken commit proves the rollback
+#
+# A build: `git archive` of the commit into builds/<stamp>/src, `bun install`, the bank seed integrity gate, `bun run
+# build`, then this profile's preview.ts copied in and a smoke run as a transient unit on a throwaway port with a
+# throwaway home, through its own preview proxy (daemon health, the web app root, walls, bank index, deep bank health,
+# the proxy refusing a foreign Origin for HTTP and WebSocket). Only then the `current` link is swapped and the service
+# restarted; unless the daemon and its tailnet proxy stay healthy, `current` is swapped back (also when the run is
+# interrupted before the health check confirmed it). The candidate is recorded only after a healthy swap.
+#
+# Exit codes:
+#   0  refreshed, or nothing to do
+#   3  verdict on the candidate: its lockfile, layout, bank seed, build, smoke test or post-swap health failed, and the
+#      previous build keeps serving. Remembered in rejected-sha, and declared final in the unit
+#      (RestartPreventExitStatus=3), so service-failover does not start a repair session for an upstream commit the
+#      gate refused as designed.
+#   1  anything else: the machine or the network failed (GitHub, disk, tailscale, a process killed by a signal, e.g.
+#      earlyoom), or the preview is down (no healthy build after a rollback, or a rejected candidate with nothing to
+#      serve). Not remembered.
+#   2  usage
+#
+# Everything lives under ~/.local/state/hsw-editor-preview (not ~/.cache, whose cleanup once deleted the whole preview):
+#   repo.git  bare mirror the builds are archived from     builds/  the 2 newest builds     current -> builds/<stamp>
+#   home/     the preview's wall and bank data              last-sha  "<commit> <sha256 of preview.ts>" now serving
+#   rejected-sha  the last rejected candidate, same format   refresh.log  one line per run that built, with its log
+#   failed/last-failure.log  detailed log of the last failure
+# Each run writes its detailed log to /tmp/hsw-editor-preview-refresh-<mode>-<stamp>-<random>.log (0600, created by
+# mktemp; own logs older than 7 days are pruned) and prints the path at start and end.
+set -uo pipefail
+umask 077
+
+# The units hard-code %h/.local/state/hsw-editor-preview, so XDG_STATE_HOME is deliberately not followed.
+STATE=$HOME/.local/state/hsw-editor-preview
+REPO_URL=${HSW_PREVIEW_REPO_URL:-https://github.com/alex-mextner/hsw-editor.git}
+SERVICE=hsw-editor-preview
+SMOKE_UNIT=hsw-editor-preview-smoke
+LOOPBACK_PORT=8944   # HSW_EDITOR_PORT of hsw-editor-preview.service
+PUBLIC_PORT=8943     # HSW_PREVIEW_PUBLIC_PORT of hsw-editor-preview.service
+SMOKE_PORT=18950     # daemon of the smoke run; its proxy listens on SMOKE_PORT+1
+# The PATH of hsw-editor-preview.service: a manual run builds and smoke-tests with the toolchain the service runs on.
+export PATH=$HOME/.local/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+export GIT_TERMINAL_PROMPT=0
+# The script is linked into ~/.local/bin from ~/.files; preview.ts sits next to it in the same files/ tree.
+PREVIEW_TS=$(dirname "$(readlink -f "$0")")/../share/hsw-editor-preview/preview.ts
+
+MODE=${1:-check}
+case $MODE in
+  check|build) ;;
+  -h|--help) sed -n '2,/^[^#]/{/^[^#]/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "usage: hsw-editor-preview-refresh [check|build]" >&2; exit 2 ;;
+esac
+
+find /tmp -maxdepth 1 -name 'hsw-editor-preview-refresh-*.log' -user "$(id -u)" -mtime +7 -delete 2>/dev/null
+STARTED=$(date +%s)
+LOG=$(mktemp "/tmp/hsw-editor-preview-refresh-$MODE-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") \
+  || { echo "hsw-editor-preview-refresh: cannot create a log file in /tmp" >&2; exit 1; }
+
+CANDIDATE=    # "<commit> <preview.ts sha256>" being built
+BUILD=        # build directory of this run; removed at exit unless `current` points at it
+PREV=         # what `current` pointed to before the swap
+VERIFIED=     # the swapped-in build passed the health check
+SMOKE_HOME=   # throwaway home of the smoke run, set while the smoke unit (ours) may run
+
+say() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG" >&2; }
+
+# Runs one stage with its full output in the log; on failure the end of that output also goes to the terminal. The
+# lock descriptor is closed for the stage, so a background process a build tool leaves behind cannot keep the lock.
+stage() {
+  local name=$1 t0 rc mark; shift
+  t0=$(date +%s)
+  say "stage $name: start"
+  printf -- '--- %s: %s\n' "$name" "$*" >> "$LOG"
+  mark=$(wc -l < "$LOG")
+  "$@" >> "$LOG" 2>&1 9>&-; rc=$?
+  [ "$rc" = 0 ] || tail -n "+$((mark + 1))" "$LOG" | tail -n 30 >&2
+  say "stage $name: rc=$rc after $(( $(date +%s) - t0 ))s"
+  return "$rc"
+}
+
+has_current_build() { [ -f "$STATE/current/src/apps/server/src/preview.ts" ]; }
+current_is_build() { [ -n "$BUILD" ] && [ "$(readlink "$STATE/current" 2>/dev/null)" = "$BUILD" ]; }
+swap_to() { ln -sfn "$1" "$STATE/current.new" && mv -T "$STATE/current.new" "$STATE/current"; }
+record() {
+  mkdir -p "$STATE/failed" && cp "$LOG" "$STATE/failed/last-failure.log"
+  printf '%s %s %s (%s) log %s\n' "$(date -Is)" "$1" "${CANDIDATE:-?}" "$2" "$LOG" >> "$STATE/refresh.log"
+}
+# down <why>: the preview itself is not serving.
+down() { say "PREVIEW DOWN ($1)"; record DOWN "$1"; exit 1; }
+# reject <why>: a verdict on the candidate (exit 3); with no previous build to serve, the preview is down.
+reject() {
+  echo "$CANDIDATE" > "$STATE/rejected-sha"
+  has_current_build || down "the candidate was rejected ($1) and there is no previous build"
+  say "REFRESH REJECTED ($1), the previous build keeps serving"; record REJECTED "$1"; exit 3
+}
+# fail <why>: not a verdict on the candidate (the machine, the network, a killed process).
+fail() {
+  has_current_build || down "$1"
+  say "REFRESH FAILED ($1), the previous build keeps serving"; record FAILED "$1"; exit 1
+}
+# verdict <rc> <why>: a stage killed by a signal (earlyoom prefers bun on this PC) says nothing about the commit.
+verdict() { if [ "$1" -ge 128 ]; then fail "$2 killed (rc $1)"; fi; reject "$2"; }
+# killed <unit>: its last main process died from a signal (CLD_KILLED), not from its own exit or a crash dump.
+killed() { [ "$(systemctl --user show -p ExecMainCode --value "$1")" = 2 ]; }
+
+smoke_stop() {
+  systemctl --user stop "$SMOKE_UNIT" >/dev/null 2>&1
+  systemctl --user reset-failed "$SMOKE_UNIT" >/dev/null 2>&1
+  [ -z "$SMOKE_HOME" ] || rm -rf "$SMOKE_HOME"
+  SMOKE_HOME=
+}
+on_exit() {
+  local rc=$?
+  [ -z "$SMOKE_HOME" ] || smoke_stop
+  # Interrupted (timeout, stop, Ctrl-C) between the swap and a confirmed health check: put the previous build back,
+  # otherwise the unverified build would serve and become the next run's rollback target.
+  if current_is_build && [ -z "$VERIFIED" ]; then
+    if [ -n "$PREV" ] && [ -d "$PREV" ]; then swap_to "$PREV"; else rm -f "$STATE/current"; fi
+    systemctl --user restart "$SERVICE" >/dev/null 2>&1
+    say "interrupted before the health check: current -> ${PREV:-none}"
+  fi
+  [ -z "$BUILD" ] || current_is_build || rm -rf "$BUILD"
+  say "exit $rc after $(( $(date +%s) - STARTED ))s; log: $LOG"
+}
+
+# daemon_env <home> <daemon port> <public host> <public port> <web dist>: the environment of hsw-editor-preview.service.
+daemon_env() {
+  DAEMON_ENV=(HSW_EDITOR_HOME="$1" HSW_EDITOR_DATA_DIR="$1/data" HSW_EDITOR_CACHE_DIR="$1/cache"
+              HSW_BANK_DIR="$1/data/bank" HSW_EDITOR_PORT="$2" HSW_EDITOR_HOST=127.0.0.1
+              HSW_EDITOR_WEB_DIST="$5" HSW_PREVIEW_PUBLIC_HOST="$3" HSW_PREVIEW_PUBLIC_PORT="$4")
+}
+expect_body() {   # name url pattern [curl args]: the response must contain pattern
+  local name=$1 url=$2 pattern=$3 body; shift 3
+  body=$(curl -fsS --max-time 120 "$@" "$url" 2>>"$LOG") && grep -q -- "$pattern" <<<"$body" \
+    && { say "smoke $name: ok"; return 0; }
+  say "smoke $name: FAILED ($url lacks $pattern)"; printf '%s\n' "${body:0:2000}" >> "$LOG"; return 1
+}
+expect_code() {   # name want url [curl args]
+  local name=$1 want=$2 url=$3 code; shift 3
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" "$url")
+  if [ "$code" = "$want" ]; then say "smoke $name: ok ($code)"; return 0; fi
+  say "smoke $name: FAILED (got $code, want $want)"; return 1
+}
+# healthy: called right after a restart. Both the loopback daemon and the tailnet proxy users hit must answer, and
+# keep answering for 10 s without a restart: a build can answer once and then crash on the real home's data. A daemon
+# that dies is restarted by Restart=always and so never looks failed; its exit is read on every pass while systemd
+# holds it in auto-restart (RestartSec=2), before the next start resets it. Returns 1 for a verdict on the build (it
+# crashed, or never answered), 2 when it died from a signal or exited 0 (the daemon's own SIGTERM handler): earlyoom
+# or a stop, no verdict.
+healthy() {
+  local _ restarts ok=0 now
+  restarts=$(systemctl --user show -p NRestarts --value "$SERVICE")
+  for _ in $(seq 1 140); do
+    now=$(systemctl --user show -p SubState -p NRestarts -p ExecMainCode -p ExecMainStatus "$SERVICE")
+    if [[ $now == *SubState=auto-restart* || $now == *SubState=failed* || $now != *NRestarts=$restarts* ]]; then
+      say "the daemon died after the restart: $(tr '\n' ' ' <<<"$now")"
+      # CLD_EXITED (1) with a non-zero status, or CLD_DUMPED (3), is the build's own failure.
+      [[ $now == *ExecMainCode=1* && $now != *ExecMainStatus=0* ]] || [[ $now == *ExecMainCode=3* ]] && return 1
+      # The exit was missed (the next start already reset it): the journal still has failed exits.
+      [[ $now == *ExecMainCode=0* ]] && journalctl --user -u "$SERVICE" --since "@$RESTARTED" -o cat --no-pager \
+        | grep -Eq 'Main process exited, code=(exited, status=[1-9]|dumped)' && return 1
+      return 2
+    fi
+    if curl -fsS --max-time 2 "http://127.0.0.1:$LOOPBACK_PORT/api/health" >/dev/null 2>&1 \
+      && curl -fsS --max-time 2 "http://$TAILNET_IP:$PUBLIC_PORT/api/health" >/dev/null 2>&1; then
+      ok=$((ok + 1)); [ $ok -ge 20 ] && return 0
+    else
+      ok=0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Until the lock is held only the log line; on_exit takes over after flock below.
+trap 'say "exit $? after $(( $(date +%s) - STARTED ))s; log: $LOG"' EXIT
+# 143 is declared a success in the refresh unit: a deliberate stop is not a failure to repair (a start timeout still
+# ends failed, systemd records Result=timeout before it signals).
+trap 'say "terminated"; exit 143' TERM INT
+say "hsw-editor-preview-refresh $MODE: log $LOG"
+
+[ -f "$PREVIEW_TS" ] || fail "preview entry $PREVIEW_TS is missing"
+mkdir -p "$STATE/builds" "$STATE/home" || fail "mkdir $STATE"
+exec 9>"$STATE/refresh.lock"
+if ! flock -n 9; then
+  # The timer finding a manual build running is fine; a requested build that did not happen is not.
+  if [ "$MODE" = build ]; then say "another refresh is running, nothing was built"; exit 1; fi
+  say "another refresh is running, nothing to do"; exit 0
+fi
+# Only now: the cleanup may touch the smoke unit and the swap, which belong to whoever holds the lock.
+trap on_exit EXIT
+
+# The remote can blip; three tries keep a short outage from failing the timer run, the timeout a stalled one.
+remote_sha() {
+  local out try
+  for try in 1 2 3; do
+    out=$(timeout 60 git ls-remote "$REPO_URL" refs/heads/main 2>>"$LOG") && [ -n "$out" ] \
+      && { echo "${out%%[[:space:]]*}"; return 0; }
+    say "git ls-remote $REPO_URL failed (try $try)"
+    [ "$try" = 3 ] || sleep 20
+  done
+  return 1
+}
+
+SHA=$(remote_sha) || fail "cannot read main of $REPO_URL"
+PREVIEW_HASH=$(sha256sum "$PREVIEW_TS" | cut -d' ' -f1)
+CANDIDATE="$SHA $PREVIEW_HASH"
+say "main of $REPO_URL is $SHA, preview.ts $PREVIEW_HASH"
+if [ "$MODE" = check ] && has_current_build; then
+  if [ "$CANDIDATE" = "$(cat "$STATE/last-sha" 2>/dev/null)" ]; then say "this is what serves already, nothing to do"; exit 0; fi
+  if [ "$CANDIDATE" = "$(cat "$STATE/rejected-sha" 2>/dev/null)" ]; then
+    say "this candidate was rejected before (see $STATE/failed/last-failure.log), not retried until main or preview.ts changes; force with: hsw-editor-preview-refresh build"
+    exit 0
+  fi
+fi
+
+TAILNET_IP=$(tailscale ip -4 2>>"$LOG" | head -n1)
+[ -n "$TAILNET_IP" ] || fail "tailscale has no IPv4 address, the preview proxy cannot bind"
+
+[ -d "$STATE/repo.git" ] || stage mirror-init git init --quiet --bare "$STATE/repo.git" || fail "mirror init"
+stage fetch timeout 600 git -C "$STATE/repo.git" fetch --quiet --no-tags "$REPO_URL" "+refs/heads/main:refs/preview/main" \
+  || fail fetch
+# main may have moved since ls-remote; build what was fetched and record that.
+SHA=$(git -C "$STATE/repo.git" rev-parse refs/preview/main) || fail "read the fetched commit"
+CANDIDATE="$SHA $PREVIEW_HASH"
+STAMP=$(date +%Y%m%d-%H%M%S)-${SHA:0:12}
+BUILD=$STATE/builds/$STAMP
+say "building $SHA in $BUILD"
+mkdir -p "$BUILD/src" || fail "mkdir $BUILD/src"
+stage archive bash -c 'set -o pipefail; git -C "$1" archive "$2" | tar -x -C "$3"' _ "$STATE/repo.git" "$SHA" "$BUILD/src" \
+  || fail "git archive"
+cd "$BUILD/src" || fail cd
+[ -d apps/server/src ] && [ -f apps/server/src/index.ts ] || reject "no apps/server/src/index.ts in the commit"
+if ! stage install bun install --frozen-lockfile; then
+  # A lockfile that does not match package.json fails on every run; anything else may be the registry or the network.
+  if grep -q 'lockfile had changes, but lockfile is frozen' "$LOG"; then reject "bun.lock does not match package.json"; fi
+  fail "bun install"
+fi
+# Bank integrity gate: the commit's seed must verify (every glb and thumbnail present, sha256, bounds) before anything
+# is swapped. It needs the installed dependencies.
+if [ -f scripts/bank/verify.ts ]; then
+  stage bank-verify bun scripts/bank/verify.ts --seed || verdict $? "bank seed integrity"
+fi
+stage build bun run build || verdict $? "bun run build"
+# Copied after the build, so the product's build never judges this file.
+cp "$PREVIEW_TS" apps/server/src/preview.ts || fail "copy preview.ts"
+
+# Smoke: the candidate as a transient unit on a throwaway port and a throwaway home, through its own preview proxy. Not
+# --collect: the unit must stay readable after a crash, to tell a killed daemon from a broken one.
+SP=$((SMOKE_PORT + 1))
+smoke_stop   # a smoke unit left behind by a run that was SIGKILLed would hold the ports
+[ -z "$(ss -Hltn "( sport = :$SMOKE_PORT or sport = :$SP )")" ] || fail "smoke ports $SMOKE_PORT/$SP are in use"
+SMOKE_HOME=$(mktemp -d)
+daemon_env "$SMOKE_HOME" "$SMOKE_PORT" 127.0.0.1 "$SP" "$BUILD/src/apps/web/dist"
+setenv=(--setenv=PATH="$PATH")
+for kv in "${DAEMON_ENV[@]}"; do setenv+=(--setenv="$kv"); done
+stage smoke-start systemd-run --user --quiet --unit="$SMOKE_UNIT" --working-directory="$BUILD/src" "${setenv[@]}" \
+  "$(command -v bun)" apps/server/src/preview.ts || fail "smoke unit did not start"
+P=http://127.0.0.1:$SP
+smoke_ok=0
+for _ in $(seq 1 120); do
+  curl -fsS --max-time 2 "$P/api/health" >/dev/null 2>&1 && { smoke_ok=1; break; }
+  systemctl --user -q is-active "$SMOKE_UNIT" || break   # the candidate exited: no point waiting the full minute
+  sleep 0.5
+done
+if [ $smoke_ok = 1 ]; then
+  expect_body health "$P/api/health" '"ok":true' || smoke_ok=0
+  expect_body web-root "$P/" 'id="root"' || smoke_ok=0
+  expect_body walls "$P/api/walls" '"walls"' -H "Origin: $P" || smoke_ok=0
+  expect_body bank-index "$P/api/bank/index" '"elements"' || smoke_ok=0
+  expect_body bank-health "$P/api/bank/health?deep=1" '"ok":true' || smoke_ok=0
+  expect_code foreign-origin 403 "$P/api/walls" -H 'Origin: http://evil.example' || smoke_ok=0
+  expect_code foreign-websocket 403 "$P/api/omp/ws?wall=smoke" -H 'Origin: http://evil.example' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+    -H "Sec-WebSocket-Key: $(head -c 16 /dev/urandom | base64)" || smoke_ok=0
+else
+  say "smoke: the candidate never answered $P/api/health"
+fi
+journalctl --user -u "$SMOKE_UNIT" -n 60 --no-pager -o short-iso >> "$LOG" 2>&1
+smoke_killed=
+killed "$SMOKE_UNIT" && smoke_killed=1
+smoke_stop
+if [ $smoke_ok = 0 ]; then
+  [ -z "$smoke_killed" ] || fail "the smoke daemon was killed by a signal"
+  reject "smoke test"
+fi
+
+PREV=$(readlink "$STATE/current" 2>/dev/null)
+swap_to "$BUILD" || fail "swap current"
+say "current -> $BUILD (previous: ${PREV:-none})"
+RESTARTED=$(date +%s)
+stage restart systemctl --user restart "$SERVICE" || fail "restart $SERVICE"
+healthy; health=$?
+if [ $health != 0 ]; then
+  journalctl --user -u "$SERVICE" -n 60 --no-pager -o short-iso >> "$LOG" 2>&1
+  if [ -n "$PREV" ] && [ -d "$PREV" ]; then
+    swap_to "$PREV" || down "the new build was unhealthy and swapping back to $PREV failed"
+    RESTARTED=$(date +%s)
+    stage rollback-restart systemctl --user restart "$SERVICE" || down "restart after rolling back to $PREV failed"
+    healthy || down "the new build was unhealthy after the swap, and the rolled-back $PREV is not healthy either"
+    say "rolled back to $PREV, it is healthy"
+    [ $health != 2 ] || fail "the new daemon was killed by a signal after the swap"
+    reject "the new build was unhealthy after the swap"
+  fi
+  rm -f "$STATE/current"
+  systemctl --user stop "$SERVICE" >/dev/null 2>&1
+  [ $health != 2 ] || down "the first build's daemon was killed by a signal after the swap"
+  reject "the first build was unhealthy after the swap"
+fi
+VERIFIED=1
+echo "$CANDIDATE" > "$STATE/last-sha"
+rm -f "$STATE/rejected-sha"
+say "preview healthy on 127.0.0.1:$LOOPBACK_PORT and $TAILNET_IP:$PUBLIC_PORT"
+
+# Publish the bank into the preview home as a new verified generation (atomic; older generations stay, so tabs that
+# hold an older index keep their asset names). Source: the full local bank when there is one, else the commit's seed.
+# A refusal keeps the previous bank serving and does not fail the refresh: the build itself is good.
+if [ -f scripts/bank/adopt.ts ]; then
+  FULL=$HOME/.local/share/hsw-editor/bank
+  if [ -f "$FULL/current/index.json" ]; then BSRC=$FULL/current
+  elif [ -f "$FULL/index.json" ]; then BSRC=$FULL
+  else BSRC=$BUILD/src/packages/bank/seed; fi
+  daemon_env "$STATE/home" "$LOOPBACK_PORT" "$TAILNET_IP" "$PUBLIC_PORT" "$STATE/current/src/apps/web/dist"
+  stage bank-adopt env "${DAEMON_ENV[@]}" timeout 600 bun scripts/bank/adopt.ts "$BSRC" \
+    || say "WARN bank adopt refused or failed (source $BSRC); the previous preview bank keeps serving"
+fi
+
+# keep the 2 newest builds (the stamps sort by time); the serving one is the newest
+mapfile -t builds < <(printf '%s\n' "$STATE"/builds/*/ | sort -r)
+for old in "${builds[@]:2}"; do [ "${old%/}" = "$BUILD" ] || rm -rf "$old"; done
+printf '%s refreshed %s -> %s log %s\n' "$(date -Is)" "$CANDIDATE" "$STAMP" "$LOG" >> "$STATE/refresh.log"
+say "refreshed to $SHA ($STAMP)"
