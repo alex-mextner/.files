@@ -1,9 +1,18 @@
+# Ticket https://github.com/alex-mextner/.files/issues/183. The script and the preview entry it builds in are in this
+# profile (files/.local/bin/hsw-editor-preview-refresh, files/.local/share/hsw-editor-preview/preview.ts); builds and the
+# preview's data live under ~/.local/state/hsw-editor-preview, so a cache cleanup cannot take them away again. The
+# script sets the PATH of hsw-editor-preview.service itself, so a manual run builds with the same toolchain.
 [Unit]
-Description=Refresh HSW editor preview when main or a WIP worktree changed
+Description=Refresh the HSW editor preview when hsw-editor main moved (main only, no worktree overlay)
 
 [Service]
 Type=oneshot
-ExecStart=%h/.cache/hsw-editor/preview/check-and-refresh.sh
-Environment=PATH=/home/ultra/.local/bin:/home/ultra/.local/bin:/home/ultra/.bun/bin:/home/ultra/.cargo/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/ultra/.nvm/versions/node/v24.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+ExecStart=%h/.local/bin/hsw-editor-preview-refresh check
 TimeoutStartSec=1200
 Nice=10
+# Exit 3: a verdict on the candidate (bank seed, build, smoke test or post-swap health failed) while the previous build
+# keeps serving. The unit still ends failed, but service-failover does not start a repair session for an upstream commit
+# the gate refused as designed. Machine and network failures, and a preview that is down, exit 1 and are repaired.
+RestartPreventExitStatus=3
+# 143: the refresh was stopped on purpose (its TERM trap); not a failure to repair.
+SuccessExitStatus=143
