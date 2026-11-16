@@ -2,13 +2,39 @@
 # auth-broker (omp-auth-broker.service). The box's omp has auth.broker.url pointed at
 # it, so review seats on the box use this workstation's omp accounts without copying
 # OAuth refresh tokens (copied refresh tokens rotate and log one side out).
+#
+# The box's sshd has no ClientAliveInterval (server-side, no root to change it), so after a
+# network drop the dead previous session keeps listening on 18765 for about two hours and every
+# restart fails with "remote port forwarding failed" (alex-mextner/.files#193). ExecStart therefore
+# records its own remote session in ~/.local/state/clvm-auth-broker-tunnel.<hostname>.pids on the
+# box: the sshd-session holding the forward ($PPID of the remote shell) and the idling shell itself,
+# each with its /proc starttime, under the box's boot_id. ExecStartPre terminates only those recorded
+# pids, and only while the boot_id and starttime still match (a pid reused in this or a later boot is
+# left alone), then waits up to 5 s for 18765 to be released; while it is still held the record is
+# kept so the next attempt retries. A holder it never recorded is only reported in the journal.
+# No pattern kill: tg-ctl-clvm-reverse-ssh (18766) and
+# tg-laya-clvm-forward share this box and user and must stay up. A start whose forward is refused
+# never overwrites the record: with ExitOnForwardFailure the client exits before the remote command
+# runs.
+# The file is keyed by this workstation's hostname (%H) so a second workstation running this unit
+# never kills the first one's healthy session; two workstations sharing a hostname would collide.
+# (%m would survive renames but exposes the confidential machine id to every account on the box.)
+# Recording is best-effort: a full disk on the box costs only the self-heal, never the tunnel.
+# The idle step is `exec tail --pid=$PPID -f /dev/null`, not `sleep infinity`: a session without a
+# terminal does not signal its command on disconnect, so a plain sleep would outlive every clean stop
+# on the box. exec keeps the recorded pid and starttime, and the idle process forks nothing, so a box
+# out of processes or memory cannot end a healthy tunnel.
+# -a -x: unlike -N, the remote command opens a long-lived session channel, which must not carry the
+# local ssh-agent or X11 to every process of this user on the box.
+# systemd needs every literal $ written as $$, so the remote shell's $$ appears here as $$$$.
 [Unit]
 Description=Reverse SSH tunnel for the omp auth-broker to the clvm build box
 After=network-online.target omp-auth-broker.service
 Wants=omp-auth-broker.service
 
 [Service]
-ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:18765:127.0.0.1:18765 ultra@65.21.40.51
+ExecStartPre=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none ultra@65.21.40.51 'f=~/.local/state/clvm-auth-broker-tunnel.%H.pids; k=0; if [ -r "$$f" ]; then read -r b <"$$f"; if [ "$$b" = "$$(cat /proc/sys/kernel/random/boot_id)" ]; then while read -r p s; do case "$$p" in ""|*[!0-9]*) continue;; esac; [ -n "$$s" ] && [ "$$(cut -d" " -f22 "/proc/$$p/stat" 2>/dev/null)" = "$$s" ] && kill "$$p" 2>/dev/null && { k=1; echo "terminated recorded stale tunnel process $$p"; }; done <"$$f"; fi; fi; if [ "$$k" = 1 ]; then for i in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :18765" | grep -q . || break; sleep 0.5; done; fi; if ss -Hltn "sport = :18765" | grep -q .; then if [ "$$k" = 1 ]; then echo "127.0.0.1:18765 on the box is still in use 5 s after terminating the recorded session" >&2; exit 0; fi; echo "127.0.0.1:18765 on the box is held by a session this unit never recorded" >&2; fi; rm -f "$$f"; exit 0'
+ExecStart=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:18765:127.0.0.1:18765 ultra@65.21.40.51 '[ "$$PPID" -gt 1 ] || exit 0; mkdir -p ~/.local/state; { cat /proc/sys/kernel/random/boot_id; echo $$PPID $$(cut -d" " -f22 /proc/$$PPID/stat); echo $$$$ $$(cut -d" " -f22 /proc/$$$$/stat); } >~/.local/state/clvm-auth-broker-tunnel.%H.pids; exec tail --pid=$$PPID -f /dev/null'
 Restart=always
 RestartSec=15
 
