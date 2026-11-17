@@ -101,7 +101,7 @@ else
   if [ "$repair" = 1 ]; then
     want+=("$here/files/service.d/15-failover-repair.conf|$unit_dir/service.d/15-failover-repair.conf|644")
     while IFS= read -r rel; do want+=("$here/files/units/$rel|$unit_dir/$rel|644"); done < <(cd "$here/files/units" && find . -type f -printf '%P\n' | sort)
-    for s in service-failover-repair service-failover-scan; do want+=("$here/bin/$s|$bin_dir/$s|755"); done
+    for s in service-failover-repair service-failover-scan service-failover-journal; do want+=("$here/bin/$s|$bin_dir/$s|755"); done
     if [ "${#hosts[@]}" -gt 0 ]; then
       { echo "# written by the service-failover module (option hosts); 'local' is this host's user manager"; echo local; printf '%s\n' "${hosts[@]}"; } >"$tmp/hosts"
       want+=("$tmp/hosts|$cfg_dir/hosts|644")
@@ -129,7 +129,7 @@ if [ "$level" = user ]; then
   find_stale "$unit_dir/service.d/15-failover-repair.conf"
   find_stale "$cfg_dir/hosts"
   for rel in $(cd "$here/files/units" && find . -type f -printf '%P\n'); do find_stale "$unit_dir/$rel"; done
-  for s in service-failover-repair service-failover-scan; do find_stale "$bin_dir/$s"; done
+  for s in service-failover-repair service-failover-scan service-failover-journal; do find_stale "$bin_dir/$s"; done
   # The module's own units are the module's to declare, so every drop-in of the directories named after them is its
   # own: the repair template's, the scan's, one for a single instance. One nobody declared (a smoke-test drop-in set
   # SERVICE_FAILOVER_DRY_RUN=1 and made every repair on the PC a dry run) is drift. Symlinks count: systemd loads them.
