@@ -22,6 +22,9 @@ runs and socket activations too), so a global value would throttle every timer-d
 that units set in their own files. The scan finds a unit that turned `failed` (whatever its limit was) within 5 minutes,
 and first aid clears the counter, which is what would have saved `ha-host-actions.service` on the evening of the 9th.
 
+The one exception is explicit and per unit: `install.sh --system UNIT=always|on-failure` (see "What the owner must run with sudo") writes
+`StartLimitIntervalSec=0` and the whole restart backoff into that unit's own drop-in, for units that must never be refused a start.
+
 ## What is installed
 
 | Piece | Where | What it does |
@@ -173,16 +176,33 @@ ssh odroidn2 'bash ~/.local/share/service-failover/install.sh --restart-only --a
 ### What the owner must run with sudo (odroid, once)
 
 The system units live in `/etc/systemd/system`, owned by root. This installs the same backoff for every system
-service and `Restart=on-failure` for `caddy.service` (it has no `Restart=`); nothing is restarted:
+service, `Restart=on-failure` for `caddy.service` (it has no `Restart=`), and for the two units that must never be
+refused a start a drop-in that sets everything explicitly; nothing is restarted:
 
 ```sh
 ssh odroidn2
-sudo bash ~/.local/share/service-failover/install.sh --system caddy.service
+sudo bash ~/.local/share/service-failover/install.sh --system caddy.service \
+  ha-host-actions.service=always hcb-odroid-watchdog.service=on-failure
 ```
 
-Afterwards `systemctl cat ha-host-actions.service` lists `service.d/10-failover.conf`. A unit that is already `failed` is cleared with `sudo systemctl reset-failed <unit>`; the odroid's system
-`ha-host-actions.service` is such a unit (it fails against the user unit that holds port 8787: decide which of the two is
-canonical and disable the other).
+`UNIT=always` / `UNIT=on-failure` writes `<unit>.d/30-failover-restart.conf` with `StartLimitIntervalSec=0`,
+`Restart=<policy>`, `RestartSec=2`, `RestartSteps=8`, `RestartMaxDelaySec=5min`. Every value is set in the drop-in
+because a drop-in beats the unit file and the unit file's own values (`ha-host-actions.service` had
+`StartLimitIntervalSec=infinity`, `hcb-odroid-watchdog.service` had the default 5 starts in 10 s) are what failed:
+
+- `infinity` never forgets a start: the unit is refused for good after `StartLimitBurst` starts in its whole life (the
+  2026-11-09 outage above). It is not "no limit"; `0` is.
+- The default 10 s / 5 starts refuses a fast crash loop or a burst of manual starts, and the refused unit stays `failed` with
+  `Result=start-limit-hit` until `reset-failed` or a later start once the window has passed. `hcb-odroid-watchdog.service` is a
+  `Type=oneshot` started by a timer every 2 minutes and was seen in that state (#186). `Restart=always` is refused for a
+  one-shot unit, hence `on-failure` there.
+
+`systemctl show` prints a disabled limit as `StartLimitIntervalUSec=0` (`infinity` for an infinite window), with
+`StartLimitBurst=5` left over and unused. Afterwards `systemctl cat ha-host-actions.service` lists
+`30-failover-restart.conf`. A unit that is already `failed` is cleared with `sudo systemctl reset-failed <unit>`; that starts nothing:
+a timer-driven unit runs again at its next tick, a service needs `sudo systemctl start <unit>` (`Restart=` acts only on a unit that
+was running). The odroid's system `ha-host-actions.service` once failed against the
+user unit that holds port 8787: decide which of the two is canonical and disable the other.
 
 ## Docker
 

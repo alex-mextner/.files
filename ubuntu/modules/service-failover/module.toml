@@ -5,7 +5,7 @@ order = 175       # after the aisis module (170): the scan also watches the unit
 # User level: the installer writes only ~/.config/systemd/user, ~/.local/bin and ~/.config/service-failover and talks to
 # the user's systemd, so it never runs as root, and it restarts nothing (daemon-reload only: a unit takes the new
 # backoff at its next start). The root level (/etc/systemd/system/service.d) is a separate, once-per-host manual step:
-# `sudo bash install.sh --system [UNIT...]`, see README.md.
+# `sudo bash install.sh --system [UNIT[=POLICY]...]`, see README.md.
 # Options ([modules.service-failover]): repair, hosts, restart_units, autoheal (see install.sh).
 [source]
 kind = "system"
