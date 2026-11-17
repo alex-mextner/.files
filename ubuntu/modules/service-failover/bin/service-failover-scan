@@ -60,10 +60,13 @@ for host in "${hosts[@]}"; do
     done <<<"$found"
   done
 done
-# A repair that could not query its unit again after the first aid (the host did not answer) leaves a recheck file: that
-# unit may be down without being failed or looping, which the listing above never reports. Each one is requested again on
-# every scan until a repair run has been able to read the unit (that run deletes the file; a request that is refused or
-# finds the repair already running leaves it).
+# A repair that did not finish what it started leaves a recheck file: its first aid cleared the unit's failed state, so the
+# unit may be down without being failed or looping, which the listing above never reports. The run was stopped before it
+# launched a session or told the user (its start deadline), could not query the unit again (the host did not answer), or
+# was deferred by the session lock. Each file is requested again on every scan until a repair run ends having launched a
+# session, told the user that nothing more will be tried, or found the unit healthy: that run deletes the file, while a
+# run that cannot read the unit or is deferred by the lock leaves it, as does a request that is refused or finds the
+# repair already running.
 state=${SERVICE_FAILOVER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/service-failover}
 for f in "$state"/recheck/*; do
   [ -f "$f" ] || continue

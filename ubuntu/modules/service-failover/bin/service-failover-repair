@@ -58,6 +58,10 @@ notes="$state/notify"
 # NAME.sending.PID: only one run wins the rename and shows it, the others skip claimed files. A message older than the
 # notification window is dropped: it would announce, hours late, a unit that has had its chance to be fixed since (the
 # next failure announces itself). That also removes the claim of a run that died.
+# still_open NAME: the notice that the host did not answer after the first aid (NAME ends in +host-silent, see notify_down) is
+# provisional: it is shown only while the incident it speaks of is open, and the recheck marker of the same instance says so
+# (the marker goes when a run has found or said what became of the unit). Any other message stays valid.
+still_open() { case "$1" in *+host-silent) [ -e "$state/recheck/${1%+host-silent}" ] ;; esac; }
 undelivered=0
 deliver_notifications() {
   local f claimed pid giveup=0
@@ -73,10 +77,12 @@ deliver_notifications() {
   for f in "$notes"/pending/*; do
     [ -f "$f" ] || continue
     case "${f##*/}" in *.sending.*) continue ;; esac
+    still_open "${f##*/}" || { rm -f "$f"; continue; }
     # the notifier failed once: every other attempt fails the same way and costs its timeout, which a repair run has no room for
     if [ "$giveup" = 1 ]; then undelivered=$((undelivered + 1)); continue; fi
     claimed="$f.sending.$$"
     mv "$f" "$claimed" 2>/dev/null || continue
+    still_open "${f##*/}" || { rm -f "$claimed"; continue; }   # (the marker went while the message was being claimed)
     # timeout: with no notification daemon on the bus, notify-send can wait for D-Bus' 25 s reply before it gives up
     if timeout 10 "$notifier" --app-name=service-failover --urgency=critical --icon=dialog-warning -- "$(sed -n 1p "$claimed")" "$(sed 1d "$claimed")" >/dev/null 2>&1; then
       mkdir -p "$notes/sent" && : >"$notes/sent/${f##*/}" && rm -f "$claimed"
@@ -98,18 +104,44 @@ else host=local; scope=user; unit=$inst; fi
 # A backslash is allowed: systemd escapes unit names that way (systemd-fsck@dev-disk-by\x2duuid-....service).
 case "$unit" in *[!A-Za-z0-9:_.@\\-]*|"") echo "bad unit name in $inst" >&2; exit 2 ;; esac
 key=$(printf %s "$inst" | tr -c 'A-Za-z0-9._-' _)
+# `.foo.service` is a valid unit name: a state file named after it would be hidden, and every glob over the state
+# directory (the scan's marker loop, the delivery of pending notifications) skips hidden files. `@` is not a key character.
+# (legacy_key: the name the launch and first aid stamps of such a unit had before; they were not hidden from `find`)
+legacy_key=$key
+case "$key" in .*) key="@$key" ;; esac
 
 log() { echo "service-failover-repair: $host/$scope/$unit: $*"; }
 # The module's own units (the scan fails while a host is unreachable) are never repaired by a session about themselves.
 case "$unit" in service-failover-*) log "the module's own unit, not repaired"; exit 0 ;; esac
-# A marker left by an earlier run that could not query the unit after its first aid (see there): its second line is the
-# invocation of the failure that run saw. It stays until this run has read the unit, so a host that still does not
-# answer keeps it for the next scan.
+# The recheck marker: written by the first aid, BEFORE it clears the unit's failed state, because the scan lists only failed
+# and restart-looping units and would never come back to a unit that first aid left inactive. Its first line is the instance,
+# its second the invocation of the failure that run saw. A run takes its own marker away when it ends, and the scan starts
+# the repair again for every marker that is left, so what ends a run decides whether the incident is looked at again:
+# a run that is stopped (its start deadline, a signal, a crash) never gets to remove it, and a run that has to leave the
+# incident open sets keep_marker=1: the unit could not be read, or the repair session is occupied. Every other end has
+# either launched a session, told the user, or found nothing to repair.
 # (the key is a sanitized instance, so `h:user:foo.service` and a local `h_user_foo.service` share one: the marker's name
 # adds a checksum of the exact instance, and its first line is checked as well)
-rkey="$key.$(printf %s "$inst" | cksum | cut -d' ' -f1)"
-recheck_inv=; recheck_file="$state/recheck/$rkey"
-if [ -f "$recheck_file" ] && [ "$(sed -n 1p "$recheck_file")" = "$inst" ]; then recheck_inv=$(sed -n 2p "$recheck_file" | tr -cd 'A-Za-z0-9._:/@+-'); else recheck_file=; fi
+crc=$(printf %s "$inst" | cksum | cut -d' ' -f1)
+rkey="$key.$crc"
+# a marker of a dot unit written before its key got the `@` was hidden from the scan, and is taken over under the new name
+legacy_rkey="$legacy_key.$crc"
+if [ "$dry" != 1 ] && [ "$legacy_rkey" != "$rkey" ] && [ -f "$state/recheck/$legacy_rkey" ] && [ ! -e "$state/recheck/$rkey" ]; then
+  mv "$state/recheck/$legacy_rkey" "$state/recheck/$rkey" 2>/dev/null
+fi
+recheck_inv=; recheck_file="$state/recheck/$rkey"; marker=; keep_marker=0; brief=
+if [ -f "$recheck_file" ] && [ "$(sed -n 1p "$recheck_file")" = "$inst" ]; then recheck_inv=$(sed -n 2p "$recheck_file" | tr -cd 'A-Za-z0-9._:/@+-'); marker=$recheck_file; else recheck_file=; fi
+# release_marker: this run took the incident's marker away when it ends (a dry run changes nothing, and keep_marker says the
+# incident stays open). It is also done before a message that says what became of the unit is delivered, so that the provisional
+# notice still waiting for the desktop is dropped by that very delivery (see still_open) and does not follow it.
+release_marker() { [ -z "$marker" ] || [ "$keep_marker" = 1 ] || [ "$dry" = 1 ] || rm -f "$marker"; }
+cleanup() {
+  [ -z "$brief" ] || rm -f "$brief"
+  release_marker
+}
+trap cleanup EXIT
+# stopped from outside (the unit's start deadline): the marker stays. (From the launcher on, a stop is not acted on: see there.)
+trap 'keep_marker=1; exit 143' TERM INT HUP
 
 # sctl ARGS...: systemctl for the unit's manager, on the host that has it. Remote words are quoted for the remote shell.
 # Every query is bounded (a hung ssh or journal must not outlive the repair) and runs without the lock descriptor 9, so a
@@ -202,20 +234,29 @@ cause_line() {
     esac
   )
 }
-# notify_down OUTCOME: the unit is still down; tell the user, once per NOTIFY_MIN minutes per unit, what became of it.
+# notify_down OUTCOME [nolog]: the unit is still down; tell the user, once per NOTIFY_MIN minutes per unit, what became of it.
+# `nolog`: the host does not answer, so its journal cannot be read either; only what was known before the first aid is said.
+# That notice is provisional (the scan keeps looking): it has its own stamp and queue name, so it never takes the place of the
+# message that says what finally became of the unit, and it is dropped when the marker is gone (see still_open).
 notify_down() {
-  local label=$unit title body tmp
+  # (the marker goes only once the message is queued: a deadline during the journal read below must leave the incident open)
+  local label=$unit title body tmp nkey=$key
+  [ "${2:-}" != nolog ] || nkey="$rkey+host-silent"
   [ "$host" = local ] || label="$host $unit"
   title="Service down: $label"
-  if [ "$dry" != 1 ] && [ -n "$(find "$notes/sent" -type f -name "$key" -mmin "-$notify_min" 2>/dev/null)" ]; then
+  if [ "$dry" != 1 ] && [ -n "$(find "$notes/sent" -type f -name "$nkey" -mmin "-$notify_min" 2>/dev/null)" ]; then
     log "the user was already notified within $notify_min min"; return 0
   fi
-  journal_load
-  body="$1. Summary: $(cause_line); $(last_log_line)"
+  [ "${2:-}" = nolog ] || journal_load
+  body="$1. Summary: $(cause_line)"; [ "${2:-}" = nolog ] || body="$body; $(last_log_line)"
   if [ "$dry" = 1 ]; then log "DRY RUN: would notify: $title | $body"; return 0; fi
   # written aside and renamed: a concurrent delivery never reads half a message (it skips dot files)
-  mkdir -p "$notes/pending" && tmp=$(mktemp "$notes/pending/.msg.XXXXXX") \
-    && printf '%s\n%s\n' "$title" "$body" >"$tmp" && mv "$tmp" "$notes/pending/$key"
+  if mkdir -p "$notes/pending" && tmp=$(mktemp "$notes/pending/.msg.XXXXXX") \
+    && printf '%s\n%s\n' "$title" "$body" >"$tmp" && mv "$tmp" "$notes/pending/$nkey"; then
+    release_marker  # before the delivery, so that it drops the provisional notice that still waits (see release_marker)
+  else
+    keep_marker=1; log "cannot queue the notification, the marker stays"; return 0
+  fi
   deliver_notifications
   [ "$undelivered" -eq 0 ] || log "notification pending ($undelivered not delivered: no notification daemon yet), the next scan delivers it"
 }
@@ -249,9 +290,8 @@ limit_since() {
 }
 query() { sctl show -p ActiveState -p SubState -p Result -p NRestarts -p UnitFileState -p FragmentPath -p Transient -p Type -p InvocationID -p ExecMainStatus -p ExecMainCode -p SuccessExitStatus -p RestartPreventExitStatus "$unit" 2>&1; }
 props=$(query) \
-  || { log "cannot query the unit ($(jt error <<<"$props")); host unreachable or unit unknown"; exit 0; }
+  || { keep_marker=1; log "cannot query the unit ($(jt error <<<"$props")); host unreachable or unit unknown"; exit 0; }
 props0=$props
-[ -z "$recheck_file" ] || rm -f "$recheck_file"
 active=$(prop ActiveState); sub=$(prop SubState); fragment=$(prop FragmentPath); invocation=$(prop InvocationID)
 
 if [ "$active" = active ] && [[ "$sub" == running || "$sub" == exited || "$sub" == waiting ]]; then log "healthy again ($active/$sub), nothing to repair"; exit 0; fi
@@ -310,7 +350,7 @@ if declares_final; then log "exited with $final, which the unit declares final (
 # One session per unit per COOLDOWN_MIN minutes. The stamps are files, not systemd start counters: systemd forgets the
 # counter of an instance as soon as it is unloaded, which happens when the repair exits.
 mkdir -p "$state/launches"
-if [ -n "$(find "$state/launches" -type f -name "*@$key" -mmin "-$cooldown" 2>/dev/null)" ]; then
+if [ -n "$(find "$state/launches" -type f \( -name "*@$key" -o -name "*@$legacy_key" \) -mmin "-$cooldown" 2>/dev/null)" ]; then
   log "a repair session was already launched for it within $cooldown min, not again"; exit 0
 fi
 
@@ -324,13 +364,14 @@ if [ "$dry" = 1 ]; then
   tried+=("first aid: skipped (dry run)")
 elif [ "$(prop Type)" = oneshot ]; then
   tried+=("first aid: skipped, the unit is a one-shot job (re-running it blindly may repeat a side effect; reset-failed would hide the failure)")
-elif [ -n "$(find "$state/aid" -type f -name "$key" -mmin "-$aid_min" 2>/dev/null)" ]; then
+elif [ -n "$(find "$state/aid" -type f \( -name "$key" -o -name "$legacy_key" \) -mmin "-$aid_min" 2>/dev/null)" ]; then
   tried+=("first aid: skipped, it already ran within $aid_min min and the unit failed again")
 else
   # The incident is written down BEFORE its failed state is cleared: if this run is stopped by its deadline, or cannot read
   # the unit afterwards, the scan starts a repair again (it lists only failed and looping units, and this one may be neither
-  # after reset-failed). The marker goes when the unit has been read after the first aid.
-  mkdir -p "$state/recheck" && printf '%s\n%s\n' "$inst" "$invocation" >"$state/recheck/$rkey"
+  # after reset-failed). It stays until this run ends (see keep_marker above), not until the unit has been read: the run still
+  # has probes, the journal and the launcher ahead of it, and its start deadline can strike between any two of them.
+  mkdir -p "$state/recheck" && printf '%s\n%s\n' "$inst" "$invocation" >"$state/recheck/$rkey" && marker="$state/recheck/$rkey"
   : >"$state/aid/$key"
   # reset-failed turns a failed unit into inactive/success, which would hide a failure that the restart does not undo:
   # it is needed only to get past a refused start. A unit whose start limit hit while it was being restarted keeps
@@ -346,20 +387,23 @@ else
     cursor=$(journal_cursor)
     if out=$(sctl restart --no-block "$unit" 2>&1); then restart_ok=1; tried+=("systemctl restart: ok"); else tried+=("systemctl restart: refused ($(jt error <<<"$out"))"); fi
     sleep "$settle"
-    # (the unit may be down for good while the host does not answer: the marker stays and the next scan starts this repair again;
-    # it goes with every conclusive exit below, and once this run owns the incident, after the last attempt)
-    props=$(query) || { log "cannot query the unit after the first aid ($(jt error <<<"$props")); host unreachable or too slow, the next scan looks again"; exit 0; }
+    # (the unit may be down for good while the host does not answer: the user is told, and the marker stays for the next scan)
+    props=$(query) || {
+      keep_marker=1
+      log "cannot query the unit after the first aid ($(jt error <<<"$props")); host unreachable or too slow, the next scan looks again"
+      notify_down "the host did not answer after the first aid, so it is not known whether the unit is back; the scan keeps looking" nolog; exit 0
+    }
     active=$(prop ActiveState); sub=$(prop SubState)
-    if declares_final; then rm -f "$state/recheck/$rkey"; log "after the restart it exited with $final, which the unit declares final (RestartPreventExitStatus=), not repaired"; exit 0; fi
-    if [ "$active" = active ]; then rm -f "$state/recheck/$rkey"; log "back up after reset-failed and restart ($active/$sub), no session needed"; exit 0; fi
+    if declares_final; then log "after the restart it exited with $final, which the unit declares final (RestartPreventExitStatus=), not repaired"; exit 0; fi
+    if [ "$active" = active ]; then log "back up after reset-failed and restart ($active/$sub), no session needed"; exit 0; fi
     # reset-failed alone turns a failed unit into inactive/success: only a NEW run (another invocation) that finished
     # successfully counts. A service that was reset or stopped after it crashed keeps its failure status; but a clean
     # signal stop (ExecMainCode killed) and a status listed in SuccessExitStatus= are successes by systemd's own verdict.
     if [ "$active" = inactive ] && [ "$(prop Result)" = success ] && [ -n "$(prop InvocationID)" ] && [ "$(prop InvocationID)" != "$invocation" ] \
        && clean_status; then
-      rm -f "$state/recheck/$rkey"; log "finished successfully after the restart, no session needed"; exit 0
+      log "finished successfully after the restart, no session needed"; exit 0
     fi
-    if [ "$active" = activating ] && [[ "$sub" != auto-restart* ]]; then rm -f "$state/recheck/$rkey"; log "the start is still in progress ($active/$sub), left to systemd"; exit 0; fi
+    if [ "$active" = activating ] && [[ "$sub" != auto-restart* ]]; then log "the start is still in progress ($active/$sub), left to systemd"; exit 0; fi
     # (a failed dependency refuses a start the same way; only the journal's "Start request repeated too quickly" names the limit)
     if [ "$attempt" = 1 ] && [ "$restart_ok" = 1 ] && [ "$active" = failed ] && [ "$(prop InvocationID)" = "$invocation" ] \
        && limit_since "$cursor"; then
@@ -368,15 +412,16 @@ else
     fi
     break
   done
-  rm -f "$state/recheck/$rkey"  # read after the last attempt: the incident is in this run's hands again
   tried+=("after ${settle} s the unit is still $active/$sub (Result=$(prop Result), NRestarts=$(prop NRestarts))")
 fi
 
 # One session at a time: the lock is held by the session itself because the launcher's child inherits it.
 exec 9>"$state/lock"
 if ! flock -n 9; then
+  # the marker (the incident's first aid wrote one, or the run was one) makes the scan retry it even when the unit is not failed
+  keep_marker=1
   log "another repair session is running, deferred (retried by the next scan)"
-  if ! scan_sees; then notify_down "another repair session is running; the scan will not retry (the unit is not failed): restart it by hand"; exit 0; fi
+  if [ -z "$marker" ] && ! scan_sees; then notify_down "another repair session is running; the scan will not retry (the unit is not failed): restart it by hand"; exit 0; fi
   notify_down "another repair session is running, deferred (retried by the next scan)"; exit 0
 fi
 # Daily cap (the lock is held).
@@ -390,7 +435,7 @@ fi
 
 name=$(printf 'service-failover-%s-%s-%s' "$host" "${unit%.service}" "$(date +%Y%m%d-%H%M)" | tr -c 'A-Za-z0-9._\n-' '-')
 brief=$(mktemp "${TMPDIR:-/tmp}/service-failover-brief.XXXXXX")
-trap 'rm -f "$brief"' EXIT
+# (the brief file is removed by cleanup when this run ends)
 handoff="${RIG_AGENT_LOG_DIR:-/tmp/agent-logs}/$name.handoff.md"
 reach="locally (this host)"; [ "$host" != local ] && reach="over ssh: \`ssh $host\` (BatchMode, no sudo; ${scope} units via \`systemctl$([ "$scope" = user ] && echo ' --user')\`)"
 fragment=$(printf '%s' "${fragment:-unknown}" | tr -cd 'A-Za-z0-9/._@:+\\-' | cut -c1-200)
@@ -470,6 +515,12 @@ if [ ! -x "$launcher" ]; then
   exec 9>&-
   notify_down "no repair session could be started: the launcher is not executable"; exit 1
 fi
+# From here the run records what it did and says it: a stop signal (the unit's start deadline) that arrives now is taken note of
+# and not acted on, or a launcher that succeeds would be followed by no launch stamp and no message, and the retry that the
+# marker brings would start a second session (or find the cooldown and say nothing). What is left to do takes seconds.
+# (A handler and not an ignored signal: an ignored signal is inherited by the launcher and the notifier, which would then
+# survive their own timeout.)
+trap : TERM INT HUP
 if "$launcher" "$name" "$brief" "$workdir"; then
   : >"$state/launches/$(date +%s)@$key"
   log "repair session launched as $name (handoff $handoff)"

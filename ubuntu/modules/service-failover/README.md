@@ -50,21 +50,32 @@ The container is `service-failover-autoheal` (compose service of the same name).
 removal (the daemon went away) reports it and exits non-zero instead of claiming it. A host without a docker client has
 nothing to remove, so `autoheal = false` is satisfied there.
 
-A repair run whose query after the first aid fails (a host that does not answer) cannot tell whether the unit is up. It
-writes a file under `~/.local/state/service-failover/recheck/`, and the next scan starts that repair again, because the
-scan itself lists only failed and restart-looping units and would never come back to a unit that first aid left inactive.
+A repair run that has not finished what it started leaves a file under `~/.local/state/service-failover/recheck/` (the
+first aid writes it before it clears the unit's failed state), and the next scan starts that repair again, because the scan
+itself lists only failed and restart-looping units and would never come back to a unit that first aid left inactive. The
+file stays when the run is stopped by its start deadline (`TimeoutStartSec=` of the template), when the query after the first
+aid fails (a host that does not answer: the user is told so as well, without journal text, since the journal is out of
+reach too), and when the session lock defers the run; a run that launched a session, told the user that nothing more will be
+tried, or found the unit healthy removes it. From the moment the launcher is called a stop signal is taken note of and not
+acted on (the rest takes seconds), so a launch is never left without its stamp and its message. A unit whose name starts with a
+dot (`.foo.service` is a valid name) is keyed with a leading `@` in those state files, so that no glob skips them as hidden
+files; its launch and first aid stamps are also looked up under the old name.
 
 ## What the user sees
 
 A failed service used to be silent: every outcome of the repair script was one journal line. When a unit is still down after the first
 aid, `service-failover-repair` now sends a desktop notification (`notify-send`, urgency critical) titled `Service down: <unit>` whose body
 says what became of it (a repair session was launched, another session is running so this one is deferred, the daily cap of sessions is
-reached, the launcher is missing or failed) and a `Summary:` of how the unit failed: `exited with status 78, Result=exit-code` from the
+reached, the launcher is missing or failed, the host did not answer after the first aid: that one has no journal text) and a `Summary:` of how the unit failed: `exited with status 78, Result=exit-code` from the
 properties read before first aid, then what the journal says (see *Secrets*: the last failure the manager itself recorded, for example
 `Main process exited, code=exited, status=78/CONFIG`, how many lines the unit's own output had, and the table members recognised in them;
 `-- No entries --` and ssh errors are no log line, and then the text is `(no log line)`; a journal that cannot be read says so), 300
 bytes of journal at most. A unit is announced once per `NOTIFY_MIN` minutes
-(default 720, the same window as the session cooldown): a stamp file in `~/.local/state/service-failover/notify/sent`. A message the
+(default 720, the same window as the session cooldown): a stamp file in `~/.local/state/service-failover/notify/sent`. The notice that the
+host did not answer after the first aid is provisional (the scan keeps looking) and has a stamp of its own, so it never hides the
+message that says what finally became of the unit. It is shown only while the unit's recheck file exists: a later run that found
+or said what became of the unit takes that file away, and the delivery then drops the notice, whether it still waits for the
+desktop or a delivery has just claimed it. (A notifier call already in progress cannot be taken back.) A message the
 notifier cannot show (no notification daemon runs early in the login) stays in `notify/pending` and leaves no stamp; the scan delivers it
 within 5 minutes, unless it is older than `NOTIFY_MIN` (it would announce, hours late, a unit that has had its chance to be fixed since:
 it is dropped). Runs overlap (one repair instance per failed unit, plus the scan), so a delivery first claims a message by renaming it to
