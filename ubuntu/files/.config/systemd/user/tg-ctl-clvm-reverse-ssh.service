@@ -1,0 +1,47 @@
+# Reverse SSH link for tg-ctl: the clvm build box's 127.0.0.1:18766 -> this workstation's sshd (127.0.0.1:22).
+# Loopback-only bind on the box. The box authenticates back here with its dedicated key (~/.ssh/tg-ctl-ubuntu),
+# whose authorized_keys line on this workstation is forced-command restricted (comment tg-ctl-clvm-20261028).
+# Independent of clvm-auth-broker-tunnel.service (port 18765); do not merge them. Linked into ~/.config/systemd/user
+# like every leaf of ubuntu/files by the ubuntu-tweak files planner (`ubuntu-tweak apply`), not by install-ubuntu.sh.
+#
+# The box's sshd has no ClientAliveInterval (server-side, no root to change it), so after a network drop the dead
+# previous session keeps listening on 18766 for hours and every restart fails with "remote port forwarding failed"
+# (alex-mextner/.files#204, the same failure clvm-auth-broker-tunnel had in #193). ExecStart therefore records its
+# own remote session in the RECORD file on the box: the sshd-session holding the forward ($PPID of the remote
+# shell) with its /proc starttime, under the box's boot_id. Only that session is recorded, never the idle process:
+# the idle process never holds the port and notices its session is gone only about once a second, so killing it
+# would log a stale-session kill on every plain restart (#195). ExecStartPre terminates only the recorded pid, and
+# only while the boot_id and starttime still match (a pid reused in this or a later boot is left alone), then waits
+# up to 5 s for the port to be released; while it is still held the record is kept so the next attempt retries.
+# (The check and the kill are two steps; a wrong kill needs the session to exit and the box to cycle its whole pid
+# space, pid_max 4194304, between them, which is accepted rather than adding a pidfd helper.)
+# A holder it never recorded is only reported in the journal. No pattern kill: clvm-auth-broker-tunnel (18765) and
+# tg-laya-clvm-forward share this box and user and must stay up. A start whose forward is refused never
+# overwrites the record: with ExitOnForwardFailure the client exits before the remote command runs.
+# The record is keyed by this workstation's hostname (%H) so a second workstation running this unit never kills
+# the first one's healthy session; two workstations sharing a hostname would collide.
+# (%m would survive renames but exposes the confidential machine id to every account on the box.)
+# Recording is best-effort: a full disk on the box costs only the self-heal, never the link.
+# The idle step is `exec tail --pid=$PPID -f /dev/null`, not `sleep infinity`: a session without a terminal does
+# not signal its command on disconnect, so a plain sleep would outlive every clean stop on the box. The idle
+# process forks nothing, so a box out of processes or memory cannot end a healthy link.
+# -a -x: unlike -N, the remote command opens a long-lived session channel, which must not carry the local
+# ssh-agent or X11 to every process of this user on the box.
+# BOX_PORT and RECORD are written once here; systemd substitutes ${NAME} in the command lines (inside the quoted
+# remote scripts too) and needs every other literal $ written as $$.
+[Unit]
+Description=Reverse SSH link for tg-ctl: clvm 127.0.0.1:18766 -> Ubuntu sshd
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Environment=BOX_PORT=18766
+Environment=RECORD=.local/state/tg-ctl-clvm-reverse-ssh.%H.pids
+ExecStartPre=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none ultra@65.21.40.51 'f=~/${RECORD}; k=0; if [ -r "$$f" ]; then { read -r b; read -r p s; } <"$$f"; if [ "$$b" = "$$(cat /proc/sys/kernel/random/boot_id)" ]; then case "$$p" in ""|*[!0-9]*) ;; *) [ -n "$$s" ] && [ "$$(cut -d" " -f22 "/proc/$$p/stat" 2>/dev/null)" = "$$s" ] && kill "$$p" 2>/dev/null && { k=1; echo "terminated recorded stale tunnel process $$p"; };; esac; fi; fi; if [ "$$k" = 1 ]; then for i in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :${BOX_PORT}" | grep -q . || break; sleep 0.5; done; fi; if ss -Hltn "sport = :${BOX_PORT}" | grep -q .; then if [ "$$k" = 1 ]; then echo "127.0.0.1:${BOX_PORT} on the box is still in use 5 s after terminating the recorded session" >&2; exit 0; fi; echo "127.0.0.1:${BOX_PORT} on the box is held by a session this unit never recorded" >&2; fi; rm -f "$$f"; exit 0'
+ExecStart=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:${BOX_PORT}:127.0.0.1:22 ultra@65.21.40.51 '[ "$$PPID" -gt 1 ] || exit 0; mkdir -p ~/.local/state; { cat /proc/sys/kernel/random/boot_id; echo $$PPID $$(cut -d" " -f22 /proc/$$PPID/stat); } >~/${RECORD}; exec tail --pid=$$PPID -f /dev/null'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
