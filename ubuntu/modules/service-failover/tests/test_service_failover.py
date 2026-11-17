@@ -825,6 +825,21 @@ class RepairTest(Base):
                 self.repair(f"case{i}.service")
                 self.assertEqual(len(self.launches()) - before, 1 if repaired else 0)
 
+    def test_final_real_time_signals_are_compared_by_number(self):
+        # `systemctl show` names a final signal as RTMIN+N / RTMAX-N and ExecMainStatus is its number; a plain number in the
+        # list is an exit status, never a signal
+        for code, status, listed, final in (
+                (2, 37, "RTMIN+3", True), (2, 37, "SIGRTMIN+3", True), (2, 37, "75 RTMIN+3 SIGHUP", True), (2, 37, "RTMIN+4", False),
+                (2, 63, "RTMAX-1", True), (2, 64, "RTMAX", True), (2, 63, "RTMAX-2", False), (2, 15, "TERM", True), (2, 15, "SIGTERM", True),
+                (2, 37, "37", False), (1, 37, "RTMIN+3", False), (1, 75, "75", True), (3, 37, "RTMIN+3", True)):
+            with self.subTest(code=code, status=status, listed=listed):
+                shutil.rmtree(self.root / "state", ignore_errors=True)
+                (self.stub / "calls").unlink(missing_ok=True)
+                self.set_state(FAILED_STATE + f"ExecMainCode={code}\nExecMainStatus={status}\nRestartPreventExitStatus={listed}\n")
+                result = self.repair("foo.service")
+                self.assertEqual("which the unit declares final" in result.stdout, final, result.stdout)
+                self.assertEqual(len(self.launches()), 0 if final else 1)
+
     def test_a_final_status_reached_during_first_aid_is_not_repaired(self):
         self.set_state(FAILED_STATE + "ExecMainCode=1\nExecMainStatus=1\nRestartPreventExitStatus=75\n")
         (self.stub / "after-restart").write_text("ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=10\nExecMainCode=1\nExecMainStatus=75\nRestartPreventExitStatus=75\n")
@@ -1725,6 +1740,7 @@ class InstallTest(Base):
 
     def run_install(self, *args, config=None, **extra_env):
         env = {**self.env, **self.dirs, **extra_env}
+        env = {name: value for name, value in env.items() if value is not None}  # an extra value of None unsets the variable
         if config is not None:
             env["UBUNTU_TWEAK_MODULE_CONFIG"] = config
         return subprocess.run(["bash", str(INSTALL), *args], capture_output=True, text=True, env=env)
@@ -2082,6 +2098,34 @@ class InstallTest(Base):
         self.assertEqual(self.run_install("--check", config='{"autoheal": false}', **env).returncode, 0)
         self.assertEqual(self.run_install(config='{"autoheal": false}', **env).returncode, 0)
         self.assertEqual([c for c in self.calls() if c.startswith("docker")], [])
+
+    def test_installers_with_different_runtime_dirs_exclude_each_other(self):
+        # a login (systemd user environment) and an ssh session see different XDG_RUNTIME_DIR values, but one HOME
+        lock = self.root / "home" / ".cache" / "service-failover-install.lock"
+        lock.parent.mkdir(parents=True)
+        for runtime in (None, str(self.root / "run-a"), str(self.root / "run-b")):
+            with self.subTest(xdg_runtime_dir=runtime), open(lock, "w") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = self.run_install(SERVICE_FAILOVER_INSTALL_LOCK=None, XDG_RUNTIME_DIR=runtime, SERVICE_FAILOVER_INSTALL_LOCK_WAIT="1")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("another install of this module holds", result.stderr)
+                self.assertFalse((self.root / "u").exists())
+
+    def test_an_install_whose_lock_cannot_be_created_changes_nothing(self):
+        parent_is_a_file = self.root / "not-a-directory"
+        parent_is_a_file.write_text("")
+        lock_is_a_directory = self.root / "directory.lock"
+        lock_is_a_directory.mkdir()
+        for why, lock in (("the lock directory cannot be created", parent_is_a_file / "install.lock"),
+                          ("the lock file cannot be opened", lock_is_a_directory)):
+            with self.subTest(why):
+                result = self.run_install(SERVICE_FAILOVER_INSTALL_LOCK=str(lock))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("cannot take the install lock", result.stderr)
+                self.assertIn("nothing was changed", result.stderr)
+                for directory in ("u", "b", "c", "etc"):
+                    self.assertFalse((self.root / directory).exists(), directory)
+                self.assertEqual([c for c in self.calls() if " enable " in c or " daemon-reload" in c], [])
 
 if __name__ == "__main__":
     unittest.main()
