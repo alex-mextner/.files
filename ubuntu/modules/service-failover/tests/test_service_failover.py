@@ -1240,6 +1240,67 @@ class InstallTest(Base):
         self.assertIn("no unit was restarted", result.stdout)
         self.assertFalse((self.root / "u").exists())
 
+    def dropin(self, unit):
+        """The unit's 30-failover-restart.conf as {section: {key: value}}."""
+        sections, current = {}, None
+        for line in (self.root / "etc" / f"{unit}.d" / "30-failover-restart.conf").read_text().splitlines():
+            if line.startswith("[") and line.endswith("]"):
+                current = sections.setdefault(line[1:-1], {})
+            elif current is not None and "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                current[key] = value
+        return sections
+
+    def test_system_unit_with_a_policy_never_gives_up_and_sets_every_value_explicitly(self):
+        result = self.run_install("--system", "caddy.service", "ha-host-actions.service=always", "hcb-odroid-watchdog.service=on-failure")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backoff = {"RestartSec": "2", "RestartSteps": "8", "RestartMaxDelaySec": "5min"}
+        self.assertEqual(self.dropin("ha-host-actions.service"),
+                         {"Unit": {"StartLimitIntervalSec": "0"}, "Service": {"Restart": "always", **backoff}})
+        self.assertEqual(self.dropin("hcb-odroid-watchdog.service"),
+                         {"Unit": {"StartLimitIntervalSec": "0"}, "Service": {"Restart": "on-failure", **backoff}})
+        # a plain unit name keeps the minimal drop-in: no start limit and no backoff of its own
+        self.assertEqual(self.dropin("caddy.service"), {"Service": {"Restart": "on-failure"}})
+        self.assertFalse((self.root / "etc" / "ha-host-actions.service=always.d").exists())
+
+    def test_system_policy_drop_ins_are_checked_idempotent_and_follow_the_listed_policy(self):
+        args = ("--system", "ha-host-actions.service=always")
+        self.assertEqual(self.run_install("--check", *args).returncode, 3)
+        self.assertEqual(self.run_install(*args).returncode, 0)
+        self.assertEqual(self.run_install("--check", *args).returncode, 0)
+        again = self.run_install(*args)
+        self.assertNotIn("installed:", again.stdout)
+        # the same unit listed as a plain name again: the drop-in is rewritten to the minimal one
+        self.assertEqual(self.run_install("--check", "--system", "ha-host-actions.service").returncode, 3)
+        self.assertEqual(self.run_install("--system", "ha-host-actions.service").returncode, 0)
+        self.assertEqual(self.dropin("ha-host-actions.service"), {"Service": {"Restart": "on-failure"}})
+
+    def test_system_policy_drop_in_is_stale_once_the_unit_is_no_longer_listed(self):
+        self.run_install("--system", "ha-host-actions.service=always")
+        self.assertIn("stale:", self.run_install("--check", "--system").stdout)
+        self.run_install("--system")
+        self.assertFalse((self.root / "etc" / "ha-host-actions.service.d" / "30-failover-restart.conf").exists())
+
+    def test_system_policy_must_be_always_or_on_failure_and_is_for_system_only(self):
+        for bad in ("ha-host-actions.service=never", "ha-host-actions.service=", "=always"):
+            result = self.run_install("--system", bad)
+            self.assertEqual(result.returncode, 2, bad)
+        self.assertFalse((self.root / "etc" / "ha-host-actions.service.d").exists())
+        self.assertEqual(self.run_install("ha-host-actions.service=always").returncode, 2)
+
+    def test_system_unit_listed_twice_with_different_policies_is_refused_in_either_order(self):
+        # one drop-in file per unit: two different contents for it would install twice and report drift forever
+        for specs in (("foo.service", "foo.service=always"), ("foo.service=always", "foo.service"),
+                      ("foo.service=always", "foo.service=on-failure")):
+            result = self.run_install("--system", *specs)
+            self.assertEqual(result.returncode, 2, specs)
+            self.assertIn("listed twice", result.stderr)
+        self.assertFalse((self.root / "etc" / "foo.service.d").exists())
+        # the same spec twice is one request
+        args = ("--system", "foo.service=always", "foo.service=always")
+        self.assertEqual(self.run_install(*args).returncode, 0)
+        self.assertEqual(self.run_install("--check", *args).returncode, 0)
+
     def test_system_level_without_root_names_the_exact_sudo_command(self):
         if os.geteuid() == 0:
             self.skipTest("running as root")

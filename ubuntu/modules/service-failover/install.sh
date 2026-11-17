@@ -7,8 +7,12 @@
 #   install.sh --restart-only         the same without the repair stack: only the restart backoff (hosts without omp,
 #                                     such as odroidn2: a PC scans them over ssh)
 #   install.sh --autoheal             also bring up the docker autoheal container (needs docker access)
-#   install.sh --system [UNIT...]     root level, run once with sudo: /etc/systemd/system/service.d/10-failover.conf, and
-#                                     Restart=on-failure drop-ins for the listed units that have no Restart= of their own.
+#   install.sh --system [UNIT[=POLICY]...]
+#                                     root level, run once with sudo: /etc/systemd/system/service.d/10-failover.conf, and
+#                                     a per-unit drop-in for each listed unit. UNIT alone: Restart=on-failure for a unit
+#                                     that has no Restart= of its own. UNIT=always or UNIT=on-failure (always is refused
+#                                     for Type=oneshot): never give up, StartLimitIntervalSec=0, Restart=POLICY,
+#                                     RestartSec=2, RestartSteps=8, RestartMaxDelaySec=5min, all set explicitly.
 #                                     Combine with --plan / --check (those do not need root). Restarts nothing.
 #
 # Exit codes (ubuntu-tweak system-module protocol): 0 ok, 3 drift (--check), 10 needs a manual step, others = failure.
@@ -33,8 +37,8 @@ while [ "$#" -gt 0 ]; do
     --restart-only) cli_restart_only=1 ;;
     --autoheal) cli_autoheal=1 ;;
     --system) level=system ;;
-    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    -*) echo "usage: $0 [--plan|--check] [--restart-only] [--autoheal] [--system [UNIT...]]" >&2; exit 2 ;;
+    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "usage: $0 [--plan|--check] [--restart-only] [--autoheal] [--system [UNIT[=always|on-failure]...]]" >&2; exit 2 ;;
     *) sys_units+=("$1") ;;
   esac
   shift
@@ -91,12 +95,34 @@ restart_dropin() { # restart_dropin UNIT -> path of a generated drop-in
   printf '# service-failover (module option restart_units / install.sh --system): this unit has no Restart= of its own.\n[Service]\nRestart=on-failure\n' >"$f"
   echo "$f"
 }
+# A unit that must come back whatever happens: every value is set explicitly (a unit file's own Restart=, RestartSec= and
+# StartLimit*= lose to a drop-in). StartLimitIntervalSec=0 switches the rate limit off; `infinity` would never forget a
+# start, so the unit would be refused for good after StartLimitBurst starts in its whole life (2026-11-09), and the
+# default 5 starts in 10 s refuses a crash loop or a manual restart burst and leaves the unit `failed` for good.
+never_give_up_dropin() { # never_give_up_dropin UNIT POLICY -> path of a generated drop-in
+  local f; f="$tmp/never-give-up-$1.conf"
+  printf '# service-failover (install.sh --system UNIT=%s): restart without a start limit, backoff 2 s growing to 5 min.\n[Unit]\nStartLimitIntervalSec=0\n[Service]\nRestart=%s\nRestartSec=2\nRestartSteps=8\nRestartMaxDelaySec=5min\n' "$2" "$2" >"$f"
+  echo "$f"
+}
 if [ "$level" = system ]; then
   want+=("$here/files/service.d/10-failover.conf|$etc_dir/service.d/10-failover.conf|644")
-  for u in "${sys_units[@]}"; do
+  declare -A listed=()
+  for spec in "${sys_units[@]}"; do
+    u=${spec%%=*}; policy=; plain=1
+    case "$spec" in *=*) policy=${spec#*=}; plain=0 ;; esac
     case "$u" in *[!A-Za-z0-9:_.@-]*|"") echo "bad unit name (a plain NAME.service): $u" >&2; exit 2 ;; esac
     case "$u" in *.service) ;; *) echo "bad unit name (a plain NAME.service): $u" >&2; exit 2 ;; esac
-    want+=("$(restart_dropin "$u")|$etc_dir/$u.d/30-failover-restart.conf|644")
+    # one drop-in file per unit: two different specs for it would fight over the file (--check would report drift forever)
+    if [ -n "${listed[$u]+x}" ]; then
+      [ "${listed[$u]}" = "$spec" ] && continue
+      echo "unit listed twice with different policies: $u (${listed[$u]} and $spec)" >&2; exit 2
+    fi
+    listed[$u]=$spec
+    case "$plain:$policy" in
+      1:) want+=("$(restart_dropin "$u")|$etc_dir/$u.d/30-failover-restart.conf|644") ;;
+      0:always|0:on-failure) want+=("$(never_give_up_dropin "$u" "$policy")|$etc_dir/$u.d/30-failover-restart.conf|644") ;;
+      *) echo "bad restart policy for $u (UNIT=always or UNIT=on-failure): $policy" >&2; exit 2 ;;
+    esac
   done
 else
   want+=("$here/files/service.d/10-failover.conf|$unit_dir/service.d/10-failover.conf|644")
