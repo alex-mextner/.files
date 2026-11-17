@@ -75,10 +75,13 @@ etc_dir=${SERVICE_FAILOVER_ETC_DIR:-/etc/systemd/system}
 launcher=$HOME/.agents/skills/rig-detached-omp/rig-detached-omp
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 # One install at a time (two `ubuntu-tweak apply` runs, or one by hand beside it): what is inspected below is what is changed.
+# The lock path is the same for every caller: XDG_RUNTIME_DIR exists in a login session and not in an ssh one, so a path
+# that followed it would give those two installs two locks. A lock that cannot be created or opened is an error, not a
+# reason to go on without one.
 if [ "$mode" = install ] && command -v flock >/dev/null; then
-  lock=${SERVICE_FAILOVER_INSTALL_LOCK:-${XDG_RUNTIME_DIR:-$HOME/.cache}/service-failover-install.lock}
-  mkdir -p "$(dirname "$lock")" && exec 8>"$lock" \
-    && { flock -w "${SERVICE_FAILOVER_INSTALL_LOCK_WAIT:-120}" 8 || { echo "another install of this module holds $lock; nothing was changed" >&2; exit 1; }; }
+  lock=${SERVICE_FAILOVER_INSTALL_LOCK:-$HOME/.cache/service-failover-install.lock}
+  { mkdir -p "$(dirname "$lock")" && exec 8>"$lock"; } || { echo "cannot take the install lock $lock (its directory or the file cannot be created); nothing was changed" >&2; exit 1; }
+  flock -w "${SERVICE_FAILOVER_INSTALL_LOCK_WAIT:-120}" 8 || { echo "another install of this module holds $lock; nothing was changed" >&2; exit 1; }
 fi
 
 # The wanted files: "SRC|DEST|MODE" (SRC is a module file or a generated one under $tmp).

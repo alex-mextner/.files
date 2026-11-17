@@ -148,7 +148,9 @@ PC (profile module, `[modules.service-failover] enabled = true` in `machines/ubu
 `ubuntu-tweak apply --commit`, or by hand `bash install.sh` (`--plan`, `--check` are read-only). It writes user files,
 runs `daemon-reload`, enables the scan timer and starts it again when it is enabled but stopped. It restarts nothing: a unit
 takes the new backoff at its next start. A repair run bounds every `systemctl`/`journalctl`/ssh query (30 s) and
-closes its lock descriptor for them, so a hung host cannot keep the one-session lock.
+closes its lock descriptor for them, so a hung host cannot keep the one-session lock. The install holds one lock,
+`~/.cache/service-failover-install.lock`, whatever `XDG_RUNTIME_DIR` is (a login session has one and an ssh session has
+not); an install that cannot create or open it stops before it changes anything.
 
 Odroid, user level, once (no repository checkout there, so copy the module):
 

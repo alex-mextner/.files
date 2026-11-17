@@ -287,17 +287,21 @@ if [[ "$fragment" == /usr/* || "$fragment" == /lib/* || "$fragment" == */generat
 fi
 # The unit declares its last exit final (RestartPreventExitStatus=, e.g. 75 for "another worker holds the lock"). The
 # list holds exit codes (ExecMainCode=1 and ExecMainStatus is the code) and signal names (ExecMainCode=2 or 3 and
-# ExecMainStatus is the signal number): a code is never read as a signal or the other way round.
+# ExecMainStatus is the signal number): a code is never read as a signal or the other way round. A signal is compared by
+# its number, as bash itself numbers it (`kill -l`): systemd lists a real-time signal as RTMIN+3 or RTMAX-1 (the unit file
+# may write SIGRTMIN+3), and a name with a sign in it is not a word that survives a name-for-name comparison.
 declares_final() {
-  local want tok
-  case "$(prop ExecMainCode)" in
-    1) want=$(prop ExecMainStatus) ;;
-    2|3) want=$(kill -l "$(prop ExecMainStatus)" 2>/dev/null) ;;
-    *) return 1 ;;
-  esac
-  [ -n "$want" ] || return 1
-  for tok in $(sed -n "s/^RestartPreventExitStatus=//p" <<<"$props" | head -n1 | tr -cd "A-Za-z0-9 "); do
-    [ "${tok#SIG}" = "$want" ] && { final=$tok; return 0; }
+  local code status tok number
+  code=$(prop ExecMainCode); status=$(prop ExecMainStatus)
+  case "$code" in 1|2|3) ;; *) return 1 ;; esac
+  [[ "$status" =~ ^[0-9]+$ ]] || return 1
+  for tok in $(sed -n "s/^RestartPreventExitStatus=//p" <<<"$props" | head -n1 | tr -cd "A-Za-z0-9 +-"); do
+    if [ "$code" = 1 ]; then
+      [ "$tok" = "$status" ] && { final=$tok; return 0; }
+    else
+      [[ "$tok" =~ ^[0-9]+$ ]] && continue
+      number=$(kill -l "${tok#SIG}" 2>/dev/null) && [ "$number" = "$status" ] && { final=$tok; return 0; }
+    fi
   done
   return 1
 }
