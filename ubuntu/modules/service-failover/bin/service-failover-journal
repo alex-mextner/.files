@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""service-failover-journal: what may leave a failed unit's journal on its way into a repair brief or a notification.
+
+    service-failover-journal brief UNIT MANAGER_PID      stdin: `journalctl -o json` lines   stdout: the summary for the brief
+    service-failover-journal notice UNIT MANAGER_PID     stdin: the same                     stdout: one line for the notification
+    service-failover-journal limit-hit UNIT MANAGER_PID  stdin: the same     exit 0 when the manager refused a start of UNIT: too quickly
+    service-failover-journal error                       stdin: what systemctl or ssh printed   stdout: one fixed phrase for it
+
+A service's own output is arbitrary text and may hold any credential in any shape: a list of patterns that hide the secret
+shapes known so far never converges (ten review rounds each found one more). So nothing is masked: the output is BUILT, and
+every part of it comes from a closed grammar G, never from the text of the journal:
+  * the unit name the caller passed (a captured name has to equal it),
+  * integers in checked ranges, and the timestamps journald sets,
+  * members of the fixed tables below (unit and job results, exit and signal names, errno values, exception class names),
+  * the fixed sentences of this program.
+What the input says changes which members of G are written, never what they are. A review finding blocks only when some
+input makes an output line leave G.
+  * An entry is the manager's own when journald says that the writing process is systemd's binary (`_COMM`, `_EXE`) and has
+    the manager's process id (`_PID`: 1 for the system manager, the user manager's own id otherwise): the SYSLOG_IDENTIFIER a
+    service may choose is not looked at, and neither `_COMM` nor `_EXE` alone proves anything about a process that runs as
+    the same user. Such an entry is kept only when it fits one of the known messages below, and is then rebuilt from them.
+  * Of any other entry (the service's own output) no text is copied. The summary counts the lines and lists the table members
+    found in them (an errno name or text, an exception class name); the service may suggest such a member, not write a word.
+  * `error` turns the error text of systemctl or ssh into one phrase of a fixed table.
+The agent that reads the brief has `journalctl` on the host and reads the rest itself. Nothing but python3 is needed; when it
+is missing, or this program stops at its deadline, nothing comes out: the caller shows a placeholder.
+"""
+import json
+import re
+import sys
+from datetime import datetime, timezone
+
+ENTRY_MAX = 1 << 20            # a journal entry longer than this (as JSON) is read no further: counted as one entry of unknown text
+TOTAL_MAX = 16 << 20           # bytes of journal read in all; the caller asks for a few dozen entries
+ENTRIES_MAX = 1000
+SHOWN_MAX = 15                 # manager entries shown, the latest ones
+HINTS_MAX = 8                  # table members listed for the service's output
+NOTICE_MAX = 300
+SCAN_MAX = 4096                # characters of one line of the service's output looked at (journald allows 48 KiB)
+ERROR_MAX = 65536              # bytes of an error text looked at
+
+# What systemd's own binary is, as journald records the writing process.
+SYSTEMD_EXE = ('/usr/lib/systemd/systemd', '/lib/systemd/systemd')
+
+# --- the closed tables -------------------------------------------------------------------------------------------------
+UNIT_RESULTS = frozenset('success resources protocol timeout exit-code signal core-dump watchdog start-limit-hit oom-kill skipped'.split())
+JOB_RESULTS = frozenset('done canceled timeout failed dependency skipped invalid assert unsupported collected once frozen concurrency'.split())
+JOB_TYPES = frozenset('start stop reload restart try-restart reload-or-restart try-reload-or-restart verify-active nop'.split())
+STATES = frozenset('''dead condition start-pre start start-post running exited reload reload-signal reload-notify stop stop-watchdog
+    stop-sigterm stop-sigkill stop-post final-watchdog final-sigterm final-sigkill failed auto-restart auto-restart-queued cleaning'''.split())
+EXIT_NAMES = frozenset('''SUCCESS FAILURE INVALIDARGUMENT NOTIMPLEMENTED NOPERMISSION NOTINSTALLED NOTCONFIGURED NOTRUNNING USAGE DATAERR NOINPUT
+    NOUSER NOHOST UNAVAILABLE SOFTWARE OSERR OSFILE CANTCREAT IOERR TEMPFAIL PROTOCOL NOPERM CONFIG CHDIR NICE FDS EXEC MEMORY LIMITS
+    OOM_ADJUST SIGNAL_MASK STDIN STDOUT CHROOT IOPRIO TIMERSLACK SECUREBITS SETSCHEDULER CPUAFFINITY GROUP USER CAPABILITIES CGROUP
+    SETSID CONFIRM STDERR PAM NETWORK NAMESPACE NO_NEW_PRIVILEGES SECCOMP SELINUX_CONTEXT PERSONALITY APPARMOR ADDRESS_FAMILIES
+    RUNTIME_DIRECTORY CHOWN SMACK_PROCESS_LABEL KEYRING STATE_DIRECTORY CACHE_DIRECTORY LOGS_DIRECTORY CONFIGURATION_DIRECTORY
+    NUMA_POLICY CREDENTIALS BPF
+    HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM
+    PROF WINCH IO PWR SYS'''.split())
+REALTIME_SIGNAL = re.compile(r'RT(?:MIN|MAX)[+-][0-9]{1,2}', re.ASCII)
+TIME_SPAN = re.compile(r'(?:[0-9]{1,9}(?:\.[0-9]{1,6})?(?:us|ms|s|min|h|d|w|month|y) ?){1,6}', re.ASCII)
+
+# errno values with the text libc gives them (and a few fixed phrases): found in the service's output, they are listed by
+# THIS table's text. A program's own wording around them is not.
+ERRNO_TABLE = (
+    ('ENOENT', 'No such file or directory'), ('EACCES', 'Permission denied'), ('EPERM', 'Operation not permitted'),
+    ('EADDRINUSE', 'Address already in use'), ('EADDRNOTAVAIL', 'Cannot assign requested address'),
+    ('ECONNREFUSED', 'Connection refused'), ('ECONNRESET', 'Connection reset by peer'), ('ETIMEDOUT', 'Connection timed out'),
+    ('EHOSTUNREACH', 'No route to host'), ('ENETUNREACH', 'Network is unreachable'), ('ENOSPC', 'No space left on device'),
+    ('ENOMEM', 'Cannot allocate memory'), ('EMFILE', 'Too many open files'), ('ENFILE', 'Too many open files in system'),
+    ('EROFS', 'Read-only file system'), ('EEXIST', 'File exists'), ('ENOTDIR', 'Not a directory'), ('EISDIR', 'Is a directory'),
+    ('ENOTEMPTY', 'Directory not empty'), ('EPIPE', 'Broken pipe'), ('EBUSY', 'Device or resource busy'),
+    ('ENODEV', 'No such device'), ('ENXIO', 'No such device or address'), ('ELOOP', 'Too many levels of symbolic links'),
+    ('ENAMETOOLONG', 'File name too long'), ('ENOEXEC', 'Exec format error'), ('EDQUOT', 'Disk quota exceeded'),
+    ('ESTALE', 'Stale file handle'), ('ENOTCONN', 'Transport endpoint is not connected'),
+    ('EAFNOSUPPORT', 'Address family not supported by protocol'), ('EIO', 'Input/output error'), ('EINVAL', 'Invalid argument'),
+    ('EAGAIN', 'Resource temporarily unavailable'), ('ENOTFOUND', None), ('EAI_AGAIN', None),
+    (None, 'Name or service not known'), (None, 'Temporary failure in name resolution'), (None, 'command not found'),
+    (None, 'Segmentation fault'), (None, 'Out of memory'), (None, 'Traceback (most recent call last)'),
+)
+# the class names programs raise or throw, as they print them (a module path in front of one is not listed)
+EXCEPTIONS = '''ArithmeticError AssertionError AttributeError BlockingIOError BrokenPipeError CalledProcessError CertificateError
+    ChildProcessError ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError ConnectTimeout DatabaseError
+    EOFError FileExistsError FileNotFoundError FloatingPointError HTTPError ImportError IndentationError IndexError IntegrityError
+    InterfaceError InterruptedError IsADirectoryError JSONDecodeError KeyError LookupError MemoryError ModuleNotFoundError NameError
+    NotADirectoryError NotImplementedError OSError OperationalError OverflowError PermissionError ProgrammingError ProtocolError
+    ReadTimeout RecursionError ReferenceError RuntimeError SSLCertVerificationError SSLError StopIteration SyntaxError SystemError
+    TabError TimeoutError TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError UnicodeError ValueError ZeroDivisionError
+    AccessDeniedException BindException ClassNotFoundException ConcurrentModificationException ConnectException FileNotFoundException
+    IOException IllegalArgumentException IllegalStateException InterruptedException NoClassDefFoundError NullPointerException
+    OutOfMemoryError SQLException SSLHandshakeException SecurityException SocketException SocketTimeoutException StackOverflowError
+    TimeoutException UnknownHostException UnsatisfiedLinkError UnsupportedOperationException AggregateError EvalError RangeError URIError'''.split()
+ERROR_PRIORITY = frozenset('0123')
+
+HINT_TOKENS = sorted({*(t for pair in ERRNO_TABLE for t in pair if t), *EXCEPTIONS}, key=len, reverse=True)    # the longest first
+HINT_RULE = re.compile(r'(?<![A-Za-z0-9_])(?:' + '|'.join(map(re.escape, HINT_TOKENS)) + r')(?![A-Za-z0-9_])')
+ANSI = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')       # a coloured log line: the escape would end in a letter, and a name behind it is no word
+
+# error text of systemctl and ssh -> one phrase (the first rule that fits)
+TOOL_ERRORS = tuple((re.compile(pattern, re.I | re.A), phrase) for pattern, phrase in (
+    (r'access denied|authentication is required|interactive authentication|permission denied|not permitted|not authorized', 'permission refused'),
+    (r'start request repeated too quickly|start-limit|start limit', 'start limit refused'),
+    (r'timed out|timeout|time out', 'timed out'),
+    (r'could not resolve|name or service not known|no route to host|unreachable|connection refused|connection reset|connection closed|'
+     r'host key|kex_exchange|connect to host|broken pipe', 'host unreachable'),
+    (r'failed to connect to (?:user scope )?bus|no medium found|dbus|\bbus\b', 'no bus connection'),
+    (r'masked', 'unit masked'),
+    (r'not found|not loaded|does not exist|no such file|unknown unit|could not be found', 'unit not found'),
+    (r'dependency', 'dependency failed'),
+))
+UNIT = re.compile(r'[A-Za-z0-9:_.@\\-]{1,255}')       # a unit name: the characters the repair script accepts, up to the 255 systemd allows
+
+CAUSE, CONSEQUENCE, BOOKKEEPING, ROUTINE = 2, 1, 0, -1
+
+
+def exit_name(name):
+    return name if name in EXIT_NAMES or name == 'n/a' or REALTIME_SIGNAL.fullmatch(name) else None
+
+
+def exited(unit, m):
+    """`Main process exited, code=exited, status=203/EXEC` (and `Control process`): the status is a number up to 255, its name a table member."""
+    status = int(m.group(3))
+    if status > 255:
+        return None
+    name = exit_name(m.group(4))
+    return f'{unit}: {m.group(1)} process exited, code={m.group(2)}, status={status}' + (f'/{name}' if name else '')
+
+
+def span(m, index=1):
+    return m.group(index).strip() if TIME_SPAN.fullmatch(m.group(index)) else None
+
+
+# (the first line of MESSAGE with <U> for the unit, how to build the line from the match, rank). The rank says how much the line
+# explains the failure: 2 its cause (the exit, a timeout, the OOM killer), 1 its consequence, 0 only bookkeeping, -1 routine;
+# the notification shows the latest line of the highest rank, and never a routine one. A builder that returns None drops the line.
+TEMPLATES = (
+    (r'<U>: (Main|Control) process exited, code=(exited|killed|dumped), status=([0-9]{1,3})/([A-Za-z0-9_+/-]{1,24})', exited, CAUSE),
+    (r"<U>: Failed with result '([a-z-]{1,20})'\.", lambda u, m: f"{u}: Failed with result '{m.group(1)}'." if m.group(1) in UNIT_RESULTS else None, CONSEQUENCE),
+    (r'<U>: Scheduled restart job, restart counter is at ([0-9]{1,9})\.', lambda u, m: f'{u}: Scheduled restart job, restart counter is at {int(m.group(1))}.', BOOKKEEPING),
+    (r'<U>: Start request repeated too quickly\.', lambda u, m: f'{u}: Start request repeated too quickly.', CONSEQUENCE),
+    (r'<U>: Deactivated successfully\.', lambda u, m: f'{u}: Deactivated successfully.', ROUTINE),
+    (r'Failed to start <U>(?: - .*)?\.', lambda u, m: f'Failed to start {u}.', CONSEQUENCE),      # the description is the unit file's text
+    (r'Dependency failed for <U>(?: - .*)?\.', lambda u, m: f'Dependency failed for {u}.', CONSEQUENCE),
+    (r"Job <U>/([a-z-]{1,30}) failed with result '([a-z-]{1,20})'\.",
+     lambda u, m: f"Job {u}/{m.group(1)} failed with result '{m.group(2)}'." if m.group(1) in JOB_TYPES and m.group(2) in JOB_RESULTS else None, CONSEQUENCE),
+    (r'<U>: Watchdog timeout \(limit ([0-9][0-9a-z. ]{0,40})\)!', lambda u, m: f'{u}: Watchdog timeout (limit {span(m)})!' if span(m) else None, CAUSE),
+    (r'<U>: ([a-z-]{1,20}) operation timed out\. Terminating\.', lambda u, m: f'{u}: {m.group(1)} operation timed out. Terminating.' if m.group(1) in STATES else None, CAUSE),
+    (r"<U>: State '([a-z-]{1,20})' timed out\. Killing\.", lambda u, m: f"{u}: State '{m.group(1)}' timed out. Killing." if m.group(1) in STATES else None, CAUSE),
+    (r'<U>: A process of this unit has been killed by the OOM killer\.', lambda u, m: f'{u}: A process of this unit has been killed by the OOM killer.', CAUSE),
+    (r'<U>: Service RestartSec=([0-9][0-9a-z. ]{0,40}) expired, scheduling restart\.',
+     lambda u, m: f'{u}: Service RestartSec={span(m)} expired, scheduling restart.' if span(m) else None, BOOKKEEPING),
+)
+
+
+def stamp(value):
+    """A journal timestamp (microseconds since the epoch) as UTC text; '' when it is not one."""
+    if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 17:
+        try:
+            return datetime.fromtimestamp(int(value) / 1e6, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        except (OverflowError, OSError, ValueError):
+            pass
+    return ''
+
+
+def text_of(message):
+    """MESSAGE as text: journald gives a list of byte values for a message that is not plain text, and null for a huge one."""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list) and all(isinstance(b, int) and 0 <= b < 256 for b in message):
+        return bytes(message).decode('utf-8', 'replace')
+    return None
+
+
+def compile_templates(unit):
+    return [(re.compile(pattern.replace('<U>', re.escape(unit)), re.ASCII), build, rank) for pattern, build, rank in TEMPLATES]
+
+
+def from_template(templates, unit, first_line):
+    """(rebuilt line, rank) for a first line that fits a known message, else None."""
+    for pattern, build, rank in templates:
+        m = pattern.fullmatch(first_line)
+        if m:
+            built = build(unit, m)
+            return (built, rank) if built else None
+    return None
+
+
+def recognised(message):
+    """The table members a line of the service's output holds, in order of appearance."""
+    message = ANSI.sub('', message)
+    if len(message) > SCAN_MAX:    # cut at a space: a word the cut splits could leave the front of a longer word that is a member
+        message = message[:message.rfind(' ', 0, SCAN_MAX) + 1]
+    return [m.group(0) for m in HINT_RULE.finditer(message)]
+
+
+def read_entries(stream):
+    """Yield the journal entries (dicts) of `journalctl -o json`, and None for one too long to read; lines that are no JSON
+    object (journalctl's own `-- No entries --`) are skipped."""
+    total = 0
+    for _ in range(ENTRIES_MAX):
+        raw = stream.readline(ENTRY_MAX + 1)
+        total += len(raw)
+        if not raw or total > TOTAL_MAX:
+            return
+        if len(raw) > ENTRY_MAX and not raw.endswith(b'\n'):
+            while raw and not raw.endswith(b'\n'):      # the rest of the line is read away, unlooked at
+                raw = stream.readline(ENTRY_MAX)
+                total += len(raw)
+            yield None
+            continue
+        try:
+            entry = json.loads(raw.decode('utf-8', 'replace'))
+        except (ValueError, RecursionError):      # not JSON, or nested deeper than python reads
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def manager_wrote(entry, manager_pid):
+    return (entry.get('_COMM') == 'systemd' and isinstance(entry.get('_EXE'), str) and entry['_EXE'] in SYSTEMD_EXE
+            and manager_pid != '0' and entry.get('_PID') == manager_pid)
+
+
+def summarize(stream, unit, manager_pid):
+    """The journal as the allowlist sees it: (the latest manager entries as (time, built line, rank), the number of manager entries not
+    known, own-output lines, of them at error priority, what was recognised in them, first and last time)."""
+    templates = compile_templates(unit)
+    shown, own, own_errors, hints, other, first, last = [], 0, 0, [], 0, '', ''
+    for entry in read_entries(stream):
+        when = stamp(entry.get('__REALTIME_TIMESTAMP')) if entry else ''
+        if when:
+            first, last = first or when, when
+        message = text_of(entry.get('MESSAGE')) if entry else None
+        if entry and message is not None and manager_wrote(entry, manager_pid):
+            built = from_template(templates, unit, message.split('\n', 1)[0])
+            if built is None:
+                other += 1
+            else:
+                shown.append((when, *built))
+            continue
+        own += 1
+        if entry and isinstance(entry.get('PRIORITY'), str) and entry['PRIORITY'] in ERROR_PRIORITY:
+            own_errors += 1
+        for token in recognised(message or ''):
+            if token in hints:
+                hints.remove(token)
+            hints.append(token)               # the most recent mention last
+    return shown[-SHOWN_MAX:], other, own, own_errors, hints[-HINTS_MAX:], first, last
+
+
+def plural(n, one, many):
+    return f'{n} {one if n == 1 else many}'
+
+
+def fit(hints, room):
+    """The newest hints whose list fits in `room` characters: whole members from the oldest end go, never half of one."""
+    while hints and len(', '.join(hints)) > room:
+        hints = hints[1:]
+    return hints
+
+
+def brief(stream, unit, manager_pid):
+    shown, other, own, own_errors, hints, first, last = summarize(stream, unit, manager_pid)
+    lines = []
+    if first:
+        lines.append(f'Entries of the journal window: {first} .. {last}')
+    lines += [f'{when or "?"} systemd: {line}' for when, line, _ in shown]
+    if other:
+        lines.append(f'{plural(other, "more entry", "more entries")} written by systemd, not copied (not a known message)')
+    if own:
+        lines.append(f"{plural(own, 'line', 'lines')} of the unit's own output" + (f' ({own_errors} at error priority)' if own_errors else '') +
+                     ', not copied: they may hold secrets; read them with journalctl on the host')
+        label = 'recognised in them (reported by the service, not verified): '
+        if fit(hints, 300 - len(label)):
+            lines.append(label + ', '.join(fit(hints, 300 - len(label))))
+    return '\n'.join(lines)
+
+
+def notice(stream, unit, manager_pid):
+    shown, other, own, own_errors, hints, first, last = summarize(stream, unit, manager_pid)
+    best = max((rank for _, _, rank in shown), default=ROUTINE)
+    pick = ([line for _, line, rank in shown if rank == best and rank > ROUTINE] or [''])[-1]
+    extra = ''
+    if own:
+        extra = f'{plural(own, "line", "lines")} of its own output not shown (may hold secrets)'
+        head = '; '.join(part for part in (pick, extra) if part)
+        room = NOTICE_MAX - len(head) - len('; recognised: ')
+        if fit(hints, room):
+            extra += '; recognised: ' + ', '.join(fit(hints, room))
+    return ('; '.join(part for part in (pick, extra) if part) or '(no log line)')[:NOTICE_MAX]
+
+
+def limit_hit(stream, unit, manager_pid):
+    """Did the manager itself refuse a start of the unit for coming too quickly? A line of the service's output saying so is no proof.
+    The whole window is read, also after the first match: a caller that closes the pipe early would see its writer killed."""
+    pattern = re.compile(re.escape(unit) + r': Start request repeated too quickly\.', re.ASCII)
+    hit = False
+    for entry in read_entries(stream):
+        if entry and manager_wrote(entry, manager_pid) and isinstance(entry.get('MESSAGE'), str) and pattern.fullmatch(entry['MESSAGE'].split('\n', 1)[0]):
+            hit = True
+    return hit
+
+
+def tool_error(stream):
+    """One phrase for what systemctl or ssh printed: from a fixed table, `refused` when none fits, nothing for no text."""
+    text = stream.read(ERROR_MAX).decode('utf-8', 'replace')
+    if not text.strip():
+        return ''
+    return next((phrase for pattern, phrase in TOOL_ERRORS if pattern.search(text)), 'reason withheld')
+
+
+def main(argv):
+    mode, args = argv[1:2], argv[2:]
+    if mode == ['error'] and not args:
+        sys.stdout.write(tool_error(sys.stdin.buffer))
+        return 0
+    if mode in (['brief'], ['notice'], ['limit-hit']) and len(args) == 2 and UNIT.fullmatch(args[0]) and args[1].isascii() and args[1].isdigit():
+        stream, unit, pid = sys.stdin.buffer, args[0], str(int(args[1]))
+        if mode == ['limit-hit']:
+            return 0 if limit_hit(stream, unit, pid) else 1
+        text = (brief if mode == ['brief'] else notice)(stream, unit, pid)
+        sys.stdout.write(text + ('\n' if text else ''))
+        return 0
+    sys.stderr.write('usage: service-failover-journal (brief | notice | limit-hit) UNIT MANAGER_PID | error\n')
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
