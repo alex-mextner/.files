@@ -69,7 +69,8 @@ server up · `@resurrect-save-script-path` is the wrapper · layout hooks presen
 `rig apply` that forgets them is reported loudly) · `@continuum-save-interval` > 0 · `tmux-autosave.timer`,
 `tmux-boot.service`, `tmux-shutdown-save.service`, `tmux-shutdown-watch.service` enabled and loaded (the last three only
 when their unit files exist) · a save ran within 2x the continuum interval while panes exist · the omp/cc/codex session
-map exists, is not empty and is fresh while an agent pane runs.
+map exists, is not empty and is fresh while an interactive agent pane runs (a one-shot `claude -p`, `codex exec` or
+`codex mcp-server` that an agent starts for a review or a tool leaves no session and demands no map).
 
 `status-right` without continuum's token is only a note: Moshi empties it on every attach and nothing here depends on it.
 Self-heal never restarts or kills the server. Every heal and every unresolved problem alerts through `tmux-alert`
