@@ -80,7 +80,7 @@ class Watchdog(StubBase):
     def healthy(self):
         """A server in which every invariant holds, with fresh saves and no agent panes."""
         self.put("panes", "100\tzsh\n101\tzsh\n")
-        self.put("ps", "100 1 -zsh\n101 1 -zsh\n")
+        self.put("ps", "100 1 pts/1 -zsh\n101 1 pts/2 -zsh\n")  # pid ppid tty args, the columns tmux-lib asks ps for
         write_exec(os.path.join(self.fakebin, "ps"), '#!/bin/sh\ncat "$STUB/ps" 2>/dev/null\n')
         self.option("@continuum-save-interval", "15")
         self.option("@continuum-save-last-timestamp", str(int(time.time())))
@@ -101,6 +101,8 @@ class Watchdog(StubBase):
         self.put("calls.log", "")
 
     def watchdog(self, *args, **extra):
+        # the agent detection reads argv from TL_PROC_ROOT/PID/cmdline: a fake root keeps a stub pid off a real process
+        extra.setdefault("TL_PROC_ROOT", os.path.join(self.tmp, "proc"))
         return self.run_script(
             "tmux-watchdog", *args,
             TMUX_WATCHDOG_RIG_CONF=self.rig_conf, TMUX_WATCHDOG_UNIT_DIR=self.units, TMUX_BOOT_ID_FILE=self.boot_id,
@@ -356,7 +358,7 @@ class Watchdog(StubBase):
 
     def test_a_claude_pane_that_shows_its_version_demands_the_cc_map_and_the_forced_save_heals_it(self):
         self.put("panes", "100\tzsh\n300\t2.1.178\n")  # pane_current_command is the VERSION, never `claude`
-        self.put("ps", "100 1 -zsh\n300 1 -zsh\n301 300 /home/ultra/.local/share/claude/versions/2.1.178 --resume abc\n")
+        self.put("ps", "100 1 pts/1 -zsh\n300 1 pts/3 -zsh\n301 300 pts/3 /home/ultra/.local/share/claude/versions/2.1.178 --resume abc\n")
         self.saver_writing("cc-sessions.map")
         res = self.watchdog()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -366,21 +368,77 @@ class Watchdog(StubBase):
 
     def test_a_claude_pane_without_a_cc_map_is_a_problem_when_the_save_cannot_write_one(self):
         self.put("panes", "300\t2.1.178\n")
-        self.put("ps", "300 1 -zsh\n301 300 claude --resume abc\n")  # a symlink launch: argv[0] is `claude`
+        self.put("ps", "300 1 pts/3 -zsh\n301 300 pts/3 claude --resume abc\n")  # a symlink launch: argv[0] is `claude`
         res = self.watchdog()
         self.assertEqual(res.returncode, 1)
         self.assertIn("cc-sessions.map is missing or empty", res.stderr)
 
     def test_a_codex_pane_demands_the_codex_map(self):
         self.put("panes", "400\tnode\n")
-        self.put("ps", "400 1 -zsh\n401 400 /usr/local/bin/codex resume abc\n")
+        self.put("ps", "400 1 pts/4 -zsh\n401 400 pts/4 /usr/local/bin/codex resume abc\n")
         res = self.watchdog()
         self.assertEqual(res.returncode, 1)
         self.assertIn("codex-sessions.map is missing or empty", res.stderr)
 
+    def run_procs(self, pane, procs):
+        """Stub the pane and its process table from (pid, ppid, tty, argv) rows: ps shows the flattened argv, the fake
+        /proc/PID/cmdline (TL_PROC_ROOT) the exact NUL-separated one, as on Linux."""
+        self.put("panes", pane)
+        self.put("ps", "".join(f"{pid} {ppid} {tty} {' '.join(argv)}\n" for pid, ppid, tty, argv in procs))
+        for pid, _, _, argv in procs:
+            os.makedirs(os.path.join(self.tmp, "proc", str(pid)), exist_ok=True)
+            with open(os.path.join(self.tmp, "proc", str(pid), "cmdline"), "wb") as f:
+                f.write(b"".join(a.encode() + b"\0" for a in argv))
+        return self.watchdog()
+
+    def test_one_shot_claude_and_codex_runs_without_a_terminal_demand_no_map(self):
+        # an omp in the pane runs a review: its `codex exec` / `claude -p` run detached from the pane's terminal and leave
+        # no resumable session, so rig writes no map line for them and the watchdog must not demand one (it failed every
+        # pass while such a review ran)
+        self.saver_writing("omp-sessions.map")
+        res = self.run_procs("100\tomp\n", [
+            (100, 1, "pts/1", ["omp"]),
+            (110, 100, "?", ["node", "/usr/local/bin/codex", "exec", "-s", "read-only", "--ephemeral", "-"]),
+            (111, 110, "?", ["/opt/codex/bin/codex", "exec", "-s", "read-only", "--ephemeral", "-"]),
+            (120, 100, "?", ["/home/ultra/.local/share/claude/versions/2.1.178", "-p", "--output-format", "json"]),
+            (130, 100, "?", ["/usr/local/bin/codex", "mcp-server"]),
+        ])
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("cc-sessions.map", res.stdout + res.stderr)
+        self.assertNotIn("codex-sessions.map", res.stdout + res.stderr)
+
+    def test_an_interactive_agent_still_demands_its_map_with_one_sign_of_a_one_shot(self):
+        for case, kind, tty, argv in (
+            # a terminal: whatever the arguments say, the pane runs it
+            ("terminal and -p", "cc", "pts/3", ["claude", "-p"]),
+            # started through setsid: no controlling terminal, and an interactive invocation
+            ("setsid launch", "cc", "?", ["claude", "--resume", "abc"]),
+            ("prompt mentions --print", "cc", "?", ["claude", "--system-prompt", "Explain --print usage"]),
+            ("prompt is exactly --print", "cc", "?", ["claude", "--system-prompt", "--print"]),
+            ("session named --print", "cc", "?", ["claude", "--name", "--print"]),
+            ("codex prompt says review", "codex", "?", ["/usr/local/bin/codex", "review this patch"]),
+            ("codex profile named review", "codex", "?", ["/usr/local/bin/codex", "--profile", "review"]),
+            ("codex prompt after --", "codex", "?", ["/usr/local/bin/codex", "--", "exec"]),
+        ):
+            with self.subTest(case=case):
+                res = self.run_procs("300\t2.1.178\n", [(300, 1, "pts/3", ["-zsh"]), (301, 300, tty, argv)])
+                self.assertEqual(res.returncode, 1)
+                self.assertIn(f"{kind}-sessions.map is missing or empty", res.stderr)
+                for key in os.listdir(os.path.join(self.state, "alerts")):
+                    os.remove(os.path.join(self.state, "alerts", key))
+
+    def test_a_detached_agent_whose_argv_cannot_be_read_still_demands_its_map(self):
+        self.put("panes", "300\t2.1.178\n")
+        self.put("ps", "300 1 pts/3 -zsh\n301 300 ? claude -p\n")  # no /proc entry under TL_PROC_ROOT
+        res = self.watchdog()
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("cc-sessions.map is missing or empty", res.stderr)
+        # an agent that exits between ps and the cmdline read is routine: no raw shell error in the journal
+        self.assertNotIn("No such file or directory", res.stderr)
+
     def test_a_nested_agent_in_the_process_tree_is_found(self):
         self.put("panes", "300\tzsh\n")
-        self.put("ps", "300 1 -zsh\n310 300 bash -c wrapper\n311 310 /opt/claude\n")
+        self.put("ps", "300 1 pts/3 -zsh\n310 300 pts/3 bash -c wrapper\n311 310 pts/3 /opt/claude\n")
         res = self.watchdog()
         self.assertEqual(res.returncode, 1)
         self.assertIn("cc-sessions.map is missing or empty", res.stderr)
@@ -389,7 +447,7 @@ class Watchdog(StubBase):
         for exe, kind in (("/home/ultra/.local/share/claude/versions/2.1.178", "cc"), ("/usr/local/bin/codex", "codex")):
             with self.subTest(kind=kind):
                 self.put("panes", "300\t2.1.178\n")
-                self.put("ps", f"300 1 {exe} --resume abc\n")  # no shell between the pane and the agent
+                self.put("ps", f"300 1 pts/3 {exe} --resume abc\n")  # no shell between the pane and the agent
                 res = self.watchdog()
                 self.assertEqual(res.returncode, 1)
                 self.assertIn(f"{kind}-sessions.map is missing or empty", res.stderr)
@@ -398,7 +456,7 @@ class Watchdog(StubBase):
 
     def test_several_panes_with_the_same_agent_demand_its_map_once_and_alert_once(self):
         self.put("panes", "300\t2.1.178\n310\t2.1.178\n320\tomp\n330\tomp\n")
-        self.put("ps", "300 1 -zsh\n301 300 claude\n310 1 -zsh\n311 310 claude\n320 1 omp\n330 1 omp\n")
+        self.put("ps", "300 1 pts/3 -zsh\n301 300 pts/3 claude\n310 1 pts/4 -zsh\n311 310 pts/4 claude\n320 1 pts/5 omp\n330 1 pts/6 omp\n")
         res = self.watchdog()
         self.assertEqual(res.returncode, 1)
         self.assertEqual(res.stderr.count("cc-sessions.map is missing or empty"), 1, res.stderr)
@@ -427,7 +485,7 @@ class Watchdog(StubBase):
         ):
             with self.subTest(exe=exe):
                 self.put("panes", "300\tbun\n")  # never `omp`, so only the process tree can say it
-                self.put("ps", f"300 1 -zsh\n301 300 {exe}\n")
+                self.put("ps", f"300 1 pts/3 -zsh\n301 300 pts/3 {exe}\n")
                 if os.path.exists(omp_map):
                     os.remove(omp_map)
                 res = self.watchdog()
@@ -443,14 +501,14 @@ class Watchdog(StubBase):
     def test_the_pane_command_omp_does_not_count_when_the_process_table_says_it_is_a_one_shot(self):
         self.saver_writing()
         self.put("panes", "300\tomp\n")
-        self.put("ps", "300 1 omp -p summarize\n")
+        self.put("ps", "300 1 pts/3 omp -p summarize\n")
         os.remove(os.path.join(self.maps, "omp-sessions.map"))
         res = self.watchdog()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_a_pane_that_merely_mentions_claude_in_an_argument_demands_nothing(self):
         self.put("panes", "500\tgrep\n600\tvim\n")
-        self.put("ps", "500 1 grep x /home/ultra/.local/share/claude/versions/\n600 1 vim claude.md\n")
+        self.put("ps", "500 1 pts/5 grep x /home/ultra/.local/share/claude/versions/\n600 1 pts/6 vim claude.md\n")
         res = self.watchdog()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertEqual(self.saver_calls(), [])

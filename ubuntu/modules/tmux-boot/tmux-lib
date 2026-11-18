@@ -306,13 +306,42 @@ tl_record_restore() { date +%s >> "$1/restore-attempts"; }
 #           up as its VERSION in #{pane_current_command}, so the pane's command never says `claude` (cc-save.sh)
 #   codex   a descendant with argv[0] `codex` or `*/codex` (codex-save.sh)
 # Only argv[0] decides what a process is: a `grep x .../claude/versions/` or `vim claude.md` in a pane is not an agent.
+# A one-shot claude/codex is not one either: the `claude -p`, `codex exec` or `codex mcp-server` that an agent in the
+# pane starts for a review or a tool leaves no session to resume, rig writes no map line for it, and demanding a map for
+# it failed every watchdog pass that ran during a review. It takes BOTH signs: no controlling terminal (ps tty `?`; such
+# a run is detached from the pane's terminal) AND a one-shot invocation read from the exact argv in /proc/PID/cmdline
+# (tl_agent_oneshot), because ps flattens argv and a missing terminal alone is not enough (an interactive agent started
+# through setsid keeps the terminal on its stdio). An argv that cannot be read counts as interactive.
+
+# tl_agent_oneshot CMDLINE_FILE: exit 0 when the NUL-separated argv in the file is a one-shot claude/codex run, read from
+# its FIRST argument only: claude `-p`/`--print`, codex `exec`/`e`/`review`/`mcp`/`mcp-server`/`app-server` (the review
+# runs seen failing the watchdog start codex as `codex exec ...`). Any later position could be the value of an option
+# (`--name --print`, `--profile review`), and the option sets of both CLIs change between releases, so a one-shot with
+# options first (`codex -C dir exec`) counts as interactive: that only keeps the old alarm, it never hides an agent.
+tl_agent_oneshot() {
+  local -a argv
+  mapfile -d '' -t argv 2>/dev/null < "$1" || return 1
+  [ "${#argv[@]}" -gt 1 ] || return 1
+  case ${argv[0]} in
+    claude|*/claude|*/claude/versions/*) case ${argv[1]} in -p|--print) return 0 ;; esac ;;
+    codex|*/codex) case ${argv[1]} in exec|e|review|mcp|mcp-server|app-server) return 0 ;; esac ;;
+  esac
+  return 1
+}
 tl_pane_agents() {
-  local panes procs
+  local panes procs oneshot pid tty exe
   panes=$("${tmux_bin:-tmux}" list-panes -a -F '#{pane_pid}	#{pane_current_command}' 2>/dev/null) || return 0
-  procs=$(ps -eo pid=,ppid=,args= 2>/dev/null) || procs=""
+  procs=$(ps -eo pid=,ppid=,tty=,args= 2>/dev/null) || procs=""
+  oneshot=""
+  while read -r pid _ tty exe _; do
+    [ "$tty" = "?" ] || continue
+    case $exe in claude|*/claude|*/claude/versions/*|codex|*/codex) ;; *) continue ;; esac
+    if tl_agent_oneshot "${TL_PROC_ROOT:-/proc}/$pid/cmdline"; then oneshot+="O $pid"$'\n'; fi
+  done <<<"$procs"
   {
     printf '%s\n' "$panes" | sed 's/^/P\t/'
     printf '%s\n' "$procs" | sed 's/^/S /'
+    printf '%s' "$oneshot"
   } | awk '
     BEGIN {
       n = split("acp agents auth-broker collab compress config dry-balance gallery gc images install join models plugin ps read render say search setup share shell ssh stats tiny-models token ttsr help version", c, " ")
@@ -331,18 +360,19 @@ tl_pane_agents() {
     }
     function kind(line,   t, nt, e, b, i, hits, at) {
       nt = split(line, t, " ")
-      e = t[4]
-      if (e == "claude" || e ~ /\/claude$/ || e ~ /\/claude\/versions\//) return "claude"
-      if (e == "codex" || e ~ /\/codex$/) return "codex"
+      e = t[5]
+      if (e == "claude" || e ~ /\/claude$/ || e ~ /\/claude\/versions\//) return (t[2] in oneshot) ? "" : "claude"
+      if (e == "codex" || e ~ /\/codex$/) return (t[2] in oneshot) ? "" : "codex"
       b = e; sub(/.*\//, "", b)
-      if (b == "omp") return interactive(t, nt, 5) ? "omp" : "omp-no"
+      if (b == "omp") return interactive(t, nt, 6) ? "omp" : "omp-no"
       if (b == "bun" || b == "node") {
         hits = 0
-        for (i = 5; i <= nt; i++) if (t[i] ~ /\/packages\/coding-agent\/src\/cli\.ts$/ || t[i] ~ /\/packages\/coding-agent\/scripts\/\.\.\/src\/cli\.ts$/) { hits++; at = i }
+        for (i = 6; i <= nt; i++) if (t[i] ~ /\/packages\/coding-agent\/src\/cli\.ts$/ || t[i] ~ /\/packages\/coding-agent\/scripts\/\.\.\/src\/cli\.ts$/) { hits++; at = i }
         if (hits == 1) return interactive(t, nt, at + 1) ? "omp" : "omp-no"
       }
       return ""
     }
+    $1 == "O" { oneshot[$2] = 1; next }
     $1 == "P" { split($0, f, "\t"); roots[++nr] = f[2]; cmd[nr] = f[3]; next }
     $1 == "S" { line[$2] = $0; kids[$3] = kids[$3] " " $2 }
     END {
