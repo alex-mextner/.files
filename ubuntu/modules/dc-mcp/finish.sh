@@ -53,7 +53,9 @@ case "${1:-}" in
   *) echo "usage: $0 check|run" >&2; exit 2 ;;
 esac
 
-"$cli" chatgpt login || exit 1
+# The tunnel is named explicitly: since computer 0.3.0 a tunnel that exists on the account without credentials here (lost ones,
+# the case this step repairs) is adopted only when named, and this machine's tunnel is the one config.toml names.
+"$cli" chatgpt login --tunnel-name "$(setting tunnel_name)" || exit 1
 "$cli" chatgpt start || exit 1
 if ! proven; then
   echo "dc-mcp: fix what is named above (a DNS record kept on purpose, or DNS not propagated yet) and run this step again" >&2
