@@ -1,101 +1,62 @@
 #!/usr/bin/env bash
 # The one human step of the dc-mcp module, `finish-setup --step dc-mcp-cloudflare`:
 #
-#   finish.sh check   exit 0 = the three units (proxy, shim, tunnel) are active (read-only, fast, no network)
-#   finish.sh run     interactive: Cloudflare login, tunnel, DNS route, start the units, print what ChatGPT needs
+#   finish.sh check   exit 0 = `computer chatgpt doctor` passes end to end AND the public URL reaches THIS machine
+#   finish.sh run     interactive: `computer chatgpt login` (Cloudflare login in a browser, tunnel, DNS route), then
+#                     `computer chatgpt start`, then the same proof as check, then `computer chatgpt connect --no-wait` prints
+#                     the fields ChatGPT needs
 #
-# Why it is human: `cloudflared tunnel login` authorizes this machine for a Cloudflare zone in a browser, and the credentials
-# it brings (~/.cloudflared/cert.pem, ~/.cloudflared/<tunnel id>.json) are secrets that never enter the repository. The proxy
-# password is NOT asked for: install.sh generated it; this script only says where it is and never prints it.
-#
-# One hostname, one machine: `route dns --overwrite-dns` moves the hostname to THIS machine's tunnel (requests would otherwise
-# split between two hosts), so `run` says so and asks before it does.
+# Why it is human: the Cloudflare login authorizes this machine for a zone in a browser; its credentials are secrets that never
+# enter the repository. The CLI keeps them in ~/.config/computer/chatgpt/cloudflared.
+# Why "reaches THIS machine" is its own proof: `login` exits 0 when the owner keeps a DNS record of the hostname that points at
+# another machine, and doctor's public check accepts any 401 with the challenge, also another dc-mcp machine's. So a request to a
+# random path of the public URL must show up in this machine's shim access log.
 set -u
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-# shellcheck source=lib.sh
-. "$here/lib.sh"
-load_options
+cli=
+command -v uv >/dev/null 2>&1 && cli=$(uv tool dir --bin 2>/dev/null)/computer
+[ -n "$cli" ] && [ -x "$cli" ] || { echo "dc-mcp: the computer CLI is not installed: run ubuntu-tweak apply --commit first" >&2; exit 1; }
 
-cf=$HOME/.local/bin/cloudflared
-cf_dir=$HOME/.cloudflared
-auth_file=${XDG_CONFIG_HOME:-$HOME/.config}/dc-mcp-auth.env
-units=(dc-mcp-bridge.service dc-mcp-shim.service dc-mcp-tunnel.service)
+# setting KEY: one value of the CLI's config.toml, with ~ expanded
+setting() {
+  python3 -B - "$1" <<'PY'
+import os, sys, tomllib
+path = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "computer", "chatgpt", "config.toml")
+with open(path, "rb") as fh:
+    print(os.path.expanduser(str(tomllib.load(fh).get(sys.argv[1], ""))))
+PY
+}
 
-if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then export XDG_RUNTIME_DIR="/run/user/$(id -u)"; fi
-sc() { systemctl --user "$@"; }
-units_active() { local u; for u in "${units[@]}"; do [ "$(sc is-active "$u" 2>/dev/null)" = active ] || return 1; done; }
-die() { echo "dc-mcp: $1" >&2; exit 1; }
+reaches_here() {
+  local probe log
+  # the shim logs every request under /.idp/ by its full path (discovery paths are collapsed per minute, so they cannot carry a nonce)
+  probe=/.idp/dc-mcp-probe-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 16)
+  log=$(setting state_dir)/access.log
+  curl -s -o /dev/null --max-time 10 "https://$(setting hostname)$probe" || return 1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    grep -qF " $probe " "$log" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# The engine kills a finish check after 60 s; doctor is bounded to 35 s and the probe to 10 + 5 s, so a slow network fails the
+# check with a reason instead of being killed.
+proven() {
+  timeout 35 "$cli" chatgpt doctor || return 1
+  reaches_here || { echo "dc-mcp: the public URL answers, but not from this machine: its DNS record points elsewhere" >&2; return 1; }
+}
 
 case "${1:-}" in
-  check)
-    units_active
-    exit $?
-    ;;
+  check) proven >/dev/null 2>&1; exit $? ;;
   run) ;;
   *) echo "usage: $0 check|run" >&2; exit 2 ;;
 esac
 
-[ -n "$opt_hostname" ] || die "set [modules.dc-mcp] hostname in machines/<host>/machine.toml first, then run: ubuntu-tweak apply --commit"
-[ -x "$cf" ] && [ -x "$HOME/.local/bin/mcp-auth-proxy" ] || die "the binaries are not installed yet: run ubuntu-tweak apply --commit first"
-for u in "${units[@]}"; do
-  [ -e "$HOME/.config/systemd/user/$u" ] || die "$u is not linked yet: run ubuntu-tweak apply --commit first"
-done
-auth_has_password() { [ -f "$auth_file" ] && grep -q '^PASSWORD=.' "$auth_file"; }
-auth_has_password || die "$auth_file has no password yet: run ubuntu-tweak apply --commit first"
-
-# 1. Cloudflare login (opens a browser; the certificate is a secret)
-if [ ! -s "$cf_dir/cert.pem" ]; then
-  echo "dc-mcp: step 1/4: Cloudflare login. A browser link appears; pick the zone of $opt_hostname and authorize."
-  "$cf" tunnel login || die "cloudflared tunnel login failed"
-  [ -s "$cf_dir/cert.pem" ] || die "the login did not leave $cf_dir/cert.pem"
-else
-  echo "dc-mcp: step 1/4: Cloudflare login already there ($cf_dir/cert.pem)"
+"$cli" chatgpt login || exit 1
+"$cli" chatgpt start || exit 1
+if ! proven; then
+  echo "dc-mcp: fix what is named above (a DNS record kept on purpose, or DNS not propagated yet) and run this step again" >&2
+  exit 1
 fi
-
-# 2. the tunnel: reuse one whose credentials are here, create it when Cloudflare does not know the name
-tunnel_id_of() { # prints the id, or nothing when Cloudflare knows no such tunnel; fails when it cannot be asked
-  local listing
-  listing=$("$cf" tunnel list --name "$opt_tunnel" -o json) || return 1
-  printf '%s' "$listing" | python3 -c 'import json,sys
-try:
-    rows = json.load(sys.stdin) or []
-except ValueError:
-    sys.exit(1)
-print(rows[0]["id"] if rows else "")'
-}
-tunnel_id=$(tunnel_id_of) || die "cannot ask Cloudflare for tunnel $opt_tunnel (network, or the login is stale: remove $cf_dir/cert.pem and run this step again)"
-if [ -z "$tunnel_id" ]; then
-  echo "dc-mcp: step 2/4: creating tunnel $opt_tunnel"
-  "$cf" tunnel create "$opt_tunnel" || die "cloudflared tunnel create $opt_tunnel failed"
-  tunnel_id=$(tunnel_id_of) || die "cannot ask Cloudflare for tunnel $opt_tunnel after creating it"
-fi
-[ -n "$tunnel_id" ] || die "cannot find tunnel $opt_tunnel after creating it"
-if [ ! -s "$cf_dir/$tunnel_id.json" ]; then
-  die "tunnel $opt_tunnel exists (id $tunnel_id) but its credentials $cf_dir/$tunnel_id.json are not on this machine: copy that file from the machine that created it, or pick a new name with [modules.dc-mcp] tunnel = \"...\" and run this step again"
-fi
-echo "dc-mcp: step 2/4: tunnel $opt_tunnel ($tunnel_id) has its credentials here"
-
-# 3. DNS: the hostname becomes a CNAME of this tunnel
-echo "dc-mcp: step 3/4: $opt_hostname will point at tunnel $opt_tunnel of THIS machine (an existing record is replaced, so any other machine serving that hostname stops receiving requests)."
-printf 'Point %s at this machine? [y/N] ' "$opt_hostname"
-read -r answer
-case "$answer" in y|Y|yes|YES) ;; *) die "stopped before changing DNS; run this step again when you want it" ;; esac
-"$cf" tunnel route dns --overwrite-dns "$opt_tunnel" "$opt_hostname" || die "cloudflared tunnel route dns failed"
-
-# 4. start the three units (proxy, shim, tunnel)
-sc daemon-reload
-sc enable --now "${units[@]}" || die "systemctl --user enable --now ${units[*]} failed"
-for _ in 1 2 3 4 5 6 7 8 9 10; do units_active && break; sleep 2; done
-units_active || die "the units did not become active: systemctl --user status ${units[*]}"
-echo "dc-mcp: step 4/4: ${units[*]} are active"
-
-cat <<TEXT
-
-ChatGPT connector (Settings, Connectors, add a custom MCP server):
-  Server URL      https://$opt_hostname/mcp
-  Authentication  OAuth
-  Log in with the password stored in $auth_file (line PASSWORD=...; this script does not print it).
-Check from here: curl -s -o /dev/null -w '%{http_code}' -X POST https://$opt_hostname/mcp -d '{}'   -> 401 means the login is enforced and the tunnel is up
-(a fresh DNS record may need a minute before the name resolves).
-TEXT
+"$cli" chatgpt connect --no-wait --no-open --no-copy

@@ -1,56 +1,101 @@
-"""modules/dc-mcp against a throwaway HOME with stub `curl`, `systemctl` and `cloudflared` on PATH.
+"""modules/dc-mcp (a thin installer over `computer chatgpt`) against a throwaway HOME with a stub `computer` on PATH, plus the files
+the profile still ships next to it: the ChatGPT window launcher with its icon and the tool-call log pruner.
 
-Nothing touches the real network, the real systemd or the real $HOME. The "release" the stub `curl` serves is a small file
-whose digest is written into a test pins file, so the real verification code runs: a wrong digest is refused for real.
+Nothing touches the real network, the real systemd or the real $HOME.
 """
 
-import hashlib
-import http.client
-import http.server
 import json
 import os
-import re
 import shutil
-import socket
 import stat
 import subprocess
 import tempfile
-import threading
 import time
+import tomllib
 import unittest
 
 MODULE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UBUNTU = os.path.dirname(os.path.dirname(MODULE))
-MACHINE = subprocess.run(["uname", "-m"], capture_output=True, text=True, check=True).stdout.strip()
 
-CURL = """#!/bin/sh
-# usage: curl -fsSL --retry N --retry-delay N -o FILE URL ; serves $STUB/release-<basename of URL>
-echo "curl $*" >> "$STUB/calls.log"
-out=""; url=""
-while [ $# -gt 0 ]; do
-  case "$1" in -o) out=$2; shift ;; -*) ;; *) url=$1 ;; esac
-  shift
-done
-[ -e "$STUB/offline" ] && exit 6
-cp "$STUB/release-$(basename "$url")" "$out"
+with open(os.path.join(MODULE, "install.sh")) as _fh:
+    _pin = dict(line.split("=", 1) for line in _fh.read().splitlines() if line.startswith(("CLI_REPO=", "CLI_REV=")))
+PINNED = f"{_pin['CLI_REPO']}?rev={_pin['CLI_REV']}"
+
+# `doctor --local --json` reports the pieces of `init` as present once `init` ran (under other check names while $STUB/renamed
+# exists: a newer CLI); `status` is healthy once `start` ran; the full `doctor` fails while $STUB/dns-elsewhere exists (the
+# hostname kept pointing at another machine); $STUB/net-down makes the downloading commands fail with the CLI's network exit
+# code 7, $STUB/init-127 makes init fail as a missing command.
+COMPUTER = """#!/bin/sh
+echo "computer $*" >> "$STUB/calls.log"
+case "$*" in
+  "mcp install") [ -e "$STUB/net-down" ] && exit 7 ;;
+  "chatgpt init") [ -e "$STUB/net-down" ] && exit 7; [ -e "$STUB/init-127" ] && exit 127; : > "$STUB/initialized" ;;
+  "chatgpt doctor --local --json")
+    ok=false; [ -e "$STUB/initialized" ] && ok=true
+    suffix=; [ -e "$STUB/renamed" ] && suffix=" (v2)"
+    printf '[{"name": "mcp-auth-proxy installed%s", "ok": %s}, {"name": "cloudflared installed", "ok": %s},' "$suffix" "$ok" "$ok"
+    printf ' {"name": "desktop-commander installed", "ok": %s}, {"name": "login password", "ok": %s},' "$ok" "$ok"
+    printf ' {"name": "unit files current%s", "ok": %s}, {"name": "dc-mcp-tunnel.service active", "ok": false}]\\n' "$suffix" "$ok"
+    ;;
+  "chatgpt doctor") [ -e "$STUB/public-down" ] && exit 3 ;;
+  "chatgpt status") [ -e "$STUB/started" ] || exit 3 ;;
+  "chatgpt start") : > "$STUB/started" ;;
+  "chatgpt login") [ -e "$STUB/login-fails" ] && exit 8 ;;
+esac
+exit 0
 """
 
-SYSTEMCTL = """#!/bin/sh
-echo "systemctl $*" >> "$STUB/calls.log"
-shift
-case "$1" in
-  is-active) [ -e "$STUB/active-$2" ] && { echo active; exit 0; }; echo inactive; exit 3 ;;
-  enable) shift; [ "$1" = "--now" ] && shift; for u in "$@"; do : > "$STUB/active-$u"; done ;;
+# `uv tool install --force "hyper-computer @ git+<repo>@<rev>"` writes a receipt like uv's and puts the computer stub into the
+# uv bin directory ($FAKEBIN, which is also on PATH).
+UV = """#!/bin/sh
+echo "uv $*" >> "$STUB/calls.log"
+case "$1 $2 ${3:-}" in
+  "tool dir --bin") echo "$FAKEBIN" ;;
+  "tool dir ") echo "$STUB/uvtools" ;;
+  "tool install "*)
+    [ -e "$STUB/offline" ] && exit 2
+    [ -e "$STUB/uv-fails" ] && exit 2
+    spec=$(printf '%s' "$4" | sed 's/^hyper-computer @ git+//')
+    mkdir -p "$STUB/uvtools/hyper-computer"
+    printf '[tool]\\nrequirements = [{ name = "hyper-computer", git = "%s?rev=%s" }]\\n' "${spec%@*}" "${spec##*@}" > "$STUB/uvtools/hyper-computer/uv-receipt.toml"
+    cp "$STUB/computer.src" "$FAKEBIN/computer"; chmod +x "$FAKEBIN/computer" ;;
 esac
+exit 0
+"""
+
+# The public URL as finish.sh probes it: the request lands in this machine's shim access log unless the hostname's DNS record
+# points at another machine ($STUB/dns-elsewhere) or the public URL is down ($STUB/public-down).
+CURL = """#!/bin/sh
+for url; do :; done
+[ -e "$STUB/public-down" ] && exit 7
+[ -e "$STUB/dns-elsewhere" ] && exit 0
+mkdir -p "$HOME/.local/state/dc-mcp"
+echo "2026-11-18T00:00:00.000Z 404 GET /${url#https://*/} 0ms client=unverified" >> "$HOME/.local/state/dc-mcp/access.log"
+"""
+
+# The installer's reachability probe after a failed `uv tool install`: unreachable while $STUB/offline exists.
+REACH = """#!/bin/sh
+[ -e "$STUB/offline" ] && exit 6
 exit 0
 """
 
 CLOUDFLARED = """#!/bin/sh
 echo "cloudflared $*" >> "$STUB/calls.log"
-case "$1 $2" in
-  "tunnel login") mkdir -p "$HOME/.cloudflared"; echo CERT > "$HOME/.cloudflared/cert.pem" ;;
-  "tunnel list") [ -e "$STUB/list-fails" ] && exit 1; [ -e "$STUB/tunnel-exists" ] && echo '[{"id":"11111111-2222-3333-4444-555555555555","name":"x"}]' || echo '[]' ;;
-  "tunnel create") : > "$STUB/tunnel-exists"; mkdir -p "$HOME/.cloudflared"; echo CRED > "$HOME/.cloudflared/11111111-2222-3333-4444-555555555555.json" ;;
+[ -e "$STUB/cf-down" ] && exit 1
+echo '[{"id": "11111111-2222-3333-4444-555555555555", "name": "dc-test"}]'
+"""
+TUNNEL_ID = "11111111-2222-3333-4444-555555555555"
+
+# a unit is active while $STUB/active-<unit> exists; a restart starts it, or, while $STUB/restart-fails-<unit> exists, fails and
+# leaves it stopped; while $STUB/bus-down exists every call fails as with an unreachable user manager
+SYSTEMCTL = """#!/bin/sh
+echo "systemctl $*" >> "$STUB/calls.log"
+[ -e "$STUB/bus-down" ] && { echo "Failed to connect to bus" >&2; exit 1; }
+case "$2" in
+  is-active) [ -e "$STUB/active-$3" ] && { echo active; exit 0; }; echo inactive; exit 3 ;;
+  restart)
+    if [ -e "$STUB/restart-fails-$3" ]; then rm -f "$STUB/active-$3"; exit 1; fi
+    : > "$STUB/active-$3" ;;
 esac
 exit 0
 """
@@ -62,25 +107,7 @@ def write_exec(path, text):
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
 
 
-def slurp(path):
-    with open(path) as fh:
-        return fh.read()
-
-
-def tree_state(root):
-    state = {}
-    for base, _dirs, names in os.walk(root):
-        for name in names:
-            path = os.path.join(base, name)
-            with open(path, "rb") as fh:
-                state[path] = hashlib.sha256(fh.read()).hexdigest()
-    return state
-
-
 class Base(unittest.TestCase):
-    PROXY = b"fake mcp-auth-proxy binary\n"
-    CF = b"fake cloudflared binary\n"
-
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -89,50 +116,36 @@ class Base(unittest.TestCase):
         self.fakebin = os.path.join(self.tmp, "fakebin")
         for d in (self.home, self.stub, self.fakebin):
             os.makedirs(d)
-        write_exec(os.path.join(self.fakebin, "curl"), CURL)
+        write_exec(os.path.join(self.stub, "computer.src"), COMPUTER)
+        write_exec(os.path.join(self.fakebin, "uv"), UV)
+        write_exec(os.path.join(self.fakebin, "curl"), REACH)
+        # never the real systemctl: on a machine running dc-mcp it would restart the live units
         write_exec(os.path.join(self.fakebin, "systemctl"), SYSTEMCTL)
-        self.serve("mcp-auth-proxy-linux", self.PROXY)
-        self.serve("cloudflared-linux", self.CF)
-        self.pins = os.path.join(self.tmp, "pins.tsv")
-        self.write_pins(self.PROXY, self.CF)
-        self.bin_dir = os.path.join(self.home, ".local", "bin")
-        self.auth = os.path.join(self.home, ".config", "dc-mcp-auth.env")
-        self.settings = os.path.join(self.home, ".config", "dc-mcp.env")
-        self.config = {"hostname": "dc.example.com", "tunnel": "dc-test"}
+        self.config_file = os.path.join(self.home, ".config", "computer", "chatgpt", "config.toml")
+        self.cf_dir = os.path.join(self.home, ".config", "computer", "chatgpt", "cloudflared")
+        self.legacy = os.path.join(self.home, ".cloudflared")
+        self.options = {"hostname": "dc.example.com", "tunnel": "dc-test"}
 
-    def serve(self, name, data):
-        with open(os.path.join(self.stub, f"release-{name}-{MACHINE}"), "wb") as fh:
-            fh.write(data)
+    def install_cli(self, rev=None):
+        """The CLI as an earlier apply left it: on PATH, with a uv receipt of `rev` (default: the pinned one)."""
+        spec = PINNED.replace("?rev=", "@") if rev is None else PINNED.split("?rev=")[0] + "@" + rev
+        subprocess.run([os.path.join(self.fakebin, "uv"), "tool", "install", "--force", "hyper-computer @ git+" + spec], env=self.env(), check=True)
+        os.remove(os.path.join(self.stub, "calls.log"))
 
-    def write_pins(self, proxy_bytes, cf_bytes):
-        rows = []
-        for tool, data in (("mcp-auth-proxy", proxy_bytes), ("cloudflared", cf_bytes)):
-            rows.append("\t".join([tool, "v1", MACHINE, hashlib.sha256(data).hexdigest(), f"https://example.invalid/{tool}-linux-{MACHINE}"]))
-        with open(self.pins, "w") as fh:
-            fh.write("\n".join(rows) + "\n")
-
-    def env(self, **extra):
+    def env(self):
         return {
             **os.environ,
             "HOME": self.home,
             "STUB": self.stub,
+            "FAKEBIN": self.fakebin,
             "XDG_CONFIG_HOME": os.path.join(self.home, ".config"),
-            # the stubs come first; /usr/bin and /bin stay for coreutils, python3, awk, sha256sum
+            "XDG_DATA_HOME": os.path.join(self.home, ".local", "share"),
             "PATH": f"{self.fakebin}:/usr/bin:/bin",
-            "DC_MCP_PINS_FILE": self.pins,
-            "UBUNTU_TWEAK_MODULE_CONFIG": json.dumps(self.config),
-            **extra,
+            "UBUNTU_TWEAK_MODULE_CONFIG": json.dumps(self.options),
         }
 
-    def run_script(self, script, *args, stdin="", **extra):
-        return subprocess.run(
-            ["bash", os.path.join(MODULE, script), *args],
-            env=self.env(**extra),
-            input=stdin,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    def run_script(self, script, *args):
+        return subprocess.run(["bash", os.path.join(MODULE, script), *args], env=self.env(), capture_output=True, text=True, check=False)
 
     def calls(self):
         path = os.path.join(self.stub, "calls.log")
@@ -141,319 +154,384 @@ class Base(unittest.TestCase):
         with open(path) as fh:
             return fh.read().splitlines()
 
-    def fake_npx(self):
-        write_exec(os.path.join(self.fakebin, "npx"), "#!/bin/sh\nexit 0\n")
+    def changing_calls(self):
+        read_only = ("uv tool dir", "systemctl --user is-active", "systemctl --user show-environment")
+        return [c for c in self.calls() if "doctor" not in c and not c.startswith(read_only)]
 
-    def install_ok(self):
-        self.fake_npx()
-        res = self.run_script("install.sh")
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        return res
+    def cli_calls(self):
+        return [c for c in self.calls() if c.startswith("computer ")]
 
-    def password(self):
-        with open(self.auth) as fh:
-            return re.search(r"^PASSWORD=(.+)$", fh.read(), re.M).group(1)
+    def config(self):
+        with open(self.config_file, "rb") as fh:
+            return tomllib.load(fh)
+
+    def legacy_credentials(self):
+        os.makedirs(self.legacy)
+        for name, text in (("cert.pem", "CERT\n"), (f"{TUNNEL_ID}.json", '{"TunnelID": "%s"}\n' % TUNNEL_ID)):
+            with open(os.path.join(self.legacy, name), "w") as fh:
+                fh.write(text)
+        bin_dir = os.path.join(self.home, ".local", "share", "computer", "chatgpt", "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        write_exec(os.path.join(bin_dir, "cloudflared"), CLOUDFLARED)
 
 
 class Installer(Base):
     def test_check_before_install_is_drift_and_writes_nothing(self):
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
-        self.assertIn("mcp-auth-proxy is missing", res.stdout)
-        self.assertIn("no PASSWORD", res.stdout)
+        self.assertIn("hostname", res.stdout)
         self.assertEqual(os.listdir(self.home), [])
+
+    def test_without_the_cli_check_is_drift_not_a_crash(self):
+        # the engine runs every --check before it executes anything and accepts only 0 or 3 from it
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        os.remove(os.path.join(self.fakebin, "computer"))
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertIn("computer CLI", res.stdout)
 
     def test_plan_lists_the_steps_and_writes_nothing(self):
         res = self.run_script("install.sh", "--plan")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("download https://example.invalid/cloudflared", res.stdout)
-        self.assertIn("generate a random password", res.stdout)
+        self.assertIn("uv tool install --force hyper-computer @ git+" + PINNED.replace("?rev=", "@"), res.stdout)
+        self.assertIn("into " + self.config_file, res.stdout)
+        self.assertIn("computer chatgpt init", res.stdout)
         self.assertEqual(os.listdir(self.home), [])
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.changing_calls(), [])
 
-    def test_install_puts_binaries_settings_and_a_private_password_in_place(self):
-        res = self.install_ok()
-        for tool, data in (("mcp-auth-proxy", self.PROXY), ("cloudflared", self.CF)):
-            path = os.path.join(self.bin_dir, tool)
-            self.assertTrue(os.access(path, os.X_OK))
-            with open(path, "rb") as fh:
-                self.assertEqual(fh.read(), data)
-        with open(self.settings) as fh:
-            text = fh.read()
-        self.assertIn("DC_MCP_HOSTNAME=dc.example.com\n", text)
-        self.assertIn("DC_MCP_TUNNEL=dc-test\n", text)
-        self.assertIn("DC_MCP_PORT=8766\n", text)
-        self.assertIn("DC_MCP_SHIM_PORT=8767\n", text)
-        self.assertEqual(sorted(line.split("=")[0] for line in text.splitlines() if not line.startswith("#")), sorted(["DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP", "DC_MCP_TOOL_LOG_KEEP", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS", "DC_MCP_PACKAGE"]))
-        self.assertIn("DC_MCP_LOG_MAX_KIB=2048\nDC_MCP_LOG_KEEP=3\nDC_MCP_TOOL_LOG_KEEP=5\nDC_MCP_TOOL_LOG_MAX_AGE_DAYS=30\n", text)
-        self.assertIn("DC_MCP_PACKAGE=@wonderwhy-er/desktop-commander@latest\n", text)
-        self.assertEqual(stat.S_IMODE(os.stat(self.auth).st_mode), 0o600)
-        self.assertRegex(self.password(), r"^[A-Za-z0-9]{32}$")
-        self.assertNotIn(self.password(), res.stdout + res.stderr)
+    def test_install_puts_the_pinned_cli_the_live_layout_and_runs_init_which_starts_nothing(self):
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(
+            self.config(),
+            {
+                "mode": "public",
+                "scheme": "https",
+                "hostname": "dc.example.com",
+                "tunnel_name": "dc-test",
+                "proxy_port": 8766,
+                "shim_port": 8767,
+                "metrics_port": 20241,
+                "unit_prefix": "dc-mcp",
+                "state_dir": "~/.local/state/dc-mcp",
+                "data_dir": "~/.local/share/mcp-auth-proxy",
+                "password_file": "~/.config/dc-mcp-auth.env",
+            },
+        )
+        # a daemon-reload starts nothing; no unit runs yet, so nothing restarts
+        self.assertEqual(
+            self.changing_calls(),
+            [
+                "uv tool install --force hyper-computer @ git+" + PINNED.replace("?rev=", "@"),
+                "computer mcp install",
+                "computer chatgpt init",
+                "systemctl --user daemon-reload",
+            ],
+        )
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
-    def test_install_touches_no_unit_and_enables_nothing(self):
-        self.install_ok()
-        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "systemd")))
-        self.assertEqual([c for c in self.calls() if c.startswith("systemctl")], [])
-        self.assertFalse(os.path.exists(os.path.join(self.home, ".cloudflared")))
-
-    def test_a_second_install_changes_nothing_and_keeps_the_password(self):
-        self.install_ok()
-        first = self.password()
-        downloads = len([c for c in self.calls() if c.startswith("curl")])
-        before = tree_state(self.home)
+    def test_a_cli_from_another_commit_is_drift_and_gets_replaced(self):
+        self.install_cli(rev="0123456789abcdef0123456789abcdef01234567")
         self.assertEqual(self.run_script("install.sh").returncode, 0)
-        self.assertEqual(tree_state(self.home), before)
-        self.assertEqual(len([c for c in self.calls() if c.startswith("curl")]), downloads)
-        self.assertEqual(self.password(), first)
-
-    def test_a_checksum_mismatch_is_refused_and_leaves_no_binary(self):
-        self.serve("cloudflared-linux", b"tampered download\n")
-        self.fake_npx()
-        res = self.run_script("install.sh")
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn("refusing cloudflared: sha256", res.stderr)
-        self.assertFalse(os.path.exists(os.path.join(self.bin_dir, "cloudflared")))
-        leftovers = [n for n in os.listdir(self.bin_dir) if n.startswith(".")]
-        self.assertEqual(leftovers, [])
-
-    def test_a_checksum_mismatch_keeps_the_installed_binary(self):
-        self.install_ok()
-        installed = os.path.join(self.bin_dir, "mcp-auth-proxy")
-        newer = b"a newer pinned build\n"
-        self.write_pins(newer, self.CF)  # the pin moved on ...
-        self.serve("mcp-auth-proxy-linux", b"but the download is not that build\n")  # ... and the server serves something else
-        res = self.run_script("install.sh")
-        self.assertEqual(res.returncode, 1)
-        with open(installed, "rb") as fh:
-            self.assertEqual(fh.read(), self.PROXY)
-
-    def test_a_modified_binary_is_drift_and_install_restores_the_pinned_one(self):
-        self.install_ok()
-        with open(os.path.join(self.bin_dir, "cloudflared"), "ab") as fh:
-            fh.write(b"local edit")
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+        self.install_cli(rev="0123456789abcdef0123456789abcdef01234567")
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3)
-        self.assertIn("cloudflared is missing or is not the pinned", res.stdout)
+        self.assertIn("not installed from", res.stdout)
         self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("uv tool install --force hyper-computer @ git+" + PINNED.replace("?rev=", "@"), self.calls())
         self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
-    def test_a_network_failure_is_the_transient_exit_code(self):
-        self.fake_npx()
+    def test_a_failed_cli_download_is_the_transient_exit_code(self):
         open(os.path.join(self.stub, "offline"), "w").close()
         self.assertEqual(self.run_script("install.sh").returncode, 75)
 
-    def test_an_existing_password_and_its_other_lines_are_kept_and_the_mode_repaired(self):
-        os.makedirs(os.path.dirname(self.auth))
-        with open(self.auth, "w") as fh:
-            fh.write("PASSWORD=existing-secret\nEXTERNAL_URL=https://old.example.com\n")
-        os.chmod(self.auth, 0o644)
+    def test_a_uv_failure_with_the_network_up_is_a_plain_failure_not_retried(self):
+        open(os.path.join(self.stub, "uv-fails"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 1)
+
+    def test_a_cli_command_that_cannot_run_is_a_manual_step(self):
+        self.install_cli()
+        open(os.path.join(self.stub, "init-127"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 10)
+
+    def test_a_network_failure_of_the_cli_is_the_transient_exit_code(self):
+        self.install_cli()
+        open(os.path.join(self.stub, "net-down"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 75)
+        os.remove(os.path.join(self.stub, "net-down"))
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+
+    def test_without_uv_check_is_drift_and_install_a_manual_step(self):
+        # the engine runs every --check before its packages phase (which brings uv) and accepts only 0 or 3 from it
+        os.remove(os.path.join(self.fakebin, "uv"))
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
+        self.assertEqual(self.run_script("install.sh", "--plan").returncode, 0)
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 10)
+        self.assertIn("uv is not installed", res.stderr)
+
+    def test_another_computer_earlier_on_path_is_never_the_one_used(self):
+        shadow = os.path.join(self.tmp, "shadow")
+        os.makedirs(shadow)
+        write_exec(os.path.join(shadow, "computer"), '#!/bin/sh\necho "shadow $*" >> "$STUB/calls.log"\nexit 0\n')
+        env = {**self.env(), "PATH": f"{shadow}:{self.fakebin}:/usr/bin:/bin"}
+        res = subprocess.run(["bash", os.path.join(MODULE, "install.sh")], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith("shadow")], [])
+        self.assertIn("computer chatgpt init", self.calls())
+
+    def test_a_second_install_changes_nothing(self):
+        self.run_script("install.sh")
+        with open(self.config_file) as fh:
+            first = fh.read()
+        before = len(self.changing_calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        with open(self.config_file) as fh:
+            self.assertEqual(fh.read(), first)
+        self.assertEqual(len(self.changing_calls()), before)
+
+    def test_keys_init_added_stay_and_a_changed_option_is_drift_then_merged(self):
+        self.run_script("install.sh")
+        with open(self.config_file, "a", encoding="utf-8") as fh:
+            fh.write('cloudflared_dir = "/media/\U0001f512/cloudflared \\u007f\\"q\\""\ntunnel_health_port = 8794\n')
+        self.options["port"] = 9766
         res = self.run_script("install.sh", "--check")
         self.assertEqual(res.returncode, 3)
-        self.assertIn("is not mode 600", res.stdout)
-        self.install_ok()
-        with open(self.auth) as fh:
-            self.assertEqual(fh.read(), "PASSWORD=existing-secret\nEXTERNAL_URL=https://old.example.com\n")
-        self.assertEqual(stat.S_IMODE(os.stat(self.auth).st_mode), 0o600)
+        self.assertIn("proxy_port", res.stdout)
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertEqual(self.config()["proxy_port"], 9766)
+        self.assertEqual(self.config()["tunnel_health_port"], 8794)
+        self.assertEqual(self.config()["cloudflared_dir"], '/media/\U0001f512/cloudflared \x7f"q"')
 
-    def test_a_password_is_appended_on_its_own_line_after_an_unterminated_file(self):
-        os.makedirs(os.path.dirname(self.auth))
-        with open(self.auth, "w") as fh:
-            fh.write("# my comment without a newline")
-        os.chmod(self.auth, 0o600)
-        self.install_ok()
-        lines = slurp(self.auth).splitlines()
-        self.assertEqual(lines[0], "# my comment without a newline")
-        self.assertRegex(lines[1], r"^PASSWORD=[A-Za-z0-9]{32}$")
+    def test_a_missing_or_invalid_option_is_a_manual_step_and_writes_nothing(self):
+        # --check may only answer 0 or 3 to the engine, so there it is drift; the install is the manual step
+        for options in ({}, {"hostname": "Not A Name"}, {"hostname": "dc.example.com", "port": 8767}, {"hostname": "dc.example.com", "package": "x"}):
+            self.options = options
+            for args, code in (((), 10), (("--check",), 3)):
+                res = self.run_script("install.sh", *args)
+                self.assertEqual(res.returncode, code, (options, args, res.stdout, res.stderr))
+                self.assertIn("[modules.dc-mcp]", res.stderr)
+        self.assertFalse(os.path.exists(self.config_file))
+        self.assertEqual(self.calls(), [])
 
-    def test_no_hostname_installs_the_binaries_and_asks_for_the_option(self):
-        self.config = {}
-        self.fake_npx()
+
+class LegacyCredentials(Base):
+    """A machine set up by the first version of this module: the login and tunnel credentials are only in ~/.cloudflared."""
+
+    def test_they_are_copied_private_and_the_originals_stay(self):
+        self.legacy_credentials()
+        res = self.run_script("install.sh")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        for name, original in (("cert.pem", "cert.pem"), ("dc-test.json", f"{TUNNEL_ID}.json")):
+            path = os.path.join(self.cf_dir, name)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, name)
+            with open(path) as fh, open(os.path.join(self.legacy, original)) as orig:
+                self.assertEqual(fh.read(), orig.read())
+        self.assertEqual(sorted(os.listdir(self.legacy)), sorted(["cert.pem", f"{TUNNEL_ID}.json"]))
+        lookup = f" --origincert {self.cf_dir}/cert.pem list --name dc-test -o json"
+        self.assertTrue(any(c.startswith("cloudflared tunnel --config ") and c.endswith(lookup) for c in self.calls()), self.calls())
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+
+    def test_until_they_are_copied_check_is_drift(self):
+        self.run_script("install.sh")
+        self.legacy_credentials()
+        res = self.run_script("install.sh", "--check")
+        self.assertEqual(res.returncode, 3)
+        self.assertIn("not copied", res.stdout)
+        self.assertIn("copy ", self.run_script("install.sh", "--plan").stdout)
+
+    def test_credentials_of_another_tunnel_are_a_manual_step(self):
+        self.legacy_credentials()
+        os.rename(os.path.join(self.legacy, f"{TUNNEL_ID}.json"), os.path.join(self.legacy, "other.json"))
         res = self.run_script("install.sh")
         self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
-        self.assertIn("needs manual: set [modules.dc-mcp] hostname", res.stderr)
-        self.assertTrue(os.access(os.path.join(self.bin_dir, "cloudflared"), os.X_OK))
-        self.assertFalse(os.path.exists(self.settings))
-        # the settings file is never written without a hostname: a half-configured machine cannot serve a wrong name
-        self.assertEqual(self.run_script("install.sh", "--check").returncode, 10)
+        self.assertIn("finish-setup", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.cf_dir, "dc-test.json")))
 
-    def test_missing_npx_is_a_manual_step_after_everything_else_is_in_place(self):
+    def test_a_fresh_machine_without_them_is_left_to_the_finish_step(self):
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.cf_dir, "cert.pem")))
+
+    def test_units_the_old_module_left_running_restart_on_the_new_text_in_chain_order(self):
+        self.legacy_credentials()
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
         res = self.run_script("install.sh")
-        self.assertEqual(res.returncode, 10, res.stdout + res.stderr)
-        self.assertIn("npx (node) is not installed", res.stderr)
-        self.assertTrue(os.path.exists(self.auth))
-        self.assertTrue(os.path.exists(self.settings))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        restarts = [c for c in self.calls() if c.startswith("systemctl --user restart")]
+        self.assertEqual(restarts, [f"systemctl --user restart dc-mcp-{u}.service" for u in ("bridge", "shim", "tunnel")])
+        self.assertLess(self.calls().index("computer chatgpt init"), self.calls().index(restarts[0]))
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)  # current units: nothing restarts again
+        self.assertEqual([c for c in self.calls()[before:] if "restart" in c], [])
 
-    def test_invalid_options_are_refused(self):
-        for bad in ({"hostname": "Not A Host"}, {"port": 80}, {"port": "8766"}, {"shim_port": 8766}, {"shim_port": 70000}, {"log_keep": -1}, {"log_keep": 21}, {"log_max_kib": 1}, {"tool_log_keep": 0}, {"tool_log_max_age_days": 0}, {"tunnel": "bad name"}, {"package": "x y"}, {"nope": 1}):
-            self.config = {"hostname": "dc.example.com", **bad}
-            res = self.run_script("install.sh", "--check")
-            self.assertEqual(res.returncode, 1, f"{bad}: {res.stdout}{res.stderr}")
-            self.assertIn("[modules.dc-mcp]", res.stderr)
+    def test_stopped_units_stay_stopped(self):
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertEqual([c for c in self.calls() if "restart" in c], [])
 
-    def test_the_options_reach_the_settings_file(self):
-        self.config = {"hostname": "a.b.example.org", "tunnel": "t1", "port": 9001, "shim_port": 9002, "log_max_kib": 512, "log_keep": 0, "tool_log_keep": 2, "tool_log_max_age_days": 7, "package": "@scope/pkg@1.2.3"}
-        self.install_ok()
-        with open(self.settings) as fh:
-            text = fh.read()
-        for line in ("DC_MCP_HOSTNAME=a.b.example.org", "DC_MCP_TUNNEL=t1", "DC_MCP_PORT=9001", "DC_MCP_SHIM_PORT=9002", "DC_MCP_LOG_MAX_KIB=512", "DC_MCP_LOG_KEEP=0", "DC_MCP_TOOL_LOG_KEEP=2", "DC_MCP_TOOL_LOG_MAX_AGE_DAYS=7", "DC_MCP_PACKAGE=@scope/pkg@1.2.3"):
-            self.assertIn(line, text)
+    def test_a_doctor_without_the_expected_check_names_fails_and_never_reruns_init_or_restarts(self):
+        # a newer CLI that renamed a check must not read as "missing piece": that would re-run init and restart every apply
+        self.install_cli()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
+        open(os.path.join(self.stub, "renamed"), "w").close()
+        before = len(self.calls())
+        for args in ((), ("--check",)):
+            res = self.run_script("install.sh", *args)
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            self.assertIn("no check named", res.stderr)
+        self.assertEqual([c for c in self.calls()[before:] if "init" in c or "restart" in c], [])
 
-    def test_the_repository_tree_is_never_written_by_install(self):
-        before = tree_state(UBUNTU)
-        self.install_ok()
-        after = tree_state(UBUNTU)
-        self.assertEqual(after, before)
-        password = self.password()
-        for path in after:
-            with open(path, "rb") as fh:
-                self.assertNotIn(password.encode(), fh.read(), path)
+    def test_the_tunnel_lookup_ignores_any_cloudflared_config_file(self):
+        self.legacy_credentials()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        lookups = [c for c in self.calls() if c.startswith("cloudflared tunnel")]
+        self.assertTrue(lookups)
+        self.assertTrue(all(c.startswith("cloudflared tunnel --config ") for c in lookups), lookups)
 
-    def test_the_shipped_pins_cover_both_machine_types_with_full_digests(self):
-        with open(os.path.join(MODULE, "pins.tsv")) as fh:
-            rows = [line.split("\t") for line in fh.read().splitlines() if line and not line.startswith("#")]
-        self.assertEqual(sorted((r[0], r[2]) for r in rows), sorted((t, m) for t in ("mcp-auth-proxy", "cloudflared") for m in ("x86_64", "aarch64")))
-        for row in rows:
-            self.assertRegex(row[3], r"^[0-9a-f]{64}$")
-            self.assertTrue(row[4].startswith("https://github.com/"))
+    def test_a_restart_left_pending_by_a_failure_after_init_runs_on_the_next_apply(self):
+        self.legacy_credentials()
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
+        open(os.path.join(self.stub, "cf-down"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 75)
+        self.assertEqual([c for c in self.calls() if "restart" in c], [])
+        os.remove(os.path.join(self.stub, "cf-down"))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        restarts = [c for c in self.calls() if c.startswith("systemctl --user restart")]
+        self.assertEqual(restarts, [f"systemctl --user restart dc-mcp-{u}.service" for u in ("bridge", "shim", "tunnel")])
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
+    def test_a_new_cli_revision_reinstalls_and_restarts_running_units_after_a_reload_even_with_the_same_unit_text(self):
+        self.install_cli(rev="0123456789abcdef0123456789abcdef01234567")
+        open(os.path.join(self.stub, "initialized"), "w").close()  # pieces and unit text already current
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        calls = self.changing_calls()
+        self.assertIn("computer mcp install", calls)
+        self.assertIn("computer chatgpt init", calls)
+        restarts = [c for c in calls if c.startswith("systemctl --user restart")]
+        self.assertEqual(restarts, [f"systemctl --user restart dc-mcp-{u}.service" for u in ("bridge", "shim", "tunnel")])
+        self.assertLess(calls.index("systemctl --user daemon-reload"), calls.index(restarts[0]))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
-class Units(unittest.TestCase):
-    """The unit files read nothing the module does not provide, and name no machine or user."""
+    def test_a_tunnel_key_without_the_login_is_a_manual_step_not_a_silent_success(self):
+        os.makedirs(self.legacy)
+        with open(os.path.join(self.legacy, f"{TUNNEL_ID}.json"), "w") as fh:
+            fh.write('{"TunnelID": "%s"}\n' % TUNNEL_ID)
+        self.assertEqual(self.run_script("install.sh").returncode, 10)
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
 
-    UNIT_DIR = os.path.join(UBUNTU, "files", ".config", "systemd", "user")
+    def test_a_restart_that_fails_and_stops_a_unit_is_retried_on_the_next_apply(self):
+        self.legacy_credentials()
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
+        open(os.path.join(self.stub, "restart-fails-dc-mcp-tunnel.service"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.stub, "active-dc-mcp-tunnel.service")))
+        os.remove(os.path.join(self.stub, "restart-fails-dc-mcp-tunnel.service"))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("systemctl --user restart dc-mcp-tunnel.service", self.calls()[before:])
+        self.assertTrue(os.path.exists(os.path.join(self.stub, "active-dc-mcp-tunnel.service")))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
-    def read(self, name):
-        with open(os.path.join(self.UNIT_DIR, name)) as fh:
-            return fh.read()
+    def test_an_upgrade_whose_installers_failed_runs_them_again_on_the_next_apply(self):
+        self.install_cli(rev="0123456789abcdef0123456789abcdef01234567")
+        open(os.path.join(self.stub, "initialized"), "w").close()
+        open(os.path.join(self.stub, "net-down"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 75)
+        os.remove(os.path.join(self.stub, "net-down"))
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 3)
+        before = len(self.calls())
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        self.assertIn("computer mcp install", self.calls()[before:])
+        self.assertIn("computer chatgpt init", self.calls()[before:])
+        self.assertEqual(self.run_script("install.sh", "--check").returncode, 0)
 
-    def test_every_variable_a_unit_expands_is_written_by_the_settings_file(self):
-        provided = {"DC_MCP_HOSTNAME", "DC_MCP_TUNNEL", "DC_MCP_PORT", "DC_MCP_SHIM_PORT", "DC_MCP_LOG_MAX_KIB", "DC_MCP_LOG_KEEP", "DC_MCP_PACKAGE"}
-        for name in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
-            exec_start = re.search(r"^ExecStart=(.*)$", self.read(name), re.M).group(1)
-            self.assertLessEqual(set(re.findall(r"\$\{(\w+)\}", exec_start)), provided, name)
-            self.assertNotRegex(exec_start, r"\$[A-Za-z]", "an unbraced variable would be split on spaces")
-        self.assertIn("${DC_MCP_HOSTNAME}", self.read("dc-mcp-bridge.service"))
-        self.assertIn("${DC_MCP_TUNNEL}", self.read("dc-mcp-tunnel.service"))
-        self.assertIn("http://127.0.0.1:${DC_MCP_SHIM_PORT}", self.read("dc-mcp-tunnel.service"))
-        self.assertIn("UPSTREAM_PORT=${DC_MCP_PORT}", self.read("dc-mcp-shim.service"))
+    def test_an_unreachable_user_manager_records_no_restart_state_and_the_retry_restarts_what_ran(self):
+        self.install_cli(rev="0123456789abcdef0123456789abcdef01234567")
+        open(os.path.join(self.stub, "initialized"), "w").close()
+        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
+            open(os.path.join(self.stub, "active-" + unit), "w").close()
+        open(os.path.join(self.stub, "bus-down"), "w").close()
+        self.assertEqual(self.run_script("install.sh").returncode, 1)
+        self.assertNotIn("computer chatgpt init", self.calls())
+        os.remove(os.path.join(self.stub, "bus-down"))
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        restarts = [c for c in self.calls() if c.startswith("systemctl --user restart")]
+        self.assertEqual(restarts, [f"systemctl --user restart dc-mcp-{u}.service" for u in ("bridge", "shim", "tunnel")])
 
-    def test_every_unit_restarts_for_ever_and_the_chain_is_ordered(self):
-        for name in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
-            text = self.read(name)
-            self.assertRegex(text, r"(?m)^Restart=always$", name)
-            self.assertRegex(text, r"(?m)^StartLimitIntervalSec=0$", name)
-            self.assertRegex(text, r"(?m)^WantedBy=default.target$", name)
-        self.assertIn("After=dc-mcp-bridge.service", self.read("dc-mcp-shim.service"))
-        self.assertIn("After=dc-mcp-shim.service", self.read("dc-mcp-tunnel.service"))
-
-    def test_units_and_launcher_name_no_user_or_home(self):
-        paths = [
-            os.path.join(self.UNIT_DIR, "dc-mcp-bridge.service"),
-            os.path.join(self.UNIT_DIR, "dc-mcp-tunnel.service"),
-            os.path.join(self.UNIT_DIR, "dc-mcp-shim.service"),
-            os.path.join(UBUNTU, "files", ".local", "share", "dc-mcp-shim", "shim.mjs"),
-            os.path.join(UBUNTU, "files", ".config", "systemd", "user", "dc-mcp-tool-log-prune.service"),
-            os.path.join(UBUNTU, "files", ".config", "systemd", "user", "dc-mcp-tool-log-prune.timer"),
-            os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-quiet"),
-            os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-log"),
-            os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-tool-log-prune"),
-            os.path.join(UBUNTU, "files", ".local", "share", "applications", "chatgpt.desktop"),
-            os.path.join(UBUNTU, "files", ".local", "bin", "chatgpt-window"),
-        ]
-        for path in paths:
-            with open(path) as fh:
-                text = fh.read()
-            self.assertNotIn("/home/", text, path)
-            self.assertNotIn("ultra", text, path)
-            self.assertNotIn("mextner", text, path)
-
-    def test_the_bridge_keeps_the_password_out_of_its_command_line(self):
-        text = self.read("dc-mcp-bridge.service")
-        self.assertIn("EnvironmentFile=%h/.config/dc-mcp-auth.env", text)
-        self.assertNotIn("--password", text)
+    def test_the_effective_legacy_password_is_kept_when_the_file_has_two_assignments(self):
+        password_file = os.path.join(self.home, ".config", "dc-mcp-auth.env")
+        os.makedirs(os.path.dirname(password_file), exist_ok=True)
+        with open(password_file, "w") as fh:
+            fh.write("# dc-mcp\nPASSWORD=\nPASSWORD=effective-one\n")
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        with open(password_file) as fh:
+            self.assertEqual(fh.read(), "# dc-mcp\nPASSWORD=effective-one\n")
+        self.assertEqual(stat.S_IMODE(os.stat(password_file).st_mode), 0o600)
 
 
 class Finish(Base):
-    PID = "11111111-2222-3333-4444-555555555555"
-
     def setUp(self):
         super().setUp()
-        write_exec(os.path.join(self.fakebin, "cloudflared"), CLOUDFLARED)
-        self.install_ok()
-        # the module installed the real stubbed tools; the finish step runs the one in ~/.local/bin, so put the stub there
-        write_exec(os.path.join(self.bin_dir, "cloudflared"), CLOUDFLARED)
-        unit_dir = os.path.join(self.home, ".config", "systemd", "user")
-        os.makedirs(unit_dir)
-        for unit in ("dc-mcp-bridge.service", "dc-mcp-shim.service", "dc-mcp-tunnel.service"):
-            shutil.copy(os.path.join(UBUNTU, "files", ".config", "systemd", "user", unit), unit_dir)
+        write_exec(os.path.join(self.fakebin, "curl"), CURL)
+        self.assertEqual(self.run_script("install.sh").returncode, 0)
+        os.remove(os.path.join(self.stub, "calls.log"))
 
-    def cloudflared_calls(self):
-        return [c for c in self.calls() if c.startswith("cloudflared")]
-
-    def test_check_is_done_only_while_both_units_are_active(self):
-        self.assertEqual(self.run_script("finish.sh", "check").returncode, 1)
-        open(os.path.join(self.stub, "active-dc-mcp-bridge.service"), "w").close()
-        self.assertEqual(self.run_script("finish.sh", "check").returncode, 1)
-        open(os.path.join(self.stub, "active-dc-mcp-tunnel.service"), "w").close()
-        self.assertEqual(self.run_script("finish.sh", "check").returncode, 1, "the shim is not active")
-        open(os.path.join(self.stub, "active-dc-mcp-shim.service"), "w").close()
+    def test_run_logs_in_starts_proves_the_public_url_then_prints_the_connector_fields(self):
+        res = self.run_script("finish.sh", "run")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            self.cli_calls(),
+            ["computer chatgpt login", "computer chatgpt start", "computer chatgpt doctor", "computer chatgpt connect --no-wait --no-open --no-copy"],
+        )
         self.assertEqual(self.run_script("finish.sh", "check").returncode, 0)
 
-    def test_run_logs_in_creates_the_tunnel_routes_dns_and_starts_both_units(self):
-        res = self.run_script("finish.sh", "run", stdin="y\n")
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        cf = self.cloudflared_calls()
-        self.assertIn("cloudflared tunnel login", cf)
-        self.assertIn("cloudflared tunnel create dc-test", cf)
-        self.assertIn("cloudflared tunnel route dns --overwrite-dns dc-test dc.example.com", cf)
-        self.assertIn("systemctl --user enable --now dc-mcp-bridge.service dc-mcp-shim.service dc-mcp-tunnel.service", self.calls())
-        self.assertEqual(self.run_script("finish.sh", "check").returncode, 0)
-        self.assertIn("https://dc.example.com/mcp", res.stdout)
-        self.assertIn("dc-mcp-auth.env", res.stdout)
-        self.assertNotIn(self.password(), res.stdout + res.stderr)
-
-    def test_declining_the_dns_question_changes_no_record_and_starts_nothing(self):
-        res = self.run_script("finish.sh", "run", stdin="n\n")
+    def test_a_hostname_that_still_points_at_another_machine_fails_and_stays_pending(self):
+        # `login` exits 0 when the owner keeps a DNS record of another machine, and that machine's 401 passes doctor
+        open(os.path.join(self.stub, "dns-elsewhere"), "w").close()
+        res = self.run_script("finish.sh", "run")
         self.assertEqual(res.returncode, 1)
-        self.assertFalse([c for c in self.cloudflared_calls() if "route" in c])
-        self.assertFalse([c for c in self.calls() if "enable" in c])
+        self.assertIn("not from this machine", res.stderr)
+        self.assertNotIn("computer chatgpt connect --no-wait --no-open --no-copy", self.cli_calls())
+        self.assertNotEqual(self.run_script("finish.sh", "check").returncode, 0)
 
-    def test_a_second_run_reuses_login_and_tunnel(self):
-        self.assertEqual(self.run_script("finish.sh", "run", stdin="y\n").returncode, 0)
-        before = len(self.cloudflared_calls())
-        self.assertEqual(self.run_script("finish.sh", "run", stdin="y\n").returncode, 0)
-        again = self.cloudflared_calls()[before:]
-        self.assertNotIn("cloudflared tunnel login", again)
-        self.assertFalse([c for c in again if "tunnel create" in c])
+    def test_an_unreachable_public_url_fails_and_stays_pending(self):
+        open(os.path.join(self.stub, "public-down"), "w").close()
+        self.assertEqual(self.run_script("finish.sh", "run").returncode, 1)
+        self.assertIn("computer chatgpt start", self.cli_calls())  # the local stack runs ...
+        self.assertNotEqual(self.run_script("finish.sh", "check").returncode, 0)  # ... but the step is not done
 
-    def test_a_tunnel_whose_credentials_are_not_here_is_not_recreated_and_dns_is_not_touched(self):
-        os.makedirs(os.path.join(self.home, ".cloudflared"))
-        with open(os.path.join(self.home, ".cloudflared", "cert.pem"), "w") as fh:
-            fh.write("CERT\n")
-        open(os.path.join(self.stub, "tunnel-exists"), "w").close()
-        res = self.run_script("finish.sh", "run", stdin="y\n")
-        self.assertEqual(res.returncode, 1)
-        self.assertIn("credentials", res.stderr)
-        self.assertFalse([c for c in self.cloudflared_calls() if "create" in c or "route" in c])
+    def test_a_failed_login_starts_nothing(self):
+        open(os.path.join(self.stub, "login-fails"), "w").close()
+        self.assertEqual(self.run_script("finish.sh", "run").returncode, 1)
+        self.assertEqual(self.cli_calls(), ["computer chatgpt login"])
 
-    def test_a_failing_tunnel_list_is_not_taken_for_a_missing_tunnel(self):
-        os.makedirs(os.path.join(self.home, ".cloudflared"))
-        with open(os.path.join(self.home, ".cloudflared", "cert.pem"), "w") as fh:
-            fh.write("CERT\n")
-        open(os.path.join(self.stub, "list-fails"), "w").close()
-        res = self.run_script("finish.sh", "run", stdin="y\n")
-        self.assertEqual(res.returncode, 1)
-        self.assertIn("cannot ask Cloudflare", res.stderr)
-        self.assertFalse([c for c in self.cloudflared_calls() if "create" in c or "route" in c])
 
-    def test_run_before_apply_says_what_is_missing(self):
-        os.remove(os.path.join(self.home, ".config", "systemd", "user", "dc-mcp-tunnel.service"))
-        res = self.run_script("finish.sh", "run", stdin="y\n")
-        self.assertEqual(res.returncode, 1)
-        self.assertIn("is not linked yet", res.stderr)
-        self.assertEqual(self.cloudflared_calls(), [])
+class ProfileFiles(unittest.TestCase):
+    """The files the profile still ships for this module name no user, machine or home."""
+
+    def test_they_name_no_user_or_home(self):
+        for path in (
+            os.path.join(UBUNTU, "files", ".config", "systemd", "user", "dc-mcp-tool-log-prune.service"),
+            os.path.join(UBUNTU, "files", ".config", "systemd", "user", "dc-mcp-tool-log-prune.timer"),
+            os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-tool-log-prune"),
+            os.path.join(UBUNTU, "files", ".local", "share", "applications", "chatgpt.desktop"),
+            os.path.join(UBUNTU, "files", ".local", "bin", "chatgpt-window"),
+        ):
+            with open(path) as fh:
+                text = fh.read()
+            for word in ("/home/", "ultra", "mextner"):
+                self.assertNotIn(word, text, path)
 
 
 class Launcher(unittest.TestCase):
@@ -543,577 +621,6 @@ class Launcher(unittest.TestCase):
             self.assertEqual(struct.unpack(">II", head[16:24]), (size, size))
         with open(self.DESKTOP) as fh:
             self.assertIn("\nIcon=chatgpt-window\n", fh.read())
-
-
-NODE = shutil.which("node") or (os.path.join(os.path.expanduser("~"), ".local", "opt", "node", "bin", "node") if os.access(os.path.join(os.path.expanduser("~"), ".local", "opt", "node", "bin", "node"), os.X_OK) else None)
-SHIM = os.path.join(UBUNTU, "files", ".local", "share", "dc-mcp-shim", "shim.mjs")
-EXTERNAL = "https://dc.example.com"
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-class Upstream(http.server.ThreadingHTTPServer):
-    """A stand-in for mcp-auth-proxy: records every request and answers from `self.routes[path]`."""
-
-    daemon_threads = True
-
-    def __init__(self):
-        self.seen = []
-        self.routes = {}
-        self.release_second_chunk = threading.Event()
-        super().__init__(("127.0.0.1", 0), Handler)
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):
-        pass
-
-    def do_GET(self):
-        self.answer(b"")
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        self.answer(self.rfile.read(length))
-
-    def answer(self, body):
-        path = self.path.split("?")[0]
-        self.server.seen.append({"method": self.command, "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
-        status, headers, payload = self.server.routes.get(path, (404, {}, b"not found"))
-        if payload == "idle":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            self.wfile.flush()
-            self.server.release_second_chunk.wait(5)
-            return
-        if payload == "partial":
-            self.send_response(200)
-            self.send_header("Content-Type", "Text/Event-Stream; charset=utf-8")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            self.wfile.write(b"2\r\nda\r\n")
-            self.wfile.flush()
-            time.sleep(0.6)
-            self.wfile.write(b"7\r\nta: ok\n\r\n0\r\n\r\n")
-            return
-        if payload == "stream":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            self.wfile.write(b"6\r\nfirst\n\r\n")
-            self.wfile.flush()
-            self.server.release_second_chunk.wait(5)
-            self.wfile.write(b"7\r\nsecond\n\r\n0\r\n\r\n")
-            return
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name, value)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-
-class ShimHarness:
-    """shim.mjs run for real in front of a stub upstream: setup shared by the shim test classes."""
-
-    def setUp(self):
-        self.shim_tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.shim_tmp, ignore_errors=True)
-        self.stderr_path = os.path.join(self.shim_tmp, "stderr.txt")
-        self.upstream = Upstream()
-        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
-        self.addCleanup(self.upstream.server_close)
-        self.addCleanup(self.upstream.shutdown)
-        self.start_shim(**self.shim_env())
-
-    def shim_env(self):
-        return {}
-
-    def start_shim(self, **env):
-        self.port = free_port()
-        with open(self.stderr_path, "w") as stderr:
-            self.proc = subprocess.Popen(
-                [NODE, SHIM],
-                env={**os.environ, "EXTERNAL_URL": EXTERNAL, "LISTEN_PORT": str(self.port), "UPSTREAM_PORT": str(self.upstream.server_address[1]), **env},
-                stdout=subprocess.DEVNULL,
-                stderr=stderr,
-            )
-        self.addCleanup(self.proc.wait)
-        self.addCleanup(self.proc.terminate)
-        for _ in range(100):
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        self.fail("the shim did not start listening")
-
-    def request(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request(method, path, body=body, headers=headers or {})
-        res = conn.getresponse()
-        data = res.read()
-        conn.close()
-        return res, data
-
-
-
-@unittest.skipUnless(NODE, "node is not installed")
-class Shim(ShimHarness, unittest.TestCase):
-    """files/.local/share/dc-mcp-shim/shim.mjs: the proxying behaviour."""
-
-    def test_a_401_without_a_challenge_gets_the_resource_metadata_challenge(self):
-        self.upstream.routes["/mcp"] = (401, {"Content-Type": "text/plain"}, b"unauthorized body")
-        res, body = self.request("POST", "/mcp", b"{}")
-        self.assertEqual(res.status, 401)
-        self.assertEqual(res.getheader("WWW-Authenticate"), f'Bearer resource_metadata="{EXTERNAL}/.well-known/oauth-protected-resource"')
-        self.assertEqual(body, b"unauthorized body")
-
-    def test_the_login_pages_of_the_proxy_get_no_challenge(self):
-        for path in ("/.auth/password", "/.idp/token"):
-            self.upstream.routes[path] = (401, {}, b"wrong password")
-            res, body = self.request("POST", path, b"x=1")
-            self.assertEqual(res.status, 401, path)
-            self.assertIsNone(res.getheader("WWW-Authenticate"), path)
-            self.assertEqual(body, b"wrong password")
-
-    def test_a_challenge_the_proxy_already_sent_is_left_alone(self):
-        self.upstream.routes["/mcp"] = (401, {"WWW-Authenticate": 'Bearer realm="proxy"'}, b"")
-        res, _ = self.request("GET", "/mcp")
-        self.assertEqual(res.getheader("WWW-Authenticate"), 'Bearer realm="proxy"')
-
-    def test_other_statuses_get_no_challenge(self):
-        self.upstream.routes["/ok"] = (200, {"X-Kept": "yes"}, b"fine")
-        self.upstream.routes["/forbidden"] = (403, {}, b"no")
-        res, body = self.request("GET", "/ok")
-        self.assertEqual((res.status, body, res.getheader("X-Kept"), res.getheader("WWW-Authenticate")), (200, b"fine", "yes", None))
-        res, _ = self.request("GET", "/forbidden")
-        self.assertEqual((res.status, res.getheader("WWW-Authenticate")), (403, None))
-
-    def test_the_path_suffix_form_of_the_resource_metadata_is_rewritten_to_the_root_form(self):
-        self.upstream.routes["/.well-known/oauth-protected-resource"] = (200, {"Content-Type": "application/json"}, b'{"resource":"x"}')
-        res, body = self.request("GET", "/.well-known/oauth-protected-resource/mcp?a=1")
-        self.assertEqual((res.status, body), (200, b'{"resource":"x"}'))
-        self.assertEqual(self.upstream.seen[-1]["path"], "/.well-known/oauth-protected-resource?a=1")
-        self.request("GET", "/.well-known/oauth-authorization-server/mcp")
-        self.assertEqual(self.upstream.seen[-1]["path"], "/.well-known/oauth-authorization-server/mcp")
-
-    def test_method_query_headers_and_body_reach_the_upstream_unchanged(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
-        self.request("POST", "/mcp?session=abc", payload, {"Authorization": "Bearer t0k", "Content-Type": "application/json", "X-Custom": "1"})
-        seen = self.upstream.seen[-1]
-        self.assertEqual((seen["method"], seen["path"], seen["body"]), ("POST", "/mcp?session=abc", payload))
-        self.assertEqual((seen["headers"]["authorization"], seen["headers"]["x-custom"]), ("Bearer t0k", "1"))
-
-    def test_hop_by_hop_headers_do_not_cross_the_shim(self):
-        self.upstream.routes["/mcp"] = (200, {"Keep-Alive": "timeout=5", "Proxy-Authenticate": "Basic", "X-End-To-End": "kept"}, b"ok")
-        res, _ = self.request("GET", "/mcp", headers={"Connection": "X-Private", "X-Private": "secret", "TE": "trailers", "Keep-Alive": "300", "X-Public": "kept"})
-        seen = self.upstream.seen[-1]["headers"]
-        for name in ("x-private", "te", "keep-alive"):
-            self.assertNotIn(name, seen, name)
-        self.assertEqual(seen["x-public"], "kept")
-        self.assertNotEqual(res.getheader("Keep-Alive"), "timeout=5", "the upstream hop's keep-alive hint is not the client's; Node adds its own")
-        self.assertIsNone(res.getheader("Proxy-Authenticate"))
-        self.assertEqual(res.getheader("X-End-To-End"), "kept")
-
-    def test_a_streamed_body_is_forwarded_as_it_arrives_not_buffered(self):
-        self.upstream.routes["/sse"] = (200, {}, "stream")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("GET", "/sse")
-        res = conn.getresponse()
-        self.assertEqual(res.status, 200)
-        self.assertEqual(res.getheader("Content-Type"), "text/event-stream")
-        self.assertEqual(res.read1(6), b"first\n", "the first chunk must arrive while the upstream still holds the second")
-        self.upstream.release_second_chunk.set()
-        self.assertEqual(res.read(), b"second\n")
-        conn.close()
-
-    def test_headers_of_an_idle_event_stream_reach_the_client_before_any_body_byte(self):
-        """GET /mcp with Accept: text/event-stream: the upstream sends headers and then stays silent; the client must not wait."""
-        self.upstream.routes["/mcp"] = (200, {}, "idle")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
-        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
-        started = time.time()
-        res = conn.getresponse()  # raises a timeout when the shim holds the headers back
-        self.assertLess(time.time() - started, 2)
-        self.assertEqual((res.status, res.getheader("Content-Type")), (200, "text/event-stream"))
-        self.upstream.release_second_chunk.set()
-        conn.close()
-
-    def test_an_event_stream_that_speaks_first_is_not_given_a_comment_line(self):
-        self.upstream.routes["/mcp"] = (200, {}, "stream")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
-        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
-        res = conn.getresponse()
-        self.assertEqual(res.read1(6), b"first\n")
-        self.upstream.release_second_chunk.set()
-        self.assertEqual(res.read(), b"second\n")
-        conn.close()
-
-    def test_a_stream_that_has_started_is_not_given_a_comment_while_it_waits_for_the_rest_of_an_event(self):
-        self.upstream.routes["/mcp"] = (200, {}, "partial")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
-        res = conn.getresponse()
-        self.assertEqual(res.read(), b"data: ok\n")
-        conn.close()
-
-    def test_the_idle_event_stream_gets_a_comment_line_so_the_cloudflare_edge_releases_the_headers(self):
-        """Cloudflare holds response headers of an event stream until the first body byte (seen live: GET /mcp hung through the tunnel)."""
-        self.upstream.routes["/mcp"] = (200, {}, "idle")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
-        conn.request("GET", "/mcp", headers={"Accept": "text/event-stream", "Authorization": "Bearer t"})
-        res = conn.getresponse()
-        self.assertEqual(res.read1(8), b": open\n\n")
-        self.upstream.release_second_chunk.set()
-        conn.close()
-
-    def test_an_upstream_that_is_down_is_a_502_not_a_hang(self):
-        self.upstream.shutdown()
-        self.upstream.server_close()
-        res, body = self.request("GET", "/mcp")
-        self.assertEqual((res.status, body), (502, b"bad gateway"))
-
-    def test_without_the_public_url_it_refuses_to_start(self):
-        proc = subprocess.run([NODE, SHIM], env={k: v for k, v in os.environ.items() if k != "EXTERNAL_URL"}, capture_output=True, text=True, timeout=10, check=False)
-        self.assertEqual(proc.returncode, 2)
-        self.assertIn("EXTERNAL_URL", proc.stderr)
-
-
-def rpc_body(method, **extra):
-    return json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, **extra}).encode()
-
-
-@unittest.skipUnless(NODE, "node is not installed")
-class ShimLog(ShimHarness, unittest.TestCase):
-    """The access log of shim.mjs: what it writes, what it must never write, rotation, failure."""
-
-    LOG_ENV = {"LOG_FLUSH_MS": "30"}
-
-    def shim_env(self):
-        self.log_dir = os.path.join(self.shim_tmp, "state", "dc-mcp")
-        self.log = os.path.join(self.log_dir, "access.log")
-        return {"LOG_FILE": self.log, **self.LOG_ENV}
-
-    def lines(self, expected, timeout=5):
-        """The log's lines once at least `expected` of them are there (the shim writes in batches)."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                with open(self.log) as fh:
-                    found = fh.read().splitlines()
-            except FileNotFoundError:
-                found = []
-            if len(found) >= expected:
-                return found
-            time.sleep(0.03)
-        self.fail(f"expected {expected} log lines, found {found}")
-
-    def settle(self):
-        time.sleep(0.4)  # several flush intervals: nothing more is coming
-
-    def test_a_chatgpt_shaped_sequence_is_logged_compactly_and_leaks_nothing(self):
-        for path in ("/.well-known/oauth-protected-resource", "/.idp/token", "/.idp/auth", "/mcp"):
-            self.upstream.routes[path] = (200, {}, b"ok")
-        ua_oauth = {"User-Agent": "openai-connectors-oauth/9.8.7-ua (+https://openai.com)"}
-        ua_mcp = {"User-Agent": "openai-mcp/9.8.7-ua", "Authorization": "Bearer SECRETTOKEN", "Content-Type": "application/json"}
-        self.request("GET", "/.well-known/oauth-protected-resource/mcp?state=SECRETSTATE", headers=ua_oauth)
-        self.request("POST", "/.idp/token?code=SECRETCODE", b"code=SECRETCODE&password=hunter2hunter2", ua_oauth)
-        self.request("POST", "/mcp", rpc_body("initialize", params={"clientInfo": {"name": "CLIENTSECRET"}}), ua_mcp)
-        self.request("POST", "/mcp", rpc_body("tools/list"), ua_mcp)
-        self.request("POST", "/mcp", rpc_body("tools/call", params={"name": "get_config", "arguments": {"path": "ARGSECRET"}}), ua_mcp)
-        lines = self.lines(5)
-        pattern = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z (\d{3}) ([A-Z]+) (\S+) (\d+)ms client=(\S+)( rpc=\S+)?( tool=\S+)?$"
-        parsed = [re.match(pattern, line) for line in lines]
-        self.assertTrue(all(parsed), lines)
-        summary = [(m.group(1), m.group(2), m.group(3), m.group(5), m.group(6), m.group(7)) for m in parsed]
-        self.assertEqual(
-            summary,
-            [
-                ("200", "GET", "/.well-known/oauth-protected-resource/mcp", "openai-connectors-oauth", None, None),
-                ("200", "POST", "/.idp/token", "openai-connectors-oauth", None, None),
-                ("200", "POST", "/mcp", "openai-mcp", " rpc=initialize", None),
-                ("200", "POST", "/mcp", "openai-mcp", " rpc=tools/list", None),
-                ("200", "POST", "/mcp", "openai-mcp", " rpc=tools/call", " tool=get_config"),
-            ],
-        )
-        text = slurp(self.log)
-        for secret in ("SECRETSTATE", "SECRETCODE", "hunter2", "SECRETTOKEN", "ARGSECRET", "CLIENTSECRET", "9.8.7-ua", "Bearer", "arguments", "?"):
-            self.assertNotIn(secret, text, secret)
-        self.assertEqual(stat.S_IMODE(os.stat(self.log).st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(os.stat(self.log_dir).st_mode), 0o700)
-
-    def test_every_authenticated_mcp_call_and_oauth_step_is_logged_but_noise_collapses(self):
-        for path in ("/.well-known/oauth-protected-resource", "/mcp", "/.idp/token", "/favicon.ico"):
-            self.upstream.routes[path] = (401, {}, b"no")
-        for _ in range(5):
-            self.request("GET", "/.well-known/oauth-protected-resource")
-            self.request("POST", "/mcp", rpc_body("tools/list"))  # no Authorization: the discovery handshake, or a scanner
-            self.request("GET", "/favicon.ico")
-        for _ in range(3):
-            self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-            self.request("POST", "/.idp/token", b"x=1")
-        self.settle()
-        lines = self.lines(1)
-        by_kind = {}
-        for line in lines:
-            fields = line.split()
-            by_kind.setdefault((fields[2], fields[3], fields[1]), []).append(line)
-        self.assertEqual(len(by_kind[("GET", "/.well-known/oauth-protected-resource", "401")]), 1)
-        self.assertEqual(len(by_kind[("POST", "/mcp", "401")]), 1 + 3, "one collapsed unauthenticated line plus three authenticated calls")
-        self.assertEqual(len(by_kind[("POST", "/.idp/token", "401")]), 3)
-        self.assertFalse([line for line in lines if "/favicon.ico" in line])
-
-    def test_collapsed_lines_carry_the_suppressed_count_when_the_minute_is_over(self):
-        self.upstream.routes["/probe"] = (404, {}, b"")
-        self.request("GET", "/probe")
-        self.request("GET", "/probe")
-        self.request("GET", "/probe")
-        self.assertEqual(len(self.lines(1)), 1)
-        self.settle()
-        self.assertEqual(len(self.lines(1)), 1)  # still collapsed: the minute has not passed
-
-    def test_a_big_or_broken_body_is_forwarded_untouched_and_logged_without_a_method(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        auth = {"Authorization": "Bearer t"}
-        big = rpc_body("tools/call", params={"name": "BIGTOOL", "pad": "x" * 70000})
-        broken = b'{"method": "tools/call", "params": {"name": "BROKENTOOL"'
-        self.request("POST", "/mcp", big, auth)
-        self.request("POST", "/mcp", broken, auth)
-        self.request("POST", "/mcp", b"[1, 2]", auth)
-        lines = self.lines(3)
-        self.assertTrue(all("rpc=?" in line and "tool=" not in line for line in lines), lines)
-        self.assertNotIn("TOOL", slurp(self.log))
-        self.assertEqual([seen["body"] for seen in self.upstream.seen], [big, broken, b"[1, 2]"], "forwarding is not affected")
-
-    def test_an_unframed_chunked_body_is_not_parsed(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        conn.request("POST", "/mcp", body=iter([rpc_body("tools/call", params={"name": "CHUNKTOOL"})]), headers={"Authorization": "Bearer t"}, encode_chunked=True)
-        self.assertEqual(conn.getresponse().status, 200)
-        conn.close()
-        self.assertTrue(self.lines(1)[0].endswith("rpc=?"))
-        self.assertNotIn("CHUNKTOOL", slurp(self.log))
-
-    def test_a_batch_logs_each_method_and_tool_name_only(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        batch = json.dumps([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "read_file", "arguments": {"path": "/etc/shadow"}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-            {"jsonrpc": "2.0", "id": 3, "method": "bad method with spaces"},
-        ]).encode()
-        self.request("POST", "/mcp", batch, {"Authorization": "Bearer t"})
-        line = self.lines(1)[0]
-        self.assertTrue(line.endswith("rpc=tools/call,tools/list,? tool=read_file"), line)
-        self.assertNotIn("shadow", slurp(self.log))
-
-    def test_a_scanner_inventing_paths_cannot_push_the_real_records_out(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-        for i in range(400):
-            self.request("GET", f"/wp-admin/{i}.php")
-        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-        self.settle()
-        lines = self.lines(3)
-        self.assertEqual(len([line for line in lines if " /mcp " in line]), 2)
-        self.assertLessEqual(len([line for line in lines if "/wp-admin/" in line]), 1)
-
-    def test_stopping_the_shim_writes_the_buffered_lines_exactly_once(self):
-        self.proc.terminate()
-        self.proc.wait()
-        self.start_shim(LOG_FILE=self.log, LOG_FLUSH_MS="60000")  # nothing is flushed until the shim is told to stop
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        for i in range(3):
-            self.request("POST", "/mcp", rpc_body("tools/call", params={"name": f"stop{i}"}), {"Authorization": "Bearer t"})
-        self.assertFalse(os.path.exists(self.log))
-        self.proc.terminate()
-        self.assertEqual(self.proc.wait(timeout=5), 0)
-        lines = slurp(self.log).splitlines()
-        self.assertEqual([line.split()[-1] for line in lines], ["tool=stop0", "tool=stop1", "tool=stop2"])
-
-    def test_a_server_error_is_always_logged(self):
-        self.upstream.routes["/boom"] = (500, {}, b"")
-        for _ in range(3):
-            self.request("GET", "/boom")
-        self.assertEqual(len(self.lines(3)), 3)
-
-    def test_an_upstream_that_is_down_is_logged_as_502_and_reported_once_in_the_journal(self):
-        self.upstream.shutdown()
-        self.upstream.server_close()
-        for _ in range(4):
-            res, _ = self.request("GET", "/mcp")
-            self.assertEqual(res.status, 502)
-        self.assertEqual(len(self.lines(4)), 4)
-        self.assertTrue(all(" 502 GET /mcp " in line for line in self.lines(4)))
-        with open(self.stderr_path) as fh:
-            self.assertEqual(len([line for line in fh if "upstream" in line]), 1)
-
-    def test_requests_leave_nothing_in_the_journal_streams_while_they_succeed(self):
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        for _ in range(5):
-            self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-        self.lines(5)
-        with open(self.stderr_path) as fh:
-            self.assertEqual(fh.read(), "")
-
-    def test_rotation_keeps_the_newest_files_drops_the_oldest_and_never_stops_serving(self):
-        self.proc.terminate()
-        self.proc.wait()
-        self.start_shim(LOG_FILE=self.log, LOG_FLUSH_MS="20", LOG_MAX_KIB="1", LOG_KEEP="2")
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        for wave in range(6):
-            for i in range(8):
-                res, _ = self.request("POST", "/mcp", rpc_body("tools/call", params={"name": f"t{wave}x{i}"}), {"Authorization": "Bearer t"})
-                self.assertEqual(res.status, 200)
-            time.sleep(0.15)
-        self.settle()
-        names = sorted(n for n in os.listdir(self.log_dir))
-        self.assertEqual(names, ["access.log", "access.log.1", "access.log.2"])
-        everything = "".join(slurp(os.path.join(self.log_dir, n)) for n in names)
-        self.assertIn("tool=t5x7", everything, "the newest request is kept")
-        self.assertNotIn("tool=t0x0", everything, "the oldest was rotated out of existence")
-        newest, older = slurp(self.log), slurp(self.log + ".1")
-        self.assertLess(older.splitlines()[-1].split()[0], newest.splitlines()[0].split()[0] + "Z", "a rotated file holds older lines than the live one")
-        for name in names:
-            self.assertLess(os.path.getsize(os.path.join(self.log_dir, name)), 4096)
-
-    def test_an_unwritable_log_directory_never_affects_requests_and_warns_once(self):
-        if os.geteuid() == 0:
-            self.skipTest("root ignores directory permissions")
-        self.proc.terminate()
-        self.proc.wait()
-        locked = os.path.join(self.shim_tmp, "locked")
-        os.mkdir(locked, 0o500)
-        self.addCleanup(os.chmod, locked, 0o700)
-        log = os.path.join(locked, "sub", "access.log")
-        self.start_shim(LOG_FILE=log, LOG_FLUSH_MS="20")
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        for _ in range(6):
-            res, body = self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-            self.assertEqual((res.status, body), (200, b"ok"))
-            time.sleep(0.06)
-        with open(self.stderr_path) as fh:
-            warnings = [line for line in fh if "cannot write the access log" in line]
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("EACCES", warnings[0])
-        os.chmod(locked, 0o700)  # fixed: logging resumes by itself and says so once
-        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-        deadline = time.time() + 5
-        while time.time() < deadline and not os.path.exists(log):
-            self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-            time.sleep(0.05)
-        self.assertTrue(os.path.exists(log))
-        time.sleep(0.2)
-        with open(self.stderr_path) as fh:
-            self.assertEqual(len([line for line in fh if "writable again" in line]), 1)
-
-    def test_without_a_log_file_nothing_is_written_anywhere(self):
-        self.proc.terminate()
-        self.proc.wait()
-        self.start_shim(LOG_FLUSH_MS="20")
-        self.upstream.routes["/mcp"] = (200, {}, b"ok")
-        self.request("POST", "/mcp", rpc_body("tools/list"), {"Authorization": "Bearer t"})
-        time.sleep(0.2)
-        self.assertFalse(os.path.exists(self.log_dir))
-
-
-class JournalFilter(unittest.TestCase):
-    """files/.local/bin/dc-mcp-quiet: only warnings and errors survive; the command's own status and stderr do."""
-
-    QUIET = os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-quiet")
-
-    def run_quiet(self, script, *args):
-        return subprocess.run([self.QUIET, "sh", "-c", script, "sh", *args], capture_output=True, text=True, timeout=20, check=False)
-
-    def test_request_lines_and_message_copies_are_dropped_and_problems_are_kept(self):
-        script = r"""
-printf '%s\n' '{"severity":"INFO","message":"/mcp","status":200,"user-agent":"openai-mcp"}'
-printf '%s\n' '[supergateway] StreamableHttp → Child: {"method":"tools/call","params":{"arguments":{"path":"/private/file"}}}'
-printf '%s\n' '[supergateway] Child → StreamableHttp: {"result":"TOOL OUTPUT with an error word in it"}'
-printf '%s\n' '[supergateway] Initialize response received'
-printf '%s\n' '[supergateway] Child exited: code=null, signal=SIGTERM'
-printf '%s\n' '[supergateway] Error: spawn npx ENOENT'
-printf '%s\n' '{"severity":"ERROR","message":"backend unreachable"}'
-printf '%s\n' 'plain startup problem'
-"""
-        done = self.run_quiet(script)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout.splitlines(), ['[supergateway] Error: spawn npx ENOENT', '{"severity":"ERROR","message":"backend unreachable"}', "plain startup problem"])
-
-    def test_the_exit_status_stderr_and_arguments_of_the_command_are_its_own(self):
-        done = self.run_quiet('echo "$1 $2" >&2; exit 7', "a b", "c*d")
-        self.assertEqual(done.returncode, 7)
-        self.assertEqual(done.stderr, "a b c*d\n")
-
-    def test_without_a_command_it_says_how_to_use_it(self):
-        done = subprocess.run([self.QUIET], capture_output=True, text=True, check=False)
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("usage: dc-mcp-quiet", done.stderr)
-
-
-class LogReader(unittest.TestCase):
-    """files/.local/bin/dc-mcp-log over a fixture log and its rotated files."""
-
-    READER = os.path.join(UBUNTU, "files", ".local", "bin", "dc-mcp-log")
-    OLD = "2026-11-08T10:00:00.000Z 200 POST /mcp 5ms client=openai-mcp rpc=tools/call tool=old_tool"
-    LIVE = [
-        "2026-11-08T11:00:00.000Z 401 POST /mcp 1ms client=openai-mcp rpc=initialize",
-        "2026-11-08T11:00:01.000Z 200 POST /.idp/token 2ms client=openai-connectors-oauth",
-        "2026-11-08T11:00:02.000Z 200 POST /mcp 3ms client=openai-mcp rpc=tools/call tool=get_config",
-        "2026-11-08T11:00:03.000Z 200 POST /mcp 4ms client=curl rpc=tools/call tool=read_file",
-        "2026-11-08T11:00:04.000Z 500 POST /mcp 9ms client=openai-mcp rpc=tools/call tool=get_config",
-    ]
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        self.log = os.path.join(self.tmp, "access.log")
-        with open(self.log, "w") as fh:
-            fh.write("\n".join(self.LIVE) + "\n")
-        with open(self.log + ".1", "w") as fh:
-            fh.write(self.OLD + "\n")
-
-    def read(self, *args):
-        return subprocess.run([self.READER, *args], env={**os.environ, "DC_MCP_LOG_FILE": self.log}, capture_output=True, text=True, check=False)
-
-    def test_the_last_lines_and_the_filters(self):
-        self.assertEqual(self.read("-n", "2").stdout.splitlines(), self.LIVE[-2:])
-        self.assertEqual(self.read("--tool", "get_config").stdout.splitlines(), [self.LIVE[2], self.LIVE[4]])
-        self.assertEqual(self.read("--status", "500").stdout.splitlines(), [self.LIVE[4]])
-        self.assertEqual(self.read("--rpc", "initialize").stdout.splitlines(), [self.LIVE[0]])
-        self.assertEqual(self.read("--client", "curl").stdout.splitlines(), [self.LIVE[3]])
-        self.assertEqual(self.read("--oauth").stdout.splitlines(), [self.LIVE[1]])
-        self.assertEqual(self.read("--tool", "get_config", "--status", "200").stdout.splitlines(), [self.LIVE[2]])
-
-    def test_a_batch_line_matches_each_of_its_methods_and_tools(self):
-        with open(self.log, "a") as fh:
-            fh.write("2026-11-08T11:00:05.000Z 200 POST /mcp 7ms client=openai-mcp rpc=tools/call,tools/list tool=read_file,write_file\n")
-        self.assertEqual(len(self.read("--tool", "read_file").stdout.splitlines()), 2, "one single call and the batch")
-        self.assertEqual(len(self.read("--tool", "write_file").stdout.splitlines()), 1)
-        self.assertEqual(len(self.read("--rpc", "tools/list").stdout.splitlines()), 1)
-        self.assertEqual(len(self.read("--rpc", "tools/call").stdout.splitlines()), 4, "three single calls plus the batch")
-        self.assertEqual(self.read("--tool", "read").stdout, "", "a part of a name is not the name")
-
-    def test_rotated_files_only_with_all_and_oldest_first(self):
-        self.assertNotIn("old_tool", self.read().stdout)
-        self.assertEqual(self.read("--all", "--tool", "old_tool").stdout.splitlines(), [self.OLD])
-        self.assertEqual(self.read("--all", "-n", "6").stdout.splitlines(), [self.OLD, *self.LIVE])
-
-    def test_a_missing_log_and_bad_arguments_are_reported(self):
-        os.remove(self.log)
-        done = self.read()
-        self.assertEqual(done.returncode, 1)
-        self.assertIn("no log yet", done.stderr)
-        self.assertEqual(self.read("-n", "x").returncode, 2)
-        self.assertEqual(self.read("--bogus").returncode, 2)
 
 
 class ToolLogRetention(unittest.TestCase):

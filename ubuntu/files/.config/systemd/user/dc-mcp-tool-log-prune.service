@@ -1,11 +1,10 @@
 [Unit]
 Description=Retention for Desktop Commander's rotated tool-call logs (dc-mcp module)
 
-# Desktop Commander never deletes its rotated claude_tool_call_*.log files; this keeps the newest few and drops the old ones. Limits
-# come from ~/.config/dc-mcp.env (DC_MCP_TOOL_LOG_KEEP, DC_MCP_TOOL_LOG_MAX_AGE_DAYS); without that file the script's defaults apply.
+# Desktop Commander never deletes its rotated claude_tool_call_*.log files; this keeps the newest few and drops the old ones, with
+# the script's default limits (DC_MCP_TOOL_LOG_KEEP 5 files, DC_MCP_TOOL_LOG_MAX_AGE_DAYS 30 days).
 
 [Service]
 Type=oneshot
-EnvironmentFile=-%h/.config/dc-mcp.env
 ExecStart=%h/.local/bin/dc-mcp-tool-log-prune
 Nice=10
