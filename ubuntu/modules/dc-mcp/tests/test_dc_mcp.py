@@ -40,7 +40,7 @@ case "$*" in
   "chatgpt doctor") [ -e "$STUB/public-down" ] && exit 3 ;;
   "chatgpt status") [ -e "$STUB/started" ] || exit 3 ;;
   "chatgpt start") : > "$STUB/started" ;;
-  "chatgpt login") [ -e "$STUB/login-fails" ] && exit 8 ;;
+  "chatgpt login --tunnel-name dc-test") [ -e "$STUB/login-fails" ] && exit 8 ;;
 esac
 exit 0
 """
@@ -492,7 +492,12 @@ class Finish(Base):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(
             self.cli_calls(),
-            ["computer chatgpt login", "computer chatgpt start", "computer chatgpt doctor", "computer chatgpt connect --no-wait --no-open --no-copy"],
+            [
+                "computer chatgpt login --tunnel-name dc-test",
+                "computer chatgpt start",
+                "computer chatgpt doctor",
+                "computer chatgpt connect --no-wait --no-open --no-copy",
+            ],
         )
         self.assertEqual(self.run_script("finish.sh", "check").returncode, 0)
 
@@ -514,7 +519,7 @@ class Finish(Base):
     def test_a_failed_login_starts_nothing(self):
         open(os.path.join(self.stub, "login-fails"), "w").close()
         self.assertEqual(self.run_script("finish.sh", "run").returncode, 1)
-        self.assertEqual(self.cli_calls(), ["computer chatgpt login"])
+        self.assertEqual(self.cli_calls(), ["computer chatgpt login --tunnel-name dc-test"])
 
 
 class ProfileFiles(unittest.TestCase):
