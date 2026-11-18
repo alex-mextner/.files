@@ -303,16 +303,43 @@ tl_record_restore() { date +%s >> "$1/restore-attempts"; }
 #           (packages/coding-agent/src/cli.ts), and neither a subcommand (omp ps, omp read, ...), nor -p/--print/--help/
 #           --version, nor --mode other than text, nor a __omp_worker_ process (omp_recovery.is_interactive_omp)
 #   claude  a DESCENDANT of the pane's shell has argv[0] `claude`, `*/claude` or `*/claude/versions/*`: Claude Code shows
-#           up as its VERSION in #{pane_current_command}, so the pane's command never says `claude` (cc-save.sh)
-#   codex   a descendant with argv[0] `codex` or `*/codex` (codex-save.sh)
+#           up as its VERSION in #{pane_current_command}, so the pane's command never says `claude` (cc-save.sh);
+#           `-p`/`--print` is print mode: a one-shot call with no session to resume
+#   codex   a descendant with argv[0] `codex` or `*/codex` (codex-save.sh); the `exec` subcommand (alias `e`) and
+#           `--ephemeral` are one-shot calls with no session to resume (judge/review wrappers use exactly these
+#           forms; anything else may still be interactive, so it keeps demanding the map)
 # Only argv[0] decides what a process is: a `grep x .../claude/versions/` or `vim claude.md` in a pane is not an agent.
+# For claude/codex candidates the argument boundaries come from /proc/<pid>/cmdline (NUL-separated, quoting intact)
+# whenever its argv[0] matches what ps printed; otherwise the flattened ps line is used, and a quoted prompt word can
+# then look like a flag or subcommand (omp detection is unchanged and always uses the flattened line).
 tl_pane_agents() {
-  local panes procs
+  local panes procs sep37 nl out="" pid ppid rest first args37
   panes=$("${tmux_bin:-tmux}" list-panes -a -F '#{pane_pid}	#{pane_current_command}' 2>/dev/null) || return 0
   procs=$(ps -eo pid=,ppid=,args= 2>/dev/null) || procs=""
+  sep37=$'\037' nl=$'\n'
+  while read -r pid ppid rest; do
+    [ -n "$pid" ] || continue
+    args37=""
+    first=${rest%% *}
+    case $first in
+      claude | */claude | */claude/versions/* | codex | */codex)
+        # /proc keeps the true argument boundaries; trust it only when argv[0] is the process ps named
+        if [ -n "$first" ] && [ -r "/proc/$pid/cmdline" ]; then
+          args37=$(tr '\0\n' '\037 ' 2>/dev/null < "/proc/$pid/cmdline") || args37=""  # newlines would split the record
+          if [ -n "$args37" ] && [ "${args37%%"$sep37"*}" != "$first" ]; then args37=""; fi
+          args37=${args37//$'\t'/ }
+        fi
+        ;;
+    esac
+    if [ -n "$args37" ]; then
+      out="${out:+$out$nl}S	$pid	$ppid	E	$args37"
+    else
+      out="${out:+$out$nl}S	$pid	$ppid	F	$rest"
+    fi
+  done <<< "$procs"
   {
     printf '%s\n' "$panes" | sed 's/^/P\t/'
-    printf '%s\n' "$procs" | sed 's/^/S /'
+    printf '%s\n' "$out"
   } | awk '
     BEGIN {
       n = split("acp agents auth-broker collab compress config dry-balance gallery gc images install join models plugin ps read render say search setup share shell ssh stats tiny-models token ttsr help version", c, " ")
@@ -329,32 +356,48 @@ tl_pane_agents() {
       }
       return 1
     }
-    function kind(line,   t, nt, e, b, i, hits, at) {
-      nt = split(line, t, " ")
-      e = t[4]
-      if (e == "claude" || e ~ /\/claude$/ || e ~ /\/claude\/versions\//) return "claude"
-      if (e == "codex" || e ~ /\/codex$/) return "codex"
+    function one_shot_claude(t, nt, start,   i, a) {
+      for (i = start; i <= nt; i++) { a = t[i]; if (a == "-p" || a == "--print") return 1 }
+      return 0
+    }
+    function one_shot_codex(t, nt, start,   i, a) {
+      for (i = start; i <= nt; i++) {
+        a = t[i]
+        if (a == "--ephemeral") return 1
+        if (a ~ /^-/) {  # a global option; the ones that take a value swallow the next word
+          if (a == "-c" || a == "-m" || a == "-s" || a == "-C" || a == "-p" || a == "-a" || a == "--config" || a == "--model" || a == "--sandbox" || a == "--cd" || a == "--profile" || a == "--ask-for-approval" || a == "--add-dir" || a == "--local-provider" || a == "--enable" || a == "--disable") i++
+          continue
+        }
+        return (a == "exec" || a == "e") ? 1 : 0  # the first free word is the subcommand; anything else may be interactive
+      }
+      return 0
+    }
+    function kind(args, flat,   t, nt, e, b, i, hits, at) {
+      nt = split(args, t, flat ? " " : "\037")
+      e = t[1]
+      if (e == "claude" || e ~ /\/claude$/ || e ~ /\/claude\/versions\//) return one_shot_claude(t, nt, 2) ? "cc-no" : "claude"
+      if (e == "codex" || e ~ /\/codex$/) return one_shot_codex(t, nt, 2) ? "codex-no" : "codex"
       b = e; sub(/.*\//, "", b)
-      if (b == "omp") return interactive(t, nt, 5) ? "omp" : "omp-no"
+      if (b == "omp") return interactive(t, nt, 2) ? "omp" : "omp-no"
       if (b == "bun" || b == "node") {
         hits = 0
-        for (i = 5; i <= nt; i++) if (t[i] ~ /\/packages\/coding-agent\/src\/cli\.ts$/ || t[i] ~ /\/packages\/coding-agent\/scripts\/\.\.\/src\/cli\.ts$/) { hits++; at = i }
+        for (i = 2; i <= nt; i++) if (t[i] ~ /\/packages\/coding-agent\/src\/cli\.ts$/ || t[i] ~ /\/packages\/coding-agent\/scripts\/\.\.\/src\/cli\.ts$/) { hits++; at = i }
         if (hits == 1) return interactive(t, nt, at + 1) ? "omp" : "omp-no"
       }
       return ""
     }
     $1 == "P" { split($0, f, "\t"); roots[++nr] = f[2]; cmd[nr] = f[3]; next }
-    $1 == "S" { line[$2] = $0; kids[$3] = kids[$3] " " $2 }
+    $1 == "S" { split($0, f, "\t"); args[f[2]] = f[5]; flat[f[2]] = (f[4] == "F"); kids[f[3]] = kids[f[3]] " " f[2] }
     END {
       for (i = 1; i <= nr; i++) {
         sp = 1; stack[1] = roots[i]; saw = 0; inter = 0
         while (sp > 0) {
           cur = stack[sp--]
-          if (cur in line) {
-            k = kind(line[cur])
+          if (cur in args) {
+            k = kind(args[cur], flat[cur])
             if (k == "omp") inter = 1
             else if (k == "omp-no") saw = 1
-            else if (k != "") found[k] = 1
+            else if (k != "" && k != "cc-no" && k != "codex-no") found[k] = 1
           }
           m = split(kids[cur], c2, " ")
           for (j = 1; j <= m; j++) stack[++sp] = c2[j]

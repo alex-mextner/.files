@@ -2,7 +2,9 @@
 systemctl, rig and Telegram (see stubs.py). Nothing here touches a real server, unit or alert channel."""
 
 import os
+import shlex
 import subprocess
+import sys
 import time
 import unittest
 
@@ -99,6 +101,11 @@ class Watchdog(StubBase):
         self.assertEqual(self.save_now().returncode, 0)
         self.put("alerts.log", "")
         self.put("calls.log", "")
+
+    def clear_alerts(self):
+        alerts_dir = os.path.join(self.state, "alerts")
+        for key in os.listdir(alerts_dir) if os.path.isdir(alerts_dir) else []:
+            os.remove(os.path.join(alerts_dir, key))
 
     def watchdog(self, *args, **extra):
         return self.run_script(
@@ -393,8 +400,7 @@ class Watchdog(StubBase):
                 res = self.watchdog()
                 self.assertEqual(res.returncode, 1)
                 self.assertIn(f"{kind}-sessions.map is missing or empty", res.stderr)
-                for key in os.listdir(os.path.join(self.state, "alerts")):
-                    os.remove(os.path.join(self.state, "alerts", key))
+                self.clear_alerts()
 
     def test_several_panes_with_the_same_agent_demand_its_map_once_and_alert_once(self):
         self.put("panes", "300\t2.1.178\n310\t2.1.178\n320\tomp\n330\tomp\n")
@@ -436,9 +442,106 @@ class Watchdog(StubBase):
                     self.assertIn("omp-sessions.map is missing or empty", res.stderr)
                 else:
                     self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                alerts_dir = os.path.join(self.state, "alerts")
-                for key in os.listdir(alerts_dir) if os.path.isdir(alerts_dir) else []:
-                    os.remove(os.path.join(alerts_dir, key))
+                self.clear_alerts()
+
+    def test_proc_cmdline_boundaries_classify_real_processes(self):
+        """On the real machine tl_pane_agents re-reads /proc/<pid>/cmdline for every agent candidate, so argument
+        quoting survives: a flag-like word inside a quoted prompt stays one token and cannot look like a flag. A real
+        python process is launched under the agent's argv[0] (`executable=`) and classified through the stubbed
+        panes/ps; `-c <script>` is python's own flag pair, exactly like a value-taking agent option."""
+        agents = os.path.join(self.tmp, "agents")
+        os.makedirs(agents)
+        for name, argv, map_name in (
+            ("codex", ["exec of the migration plan"], "codex-sessions.map"),  # one quoted token: NOT the exec subcommand
+            ("codex", ["exec", "--ephemeral", "judge prompt"], None),
+            ("codex", ["review the -p diff"], "codex-sessions.map"),
+            ("claude", ["explain the -p flag"], "cc-sessions.map"),
+            ("claude", ["multi\nline\nprompt", "-p", "review"], None),  # a newline cannot split the record
+        ):
+            with self.subTest(agent=name, argv=argv):
+                exe = os.path.join(agents, name)
+                proc = subprocess.Popen(
+                    [exe, "-c", "import time; time.sleep(120)"] + argv,
+                    executable=sys.executable, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                try:
+                    flat = " ".join([exe, "-c", "import time; time.sleep(120)"] + argv).replace("\n", "?")
+                    self.put("panes", f"{proc.pid}\tpython3\n")
+                    self.put("ps", f"{proc.pid} 1 {flat}\n")
+                    res = self.watchdog()
+                    if map_name:
+                        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                        self.assertIn(f"{map_name} is missing or empty", res.stderr)
+                    else:
+                        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                finally:
+                    proc.kill()
+                    proc.wait()
+                self.clear_alerts()
+
+    def test_one_shot_codex_exec_and_claude_print_calls_demand_no_map(self):
+        """The judge/review forms from the 2026-11-18 incident: `codex exec --ephemeral` (also behind the node
+        wrapper's vendor binary) and `claude -p` are one-shot calls with nothing to resume, so an empty
+        cc/codex map next to them is correct and must not trip the maps invariant."""
+        vendor = "/home/u/x/node_modules/@openai/codex/vendor/x86_64-unknown-linux-gnu/codex/codex"
+        for exe, map_name in (
+            (f"{vendor} exec --ephemeral -s read-only judge prompt", None),
+            ("/usr/local/bin/codex exec one-shot prompt", None),
+            ("codex --ephemeral", None),
+            ("codex -c model=o3 exec prompt", None),  # global options may precede the subcommand
+            ("codex -m gpt-5 exec prompt", None),
+            ("codex -a never exec prompt", None),  # -a takes a value: `never` must not look like the subcommand
+            ("codex -i shot.png exec prompt", "codex-sessions.map"),  # -i takes many words: too ambiguous to skip
+            ("codex --add-dir /x exec prompt", None),
+            ("codex e prompt", None),  # the exec alias
+            ("codex review the diff", "codex-sessions.map"),  # `review` may open an interactive session: demand the map
+            ("codex mcp-server", "codex-sessions.map"),  # only exec/e/--ephemeral are skipped; the rest may be sessions
+            ("/usr/local/bin/codex resume abc", "codex-sessions.map"),
+            ("/usr/local/bin/codex", "codex-sessions.map"),
+            ('claude -p "do the review"', None),
+            ("claude --print summarize", None),
+            ("/home/ultra/.local/share/claude/versions/2.1.178 -p review", None),
+            # the user's cc alias puts value-taking options in front of -p (aliases.zsh)
+            ("claude --allow-dangerously-skip-permissions --permission-mode bypassPermissions -p review this", None),
+            ("claude --model sonnet -p review", None),
+            ("claude --output-format json -p review", None),
+            ("claude --resume abc", "cc-sessions.map"),
+            ("claude", "cc-sessions.map"),
+            # these stub pids have no /proc argv to enrich, so the flattened ps line decides; the first free word is
+            # then the subcommand/flag boundary: a flag-like word inside a quoted prompt can be misread (tmux-lib limit)
+            ("claude explain the -p flag to me", None),
+            ("codex add an --ephemeral option", "codex-sessions.map"),
+        ):
+            with self.subTest(exe=exe):
+                self.put("panes", "300\tzsh\n")
+                self.put("ps", f"300 1 -zsh\n301 300 {exe}\n")
+                # the setup never writes a cc/codex map: a demanded one stays missing, an undemanded one is correct
+                res = self.watchdog()
+                if map_name:
+                    self.assertEqual(res.returncode, 1, res.stdout)
+                    self.assertIn(f"{map_name} is missing or empty", res.stderr)
+                else:
+                    self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                self.clear_alerts()
+
+    def test_a_one_shot_codex_or_claude_call_does_not_hide_the_panes_omp(self):
+        """A judge call in the process tree says nothing about the pane's own omp: the omp pane-command fallback
+        must keep demanding the omp map even while `codex exec` or `claude -p` runs in the same pane."""
+        omp_map = os.path.join(self.maps, "omp-sessions.map")
+        for one_shot in (
+            "/usr/local/bin/codex exec --ephemeral judge prompt",
+            "claude -p review",
+        ):
+            with self.subTest(one_shot=one_shot):
+                self.saver_writing()  # a forced save writes no omp map: the demanded one stays missing
+                self.put("panes", "300\tomp\n")  # the process table shows no interactive omp: only the pane command says omp
+                self.put("ps", f"300 1 -zsh\n302 300 {one_shot}\n")
+                if os.path.exists(omp_map):
+                    os.remove(omp_map)
+                res = self.watchdog()
+                self.assertEqual(res.returncode, 1, res.stdout)
+                self.assertIn("omp-sessions.map is missing or empty", res.stderr)
+                self.clear_alerts()
 
     def test_the_pane_command_omp_does_not_count_when_the_process_table_says_it_is_a_one_shot(self):
         self.saver_writing()
