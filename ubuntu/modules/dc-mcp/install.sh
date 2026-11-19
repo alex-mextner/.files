@@ -29,9 +29,9 @@
 # DC_MCP_LEGACY_CLOUDFLARED replaces ~/.cloudflared; it exists for the tests, nothing else sets it.
 set -u
 
-# Upgrading the stack is a change of this line (a commit of alex-mextner/computer-use-plugin; computer 0.4.1).
+# Upgrading the stack is a change of this line (a commit of alex-mextner/computer-use-plugin; computer 0.4.7).
 CLI_REPO=https://github.com/alex-mextner/computer-use-plugin.git
-CLI_REV=84dda4ddc601cbccb5e74ec7a6e785f9b4dedf4f
+CLI_REV=df4362a49c02cc27098a3a541d87b5a1c9216acb
 
 mode=install
 case "${1:-}" in
