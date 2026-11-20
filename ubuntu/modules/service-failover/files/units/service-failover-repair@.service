@@ -8,5 +8,8 @@ Type=oneshot
 # outlives it. KillMode=process keeps a stray child of the launcher alive when the unit stops.
 ExecStart=%h/.local/bin/service-failover-repair %i
 KillMode=process
-TimeoutStartSec=120
-Environment=PATH=%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# 120 s for the run itself, plus one delivery of the pending notices (all its notifier calls share SERVICE_FAILOVER_NOTIFY_TIMEOUT,
+# 90 s: a Telegram send of the default notifier can wait on tg's online check under load) and a margin.
+TimeoutStartSec=240
+# ~/.bun/bin or Linuxbrew: tg (the default notifier's Telegram channel) is a Bun script; install.sh --check reads this PATH
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin

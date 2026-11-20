@@ -14,15 +14,11 @@ install = "install.sh"
 check = "install.sh --check"
 preview = "install.sh --plan"
 
-# notify-send (the repair script tells the user that a service is down); the engine installs it, so --check does not
-# have to ask for a manual step on a fresh machine.
-[deps]
-apt = ["libnotify-bin"]
-
 [[coverage]]
 match = [
   "unit:service-failover-repair@.service", "unit:service-failover-scan.service", "unit:service-failover-scan.timer",
   "file:~/.local/bin/service-failover-repair", "file:~/.local/bin/service-failover-scan", "file:~/.local/bin/service-failover-journal",
+  "file:~/.local/bin/service-failover-notify-journal",
   "file:~/.config/service-failover*", "file:~/.config/systemd/user/service.d*",
   "file:~/.config/systemd/user/service-failover-repair@.service*",
 ]

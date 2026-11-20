@@ -19,6 +19,7 @@ from harness import (
     FAILED_STATE,
     HEADER_VALUE,
     JOURNAL,
+    NOTIFY_JOURNAL,
     PASSWORD_VALUE,
     REPAIR,
 )
@@ -661,11 +662,12 @@ class JournalTest(Base):
             shim.chmod(0o755)
             copy = Path(alone) / "service-failover-repair"       # alone in its directory: the helper is not next to it
             shutil.copy(REPAIR, copy)
+            shutil.copy(NOTIFY_JOURNAL, Path(alone) / NOTIFY_JOURNAL.name)   # (the notifier is: only the helper is missing)
             for label, script, extra in (("python3", REPAIR, {"PATH": f"{alone}:{self.env['PATH']}"}), ("helper", copy, {})):
                 with self.subTest(label):
                     self.set_state()
                     (self.stub / "journal").write_text(journal)
-                    (self.stub / "notifications").unlink(missing_ok=True)
+                    (self.stub / "logged").unlink(missing_ok=True)
                     (self.stub / "brief-sent").unlink(missing_ok=True)
                     shutil.rmtree(self.root / "state", ignore_errors=True)
                     result = self.repair("foo.service", script=script, **extra)

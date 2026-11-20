@@ -23,8 +23,8 @@
 #   restart_units  [string] user units that need Restart=on-failure from this module because they have none
 #   autoheal       bool     docker autoheal container; false removes the one this module created          (default false)
 #
-# Test hooks: SERVICE_FAILOVER_UNIT_DIR / _BIN_DIR / _CONFIG_DIR / _ETC_DIR move the install locations; SERVICE_FAILOVER_NOTIFY
-# names the desktop notifier --check looks for (default notify-send).
+# Test hooks: SERVICE_FAILOVER_UNIT_DIR / _BIN_DIR / _CONFIG_DIR / _ETC_DIR move the install locations; SERVICE_FAILOVER_TG
+# names the tg command --check looks for (default tg, on the units' PATH).
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
@@ -77,6 +77,19 @@ bin_dir=${SERVICE_FAILOVER_BIN_DIR:-$HOME/.local/bin}
 cfg_dir=${SERVICE_FAILOVER_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/service-failover}
 etc_dir=${SERVICE_FAILOVER_ETC_DIR:-/etc/systemd/system}
 launcher=$HOME/.agents/skills/rig-detached-omp/rig-detached-omp
+# the repair stack's scripts (service-failover-notify-journal is the repair script's default notifier: journal and tg, no desktop pop-up)
+bins=(service-failover-repair service-failover-scan service-failover-journal service-failover-notify-journal)
+# The default notifier reaches the owner only through tg (a Bun script), run with the PATH the module's units set (read from
+# the scan unit, so the two cannot drift apart). Found means: tg resolves on that PATH, and so does the interpreter its `#!`
+# line names through env (bun), which is what fails first on a host whose bun is elsewhere.
+tg_cmd=${SERVICE_FAILOVER_TG:-tg}; tg_cmd=${tg_cmd%% *}
+units_path=$(sed -n 's/^Environment=PATH=//p' "$here/files/units/service-failover-scan.service" | head -n1); units_path=${units_path//%h/$HOME}
+tg_found() {
+  local path interp
+  path=$(PATH=$units_path command -v "$tg_cmd") || return 1
+  interp=$(head -n1 "$path" 2>/dev/null | sed -n 's|^#! *[^ ]*/env  *\([^ ]*\).*|\1|p')
+  [ -z "$interp" ] || PATH=$units_path command -v "$interp" >/dev/null
+}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 # One install at a time (two `ubuntu-tweak apply` runs, or one by hand beside it): what is inspected below is what is changed.
 # The lock path is the same for every caller: XDG_RUNTIME_DIR exists in a login session and not in an ssh one, so a path
@@ -130,7 +143,7 @@ else
   if [ "$repair" = 1 ]; then
     want+=("$here/files/service.d/15-failover-repair.conf|$unit_dir/service.d/15-failover-repair.conf|644")
     while IFS= read -r rel; do want+=("$here/files/units/$rel|$unit_dir/$rel|644"); done < <(cd "$here/files/units" && find . -type f -printf '%P\n' | sort)
-    for s in service-failover-repair service-failover-scan service-failover-journal; do want+=("$here/bin/$s|$bin_dir/$s|755"); done
+    for s in "${bins[@]}"; do want+=("$here/bin/$s|$bin_dir/$s|755"); done
     if [ "${#hosts[@]}" -gt 0 ]; then
       { echo "# written by the service-failover module (option hosts); 'local' is this host's user manager"; echo local; printf '%s\n' "${hosts[@]}"; } >"$tmp/hosts"
       want+=("$tmp/hosts|$cfg_dir/hosts|644")
@@ -158,7 +171,7 @@ if [ "$level" = user ]; then
   find_stale "$unit_dir/service.d/15-failover-repair.conf"
   find_stale "$cfg_dir/hosts"
   for rel in $(cd "$here/files/units" && find . -type f -printf '%P\n'); do find_stale "$unit_dir/$rel"; done
-  for s in service-failover-repair service-failover-scan service-failover-journal; do find_stale "$bin_dir/$s"; done
+  for s in "${bins[@]}"; do find_stale "$bin_dir/$s"; done
   # The module's own units are the module's to declare, so every drop-in of the directories named after them is its
   # own: the repair template's, the scan's, one for a single instance. One nobody declared (a smoke-test drop-in set
   # SERVICE_FAILOVER_DRY_RUN=1 and made every repair on the PC a dry run) is drift. Symlinks count: systemd loads them.
@@ -248,7 +261,7 @@ if [ "$level" = user ]; then
   for v in "${leftover_env[@]}"; do drift+=("set: $v in the user manager's environment (a leftover test setting that changes every repair run)"); done
   if [ "$repair" = 1 ]; then
     [ -x "$launcher" ] || drift+=("missing: $launcher (the sanctioned omp launcher, installed by rig apply; the repair stack cannot start a session without it)")
-    command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null || drift+=("missing: ${SERVICE_FAILOVER_NOTIFY:-notify-send} (package libnotify-bin: without it the repair stack cannot tell the user that a service is down)")
+    tg_found || drift+=("missing: $tg_cmd on the units' PATH, or the interpreter it needs (rig installs tg, a Bun script; without it nobody is told of a unit that no repair session is acting on)")
     command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ] || drift+=("not enabled: service-failover-scan.timer")
     # enabled is not running: a stopped timer (a failed first start, a manual stop) leaves the hosts unwatched
     if command -v systemctl >/dev/null && [ "$(systemctl --user is-enabled service-failover-scan.timer 2>/dev/null)" = enabled ] \
@@ -325,7 +338,7 @@ if [ "$repair" = 1 ]; then
     systemctl --user start service-failover-scan.timer && echo "started: service-failover-scan.timer" || rc=1
   fi
   if [ ! -x "$launcher" ]; then echo "needs manual: $launcher is missing (rig apply installs the rig-detached-omp skill); the repair stack is in place but cannot start a session" >&2; rc=10; fi
-  if ! command -v "${SERVICE_FAILOVER_NOTIFY:-notify-send}" >/dev/null; then echo "needs manual: ${SERVICE_FAILOVER_NOTIFY:-notify-send} is missing (apt install libnotify-bin); the repair stack is in place but cannot tell you that a service is down" >&2; rc=10; fi
+  if ! tg_found; then echo "needs manual: $tg_cmd, or the interpreter it needs, is not on the units' PATH (rig installs tg, a Bun script); the repair stack is in place but cannot tell you of a unit that no repair session is acting on" >&2; rc=10; fi
 fi
 if [ "$autoheal" = 1 ]; then
   up_ok=0

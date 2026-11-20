@@ -20,11 +20,13 @@
 #    messages; the unit's own output is never copied, only counted: see service-failover-journal; fenced as data). One
 #    session at a time (flock, held by the session itself because the launcher's child inherits it), at most one per unit
 #    per COOLDOWN_MIN minutes and at most DAILY_CAP per 24 h in total (stamps in the state directory).
-# 4. Tells the user: a desktop notification (notify-send) naming the unit and its last error line, once per NOTIFY_MIN
-#    minutes per unit, whenever the unit is still down after the first aid, whether a session was launched or not (lock
-#    held, daily cap, launcher missing). A message the notifier cannot show (no notification daemon runs early in the
-#    login) stays pending in the state directory until `service-failover-repair --flush-notifications` delivers it; the
-#    scan runs that every 5 minutes.
+# 4. Tells the user: a notice naming the unit and its last error line, once per NOTIFY_MIN minutes per unit, whenever the
+#    unit is still down after the first aid, whether a session was launched or not (lock held, daily cap, launcher missing).
+#    The default notifier (service-failover-notify-journal, next to this script) writes every notice to the user journal;
+#    one that no session will act on is queued once more for the owner, which that notifier sends via `tg --tag problem`
+#    (see notify_down): no desktop pop-up (#226). A message the
+#    notifier cannot deliver (journal or Telegram unreachable) stays pending in the state directory until
+#    `service-failover-repair --flush-notifications` delivers it; the scan runs that every 5 minutes.
 #
 # Environment (tests and smoke runs): SERVICE_FAILOVER_LAUNCHER (the launcher, default
 # ~/.agents/skills/rig-detached-omp/rig-detached-omp), SERVICE_FAILOVER_DRY_RUN=1 (print the brief and what would be
@@ -32,8 +34,10 @@
 # SERVICE_FAILOVER_DAILY_CAP (default 4), SERVICE_FAILOVER_SETTLE_S (wait after the first aid, default 20),
 # SERVICE_FAILOVER_MIN_RESTARTS (restart-loop size, default 10), SERVICE_FAILOVER_COOLDOWN_MIN (per unit, default 720),
 # SERVICE_FAILOVER_AID_MIN (first aid per unit, default 60), SERVICE_FAILOVER_WORKDIR (default $HOME),
-# SERVICE_FAILOVER_NOTIFY (the notifier, default notify-send), SERVICE_FAILOVER_NOTIFY_MIN (per unit, default 720),
-# SERVICE_FAILOVER_PROBE_S (longest a systemctl/journalctl/ssh query may run, default 30).
+# SERVICE_FAILOVER_NOTIFY (the notifier, called like notify-send; default service-failover-notify-journal next to this
+# script), SERVICE_FAILOVER_NOTIFY_TIMEOUT (seconds one delivery of the pending notices may take in all, default 90),
+# SERVICE_FAILOVER_NOTIFY_MIN (per unit, default 720), SERVICE_FAILOVER_PROBE_S (longest a systemctl/journalctl/ssh query
+# may run, default 30).
 set -uo pipefail
 
 launcher=${SERVICE_FAILOVER_LAUNCHER:-$HOME/.agents/skills/rig-detached-omp/rig-detached-omp}
@@ -48,23 +52,32 @@ dry=${SERVICE_FAILOVER_DRY_RUN:-0}
 ssh_opts=(-n -o BatchMode=yes -o ConnectTimeout=8)
 probe_s=${SERVICE_FAILOVER_PROBE_S:-30}
 
-notifier=${SERVICE_FAILOVER_NOTIFY:-notify-send}
+here=$(dirname "$(readlink -f "$0")")
+notifier=${SERVICE_FAILOVER_NOTIFY:-$here/service-failover-notify-journal}
+# a Telegram send can wait 10 s and more on tg's online check under load; the units' TimeoutStartSec= leaves room for one
+notify_timeout=${SERVICE_FAILOVER_NOTIFY_TIMEOUT:-90}
 notify_min=${SERVICE_FAILOVER_NOTIFY_MIN:-720}
 notes="$state/notify"
 
-# deliver_notifications: shows every pending message on the desktop; one the notifier cannot show stays pending and is
+# deliver_notifications: hands every pending message to the notifier; one it cannot deliver stays pending and is
 # counted in $undelivered. A delivered message leaves a stamp, which is what keeps the next run quiet. Runs overlap (one
 # repair instance per failed unit, plus the scan's flush), so a message is first claimed by renaming it to
 # NAME.sending.PID: only one run wins the rename and shows it, the others skip claimed files. A message older than the
 # notification window is dropped: it would announce, hours late, a unit that has had its chance to be fixed since (the
 # next failure announces itself). That also removes the claim of a run that died.
+# A message whose name ends in +owner is for the owner (see notify_down) and is handed over with --category=owner: the default
+# notifier sends it with tg, every other message only goes to the journal. The two channels fail apart (Telegram down, the
+# journal up): the journal messages are delivered first, the owner messages after them, and a failure stops further attempts
+# on its own channel only, so a Telegram send that hangs never holds back a journal notice. All calls of one delivery share
+# one time budget, NOTIFY_TIMEOUT seconds, which is what the units' start deadlines leave room for; what is left over waits
+# for the next run. $notify_rc is the exit status of the last notifier call that failed.
 # still_open NAME: the notice that the host did not answer after the first aid (NAME ends in +host-silent, see notify_down) is
 # provisional: it is shown only while the incident it speaks of is open, and the recheck marker of the same instance says so
 # (the marker goes when a run has found or said what became of the unit). Any other message stays valid.
 still_open() { case "$1" in *+host-silent) [ -e "$state/recheck/${1%+host-silent}" ] ;; esac; }
-undelivered=0
+undelivered=0 notify_rc=0
 deliver_notifications() {
-  local f claimed pid giveup=0
+  local f claimed pid channel pass left category giveup=0 deadline=$((SECONDS + notify_timeout))
   undelivered=0
   # (a window of 0 minutes switches the suppression off, and `find -mmin +0` would match a message written a second ago)
   [ "$notify_min" -gt 0 ] && find "$notes/pending" -maxdepth 1 -type f -mmin "+$notify_min" -delete 2>/dev/null
@@ -74,23 +87,33 @@ deliver_notifications() {
     pid=${f##*.sending.}
     [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null && mv -n "$f" "${f%.sending.*}" 2>/dev/null && rm -f "$f"
   done
-  for f in "$notes"/pending/*; do
-    [ -f "$f" ] || continue
-    case "${f##*/}" in *.sending.*) continue ;; esac
-    still_open "${f##*/}" || { rm -f "$f"; continue; }
-    # the notifier failed once: every other attempt fails the same way and costs its timeout, which a repair run has no room for
-    if [ "$giveup" = 1 ]; then undelivered=$((undelivered + 1)); continue; fi
-    claimed="$f.sending.$$"
-    mv "$f" "$claimed" 2>/dev/null || continue
-    still_open "${f##*/}" || { rm -f "$claimed"; continue; }   # (the marker went while the message was being claimed)
-    # timeout: with no notification daemon on the bus, notify-send can wait for D-Bus' 25 s reply before it gives up
-    if timeout 10 "$notifier" --app-name=service-failover --urgency=critical --icon=dialog-warning -- "$(sed -n 1p "$claimed")" "$(sed 1d "$claimed")" >/dev/null 2>&1; then
-      mkdir -p "$notes/sent" && : >"$notes/sent/${f##*/}" && rm -f "$claimed"
-    else
-      # -n: a newer message of this unit written meanwhile is not replaced by this older one
-      mv -n "$claimed" "$f" 2>/dev/null; rm -f "$claimed"
-      undelivered=$((undelivered + 1)); giveup=1
-    fi
+  for pass in journal owner; do
+    giveup=0
+    for f in "$notes"/pending/*; do
+      [ -f "$f" ] || continue
+      case "${f##*/}" in *.sending.*) continue ;; esac
+      channel=journal category=; case "${f##*/}" in *+owner) channel=owner category=--category=owner ;; esac
+      [ "$channel" = "$pass" ] || continue
+      still_open "${f##*/}" || { rm -f "$f"; continue; }
+      # the notifier failed once on this channel: every other attempt fails the same way and costs its timeout
+      if [ "$giveup" = 1 ]; then undelivered=$((undelivered + 1)); continue; fi
+      left=$((deadline - SECONDS))
+      if [ "$left" -lt 1 ]; then undelivered=$((undelivered + 1)); continue; fi
+      claimed="$f.sending.$$"
+      mv "$f" "$claimed" 2>/dev/null || continue
+      still_open "${f##*/}" || { rm -f "$claimed"; continue; }   # (the marker went while the message was being claimed)
+      # timeout: a hung notifier (Telegram unreachable) must not eat the run's start deadline; -k: nor one that ignores
+      # SIGTERM. 9>&-: a child the notifier leaves behind must not hold the one-session lock.
+      if timeout -k 5 "$left" "$notifier" --app-name=service-failover --urgency=critical --icon=dialog-warning ${category:+"$category"} -- \
+           "$(sed -n 1p "$claimed")" "$(sed 1d "$claimed")" >/dev/null 2>&1 9>&-; then
+        mkdir -p "$notes/sent" && : >"$notes/sent/${f##*/}" && rm -f "$claimed"
+      else
+        notify_rc=$?
+        # -n: a newer message of this unit written meanwhile is not replaced by this older one
+        mv -n "$claimed" "$f" 2>/dev/null; rm -f "$claimed"
+        undelivered=$((undelivered + 1)); giveup=1
+      fi
+    done
   done
 }
 
@@ -133,7 +156,7 @@ recheck_inv=; recheck_file="$state/recheck/$rkey"; marker=; keep_marker=0; brief
 if [ -f "$recheck_file" ] && [ "$(sed -n 1p "$recheck_file")" = "$inst" ]; then recheck_inv=$(sed -n 2p "$recheck_file" | tr -cd 'A-Za-z0-9._:/@+-'); marker=$recheck_file; else recheck_file=; fi
 # release_marker: this run took the incident's marker away when it ends (a dry run changes nothing, and keep_marker says the
 # incident stays open). It is also done before a message that says what became of the unit is delivered, so that the provisional
-# notice still waiting for the desktop is dropped by that very delivery (see still_open) and does not follow it.
+# notice still waiting for delivery is dropped by that very delivery (see still_open) and does not follow it.
 release_marker() { [ -z "$marker" ] || [ "$keep_marker" = 1 ] || [ "$dry" = 1 ] || rm -f "$marker"; }
 cleanup() {
   [ -z "$brief" ] || rm -f "$brief"
@@ -160,7 +183,7 @@ jctl() {
 # or of the error text of systemctl and ssh reaches a brief or a notification except through it: it BUILDS what it prints from a
 # closed grammar (the unit name, numbers, fixed tables; see its header) and copies no text. When python3 or the helper is
 # missing, or the deadline stops it, nothing comes out: every use below then shows a placeholder or an empty text.
-journal_tool="$(dirname "$(readlink -f "$0")")/service-failover-journal"
+journal_tool="$here/service-failover-journal"
 jt() { timeout -k 5 "$probe_s" python3 -I "$journal_tool" "$@"; }
 # Text that came from a host (journal, error output, unit path) goes into an agent prompt: no control characters, and
 # `plain` also drops backticks so that a short value cannot open or close a code fence.
@@ -234,36 +257,50 @@ cause_line() {
     esac
   )
 }
-# notify_down OUTCOME [nolog]: the unit is still down; tell the user, once per NOTIFY_MIN minutes per unit, what became of it.
+# notify_down OUTCOME [nolog|owner]: the unit is still down; tell the user, once per NOTIFY_MIN minutes per unit, what became of it.
 # `nolog`: the host does not answer, so its journal cannot be read either; only what was known before the first aid is said.
 # That notice is provisional (the scan keeps looking): it has its own stamp and queue name, so it never takes the place of the
 # message that says what finally became of the unit, and it is dropped when the marker is gone (see still_open).
+# `owner`: no repair session is acting on the unit right now (launcher missing or failed, daily cap, a deferral nothing
+# retries), so the owner is told: besides the journal notice the message is queued once more as KEY+owner, with a stamp of its
+# own, so a journal notice of the same unit earlier in the window (a deferral) never hides it, and the owner is told once per
+# window. An owner message that is due always brings its journal line, so the journal holds what the owner was told.
 notify_down() {
   # (the marker goes only once the message is queued: a deadline during the journal read below must leave the incident open)
-  local label=$unit title body tmp nkey=$key
-  [ "${2:-}" != nolog ] || nkey="$rkey+host-silent"
+  local label=$unit title body tmp nkey due=()
+  stamped() { [ -n "$(find "$notes/sent" -type f -name "$1" -mmin "-$notify_min" 2>/dev/null)" ]; }
+  if [ "${2:-}" = nolog ]; then due=("$rkey+host-silent")
+  elif [ "${2:-}" = owner ] && ! stamped "$key+owner"; then due=("$key" "$key+owner")
+  else due=("$key"); fi
   [ "$host" = local ] || label="$host $unit"
   title="Service down: $label"
-  if [ "$dry" != 1 ] && [ -n "$(find "$notes/sent" -type f -name "$nkey" -mmin "-$notify_min" 2>/dev/null)" ]; then
-    log "the user was already notified within $notify_min min"; return 0
+  if [ "$dry" != 1 ]; then
+    [ "${#due[@]}" -gt 1 ] || ! stamped "${due[0]}" || { log "the user was already notified within $notify_min min"; return 0; }
   fi
   [ "${2:-}" = nolog ] || journal_load
   body="$1. Summary: $(cause_line)"; [ "${2:-}" = nolog ] || body="$body; $(last_log_line)"
-  if [ "$dry" = 1 ]; then log "DRY RUN: would notify: $title | $body"; return 0; fi
-  # written aside and renamed: a concurrent delivery never reads half a message (it skips dot files)
-  if mkdir -p "$notes/pending" && tmp=$(mktemp "$notes/pending/.msg.XXXXXX") \
-    && printf '%s\n%s\n' "$title" "$body" >"$tmp" && mv "$tmp" "$notes/pending/$nkey"; then
-    release_marker  # before the delivery, so that it drops the provisional notice that still waits (see release_marker)
-  else
-    keep_marker=1; log "cannot queue the notification, the marker stays"; return 0
-  fi
+  if [ "$dry" = 1 ]; then log "DRY RUN: would notify${2:+ ($2)}: $title | $body"; return 0; fi
+  for nkey in "${due[@]}"; do
+    # written aside and renamed: a concurrent delivery never reads half a message (it skips dot files)
+    if ! { mkdir -p "$notes/pending" && tmp=$(mktemp "$notes/pending/.msg.XXXXXX") \
+      && printf '%s\n%s\n' "$title" "$body" >"$tmp" && mv "$tmp" "$notes/pending/$nkey"; }; then
+      keep_marker=1; log "cannot queue the notification, the marker stays"; return 0
+    fi
+  done
+  release_marker  # before the delivery, so that it drops the provisional notice that still waits (see release_marker)
   deliver_notifications
-  [ "$undelivered" -eq 0 ] || log "notification pending ($undelivered not delivered: no notification daemon yet), the next scan delivers it"
+  [ "$undelivered" -eq 0 ] || log "notification pending ($undelivered not delivered: the notifier failed with exit $notify_rc or the time ran out), the next scan delivers it"
 }
 
 # scan_sees: the scan lists only failed units and units stuck in auto-restart; for any other state "retried by the next
 # scan" is a promise nobody keeps.
 scan_sees() { [ "$active" = failed ] || { [ "$active" = activating ] && [[ "$sub" == auto-restart* ]] && [ "$(prop NRestarts)" -ge "$min_restarts" ] 2>/dev/null; }; }
+# retry_hint: what happens next to a unit no session is acting on, for the owner's message: the scan requests a repair again
+# while it can see the unit (a session starts once the cap frees or the launcher works); otherwise nothing does.
+retry_hint() {
+  if scan_sees; then echo "; the scan requests a repair again every 5 minutes"
+  else echo "; the scan will not see the unit again (it is not failed): restart it by hand"; fi
+}
 # clean_status: the last run's end counts as a success: status 0 (or none), a clean stop signal (code killed: SIGHUP, SIGINT,
 # SIGPIPE, SIGTERM; any other signal is a crash), or a status the unit lists in SuccessExitStatus=.
 clean_status() {
@@ -421,7 +458,7 @@ if ! flock -n 9; then
   # the marker (the incident's first aid wrote one, or the run was one) makes the scan retry it even when the unit is not failed
   keep_marker=1
   log "another repair session is running, deferred (retried by the next scan)"
-  if [ -z "$marker" ] && ! scan_sees; then notify_down "another repair session is running; the scan will not retry (the unit is not failed): restart it by hand"; exit 0; fi
+  if [ -z "$marker" ] && ! scan_sees; then notify_down "another repair session is running; the scan will not retry (the unit is not failed): restart it by hand" owner; exit 0; fi
   notify_down "another repair session is running, deferred (retried by the next scan)"; exit 0
 fi
 # Daily cap (the lock is held).
@@ -429,8 +466,8 @@ recent=$(find "$state/launches" -type f -mmin -1440 | wc -l)
 if [ "$recent" -ge "$cap" ]; then
   log "daily cap reached ($recent of $cap sessions in 24 h), not launching"
   exec 9>&-  # the notification can take seconds: a concurrent run must not be told "another session is running"
-  hint=""; scan_sees || hint="; the scan will not see the unit again (it is not failed): restart it by hand"
-  notify_down "daily cap reached ($recent of $cap repair sessions in 24 h), no repair session launched$hint"; exit 0
+  hint=$(retry_hint)
+  notify_down "daily cap reached ($recent of $cap repair sessions in 24 h), no repair session launched$hint" owner; exit 0
 fi
 
 name=$(printf 'service-failover-%s-%s-%s' "$host" "${unit%.service}" "$(date +%Y%m%d-%H%M)" | tr -c 'A-Za-z0-9._\n-' '-')
@@ -513,7 +550,7 @@ fi
 if [ ! -x "$launcher" ]; then
   log "launcher $launcher is not executable; cannot start a repair session"
   exec 9>&-
-  notify_down "no repair session could be started: the launcher is not executable"; exit 1
+  notify_down "no repair session could be started: the launcher is not executable (rig apply installs it)$(retry_hint)" owner; exit 1
 fi
 # From here the run records what it did and says it: a stop signal (the unit's start deadline) that arrives now is taken note of
 # and not acted on, or a launcher that succeeds would be followed by no launch stamp and no message, and the retry that the
@@ -529,5 +566,5 @@ else
   rc=$?
   log "launcher failed (exit $rc)"
   exec 9>&-
-  notify_down "no repair session could be started: the launcher failed with exit $rc"; exit 1
+  notify_down "no repair session could be started: the launcher failed with exit $rc$(retry_hint)" owner; exit 1
 fi

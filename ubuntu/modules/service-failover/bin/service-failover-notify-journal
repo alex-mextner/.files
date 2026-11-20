@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# service-failover-notify-journal [notify-send options] [--] TITLE BODY: the repair script's default notifier (#226).
+#
+# The notices are for agents, not for the owner's desktop (the owner ordered the pop-ups gone, #226), so this takes
+# notify-send's arguments (SERVICE_FAILOVER_NOTIFY may still name notify-send or anything called like it). The repair script
+# picks the channel, not this script:
+#   - a message handed over with --category=owner (no repair session is acting on the unit: launcher missing or failed,
+#     daily cap, a deferral nothing retries) goes to the owner via `tg --tag problem`, in the problem-report format;
+#   - every other message goes to the user journal: tag service-failover, priority crit (`journalctl --user -t service-failover`).
+# The repair script queues an owner message twice, once for each channel, so each channel succeeds or fails on its own.
+# A non-zero exit (the journal or Telegram refused) leaves the message pending in the repair script's queue for the next run.
+# The body comes from the repair script, built from a closed grammar (see service-failover-journal): it holds no text of
+# the unit's own output, so it may leave the host. It is HTML-escaped for tg's html format.
+# SERVICE_FAILOVER_TG overrides the tg command (word-split; tests point it at a fake).
+set -uo pipefail
+
+category=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    --category=*) category=${1#--category=}; shift ;;
+    -c|--category) shift; [ "$#" -gt 0 ] && { category=$1; shift; } ;;
+    # notify-send's options that take a value: the value is not the title
+    -u|-a|-i|-t|-h|--urgency|--app-name|--icon|--expire-time|--hint) shift; [ "$#" -gt 0 ] && shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+title=${1:-} body=${2:-}
+if [ "$category" != owner ]; then
+  exec logger -t service-failover -p user.crit -- "$title${body:+ — $body}"
+fi
+
+# The outcome says whether the scan retries the unit (retry_hint of the repair script): the message must not tell the owner to
+# start a session by hand while the scan is about to start one too.
+outcome=${body%%. Summary:*}
+evidence=${body#*. Summary: }
+unit=${title#Service down: }
+esc() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' <<<"$1"; }
+# tg's problem gate wants "Already tried" as an action and its observed result, and "Doing now" as the current step or a hard
+# blocker with its dependency and the check that follows when it clears (checked with `tg --dry-run`).
+case "$outcome" in
+  *"restart it by hand"*)
+    context="the unit is still down, and nothing will retry it: the scan does not see it (it is not failed)."
+    blocked="The unit stays down until someone acts."
+    doing="Blocked: service-failover cannot retry the unit because the scan does not list it (it is not failed). Needs: restart $unit by hand, or start an agent repair session for it. Once it is restarted, the next service-failover-scan will verify the unit with systemctl is-failed and report again if it is still down." ;;
+  *)
+    case "$outcome" in
+      *"launcher is not executable"*) until="the launcher is installed"; needs="run rig apply on $(uname -n) (it installs the repair launcher)" ;;
+      *"launcher failed"*) until="the launcher works again"; needs="find out why the launcher fails" ;;
+      *) until="the daily cap frees a slot"; needs="nothing; do not start a second session by hand while the scan retries" ;;
+    esac
+    context="the unit is still down. The scan requests a repair again every 5 minutes."
+    blocked="The repair session for this unit is held back until $until."
+    doing="Blocked: service-failover cannot start a repair session because it is held back until $until. Needs: $needs. Once it clears, the next service-failover-scan will verify the unit with systemctl is-failed and report again if it is still down." ;;
+esac
+tried="service-failover ran first aid and then tried to launch a repair session; result: $outcome."
+read -r -a tg_cmd <<<"${SERVICE_FAILOVER_TG:-tg}"
+exec "${tg_cmd[@]}" --tag problem --format html "<h3>Context</h3><p>$(esc "$title") (reported by $(uname -n)): $(esc "$context")</p><hr><h3>What is blocked</h3><ul><li>$(esc "$blocked")</li></ul><hr><h3>Already tried</h3><p>$(esc "$tried")</p><hr><h3>Doing now</h3><p>$(esc "$doing")</p><hr><h3>Where to look</h3><ul><li><code>$(esc "$evidence")</code></li><li><code>journalctl --user -t service-failover</code></li></ul>"

@@ -32,9 +32,10 @@ The one exception is explicit and per unit: `install.sh --system UNIT=always|on-
 | `service.d/10-failover.conf` | user manager (every user service of the PC and the odroid) and, with sudo, `/etc/systemd/system/service.d/` | `RestartSteps=8`, `RestartMaxDelaySec=5min`: the delay between restarts grows from the unit's own `RestartSec` to 5 minutes over 8 steps. systemd counts the steps in `NRestarts`, which only a manual start or `reset-failed` clears, so a service that crashes rarely drifts toward the 5 minute delay over weeks |
 | `service.d/15-failover-repair.conf` | user manager of the PC only (needs omp) | `OnFailure=service-failover-repair@%n.service`. systemd fires it on every crash, also while it is still restarting the unit; the script below decides. The instance is the unit name (it may hold colons), or `HOST:SCOPE:UNIT` for a unit of an ssh host (`odroidn2:system:caddy.service`; the host is a plain ssh alias, no `user@`) |
 | `service-failover-repair@.service` + `.d/20-limits.conf` | PC | oneshot template; `OnFailure=` reset (checked with `systemctl --user show`) so a failing repair cannot start a repair of the repair; `StartLimitIntervalSec=0`, because a fast crash loop of the watched unit starts its repair instance once per crash and systemd's default limit (5 starts in 10 s) refused the start that reports the final `failed` state (2026-11-10 22:55:09, `wireplumber.service`). The script ignores `service-failover-*` units as well. The template's drop-in directory belongs to the module: `install.sh --check` lists a drop-in it did not install as `stale` and an install removes it (a leftover smoke-test drop-in set `SERVICE_FAILOVER_DRY_RUN=1` and made every repair on the PC a dry run) |
-| `bin/service-failover-repair` | PC | leaves a unit alone that is healthy (running, or a one-shot that finished with `Result=success`), still inside its restart backoff, stopped on purpose, transient, or one that exited with a status it declares final (`RestartPreventExitStatus=`) (only `failed`, or 10 or more restarts in `auto-restart`, counts as a failure); a vendor or generated unit (the distribution's, or from a generator) is handled like any other, and its brief tells the session not to edit the vendor file; first aid at most once per hour per unit (`restart --no-block`; `reset-failed` first only when `Result=start-limit-hit`, or after a restart that started nothing: same invocation, still `failed`, and the restart added a "Start request repeated too quickly" journal line (the original failure's line does not count; a failed dependency refuses a start the same way and must not trigger `reset-failed`), because `--no-block` exits 0 for it and the limit keeps `Result=exit-code`; `reset-failed` would otherwise hide a failure the restart cannot undo; wait 20 s; a start still in progress is left to systemd; a unit that ends `inactive` with `Result=success` after the restart counts as finished only with exit status 0, a clean stop signal (SIGHUP, SIGINT, SIGPIPE, SIGTERM) or a status the unit lists in SuccessExitStatus=, because a crashed service whose failed state was cleared keeps its crash status; one-shot jobs are left untouched because re-running them may repeat a side effect); if still down, writes a brief (host, scope, unit file, what was tried, a summary of the last 50 journal entries (see *Secrets*) fenced as data, instructions to diagnose, fix at the source, verify for 5 minutes, look for an existing ticket, report) and starts the sanctioned launcher `~/.agents/skills/rig-detached-omp/rig-detached-omp`. One session at a time (`flock`, inherited by the session), one per unit per 12 hours and 4 per 24 hours in total (stamp files in `~/.local/state/service-failover/launches`: systemd forgets a unit's counters once it unloads, so it cannot carry the limit). A session that hangs holds the lock until it ends: later repairs are deferred (the launcher gives the session no time limit), and the user is told so by the notification below. Units stopped on purpose whose stop ended `failed` (a stop timeout) look like failures and are restarted once by first aid. **Tells the user** (see *What the user sees*) |
+| `bin/service-failover-repair` | PC | leaves a unit alone that is healthy (running, or a one-shot that finished with `Result=success`), still inside its restart backoff, stopped on purpose, transient, or one that exited with a status it declares final (`RestartPreventExitStatus=`) (only `failed`, or 10 or more restarts in `auto-restart`, counts as a failure); a vendor or generated unit (the distribution's, or from a generator) is handled like any other, and its brief tells the session not to edit the vendor file; first aid at most once per hour per unit (`restart --no-block`; `reset-failed` first only when `Result=start-limit-hit`, or after a restart that started nothing: same invocation, still `failed`, and the restart added a "Start request repeated too quickly" journal line (the original failure's line does not count; a failed dependency refuses a start the same way and must not trigger `reset-failed`), because `--no-block` exits 0 for it and the limit keeps `Result=exit-code`; `reset-failed` would otherwise hide a failure the restart cannot undo; wait 20 s; a start still in progress is left to systemd; a unit that ends `inactive` with `Result=success` after the restart counts as finished only with exit status 0, a clean stop signal (SIGHUP, SIGINT, SIGPIPE, SIGTERM) or a status the unit lists in SuccessExitStatus=, because a crashed service whose failed state was cleared keeps its crash status; one-shot jobs are left untouched because re-running them may repeat a side effect); if still down, writes a brief (host, scope, unit file, what was tried, a summary of the last 50 journal entries (see *Secrets*) fenced as data, instructions to diagnose, fix at the source, verify for 5 minutes, look for an existing ticket, report) and starts the sanctioned launcher `~/.agents/skills/rig-detached-omp/rig-detached-omp`. One session at a time (`flock`, inherited by the session), one per unit per 12 hours and 4 per 24 hours in total (stamp files in `~/.local/state/service-failover/launches`: systemd forgets a unit's counters once it unloads, so it cannot carry the limit). A session that hangs holds the lock until it ends: later repairs are deferred (the launcher gives the session no time limit), and each deferral is a journal notice (see below). Units stopped on purpose whose stop ended `failed` (a stop timeout) look like failures and are restarted once by first aid. **Tells the user** (see *What the user sees*) |
 | `bin/service-failover-journal` | PC (next to the repair script) | builds what a brief or a notification says about a unit's journal and about the error text of systemctl/ssh, from a closed grammar, never copying text; see *Secrets*. python3 only |
-| `service-failover-scan.timer` / `.service` / `bin/service-failover-scan` | PC, every 5 minutes | finds failed units and units in `auto-restart` with 10 or more restarts (a unit that never reaches `failed`, such as one with `StartLimitIntervalSec=0`, or any unit under the backoff) on this host and on each host of `~/.config/service-failover/hosts`, over ssh with no sudo, user and system units, and starts the repair template for each; at the end of every run it delivers the notifications that were waiting for the desktop (`service-failover-repair --flush-notifications`) |
+| `bin/service-failover-notify-journal` | PC (next to the repair script) | the repair script's default notifier: every notice goes to the user journal (tag `service-failover`), and one that no repair session will act on (launcher missing or failed, daily cap) also to the owner via `tg --tag problem`; no desktop pop-up. See *What the user sees* |
+| `service-failover-scan.timer` / `.service` / `bin/service-failover-scan` | PC, every 5 minutes | finds failed units and units in `auto-restart` with 10 or more restarts (a unit that never reaches `failed`, such as one with `StartLimitIntervalSec=0`, or any unit under the backoff) on this host and on each host of `~/.config/service-failover/hosts`, over ssh with no sudo, user and system units, and starts the repair template for each; at the end of every run it delivers the notices that are still pending (`service-failover-repair --flush-notifications`) |
 | `docker/autoheal.compose.yaml` | both hosts, option `autoheal` | `willfarrell/autoheal` restarts a container whose healthcheck is `unhealthy` |
 
 `Restart=` is deliberately **not** in the global drop-in: it would override `Restart=always` of units that have it,
@@ -67,7 +68,7 @@ files; its launch and first aid stamps are also looked up under the old name.
 ## What the user sees
 
 A failed service used to be silent: every outcome of the repair script was one journal line. When a unit is still down after the first
-aid, `service-failover-repair` now sends a desktop notification (`notify-send`, urgency critical) titled `Service down: <unit>` whose body
+aid, `service-failover-repair` now sends a notice titled `Service down: <unit>` whose body
 says what became of it (a repair session was launched, another session is running so this one is deferred, the daily cap of sessions is
 reached, the launcher is missing or failed, the host did not answer after the first aid: that one has no journal text) and a `Summary:` of how the unit failed: `exited with status 78, Result=exit-code` from the
 properties read before first aid, then what the journal says (see *Secrets*: the last failure the manager itself recorded, for example
@@ -78,13 +79,49 @@ bytes of journal at most. A unit is announced once per `NOTIFY_MIN` minutes
 host did not answer after the first aid is provisional (the scan keeps looking) and has a stamp of its own, so it never hides the
 message that says what finally became of the unit. It is shown only while the unit's recheck file exists: a later run that found
 or said what became of the unit takes that file away, and the delivery then drops the notice, whether it still waits for the
-desktop or a delivery has just claimed it. (A notifier call already in progress cannot be taken back.) A message the
-notifier cannot show (no notification daemon runs early in the login) stays in `notify/pending` and leaves no stamp; the scan delivers it
+notifier or a delivery has just claimed it. (A notifier call already in progress cannot be taken back.) A message the
+notifier cannot deliver (the journal socket or Telegram is not reachable) stays in `notify/pending` and leaves no stamp; the scan delivers it
 within 5 minutes, unless it is older than `NOTIFY_MIN` (it would announce, hours late, a unit that has had its chance to be fixed since:
 it is dropped). Runs overlap (one repair instance per failed unit, plus the scan), so a delivery first claims a message by renaming it to
-`NAME.sending.PID`: one run shows it, the others skip it. A unit that first aid brings back is not announced. `install.sh --check` reports a
-missing `notify-send` (package `libnotify-bin`) as drift; an install says `needs manual` and exits 10 because the module cannot tell you
-anything without it.
+`NAME.sending.PID`: one run delivers it, the others skip it. A unit that first aid brings back is not announced.
+
+### Where the notice goes: the journal, and Telegram for what no session will fix
+
+The notices are for agents, not for the owner's desktop: the owner ordered the desktop pop-ups gone (2026-11-19,
+[#226](https://github.com/alex-mextner/.files/issues/226)). The repair script decides who a notice is for; the default notifier,
+`bin/service-failover-notify-journal` (installed next to the repair script, called with notify-send's arguments), only carries it:
+
+- every notice goes to the user journal, tag `service-failover`, priority `crit`: `journalctl --user -t service-failover`;
+- a notice that means no repair session is acting on the unit right now (the launcher is missing or failed, the daily cap is reached, or a
+  deferral that nothing retries: "restart it by hand") is queued a second time as `<key>+owner` and handed over with `--category=owner`;
+  the notifier sends that copy to the owner with `tg --tag problem`, in the problem-report format (context, what is blocked, what was
+  tried, what is being done, where to look). Nobody else reads that journal tag. The owner copy has its own stamp, so a journal notice of
+  the same unit earlier in the window (a deferral) never hides it, and the owner hears of a unit once per `NOTIFY_MIN` window; an owner
+  copy that is due always brings its journal line, so the journal holds what the owner was told.
+- the outcome says what happens next, and the owner's message follows it: while the scan still sees the unit (it is failed or
+  restart-looping) it requests a repair every 5 minutes and a session starts on its own once the cap frees a slot or the launcher works
+  again, so the message says what blocks it and warns against starting a second session by hand; only when nothing will retry the unit
+  does it ask the owner to restart it by hand.
+
+The two copies are delivered and retried apart: journal messages first, owner messages after them, and a failure stops further attempts
+on its own channel only. A Telegram outage, or a send that hangs, leaves the owner copies pending while the journal notices of every unit
+are still written (once each: a Telegram retry writes no second journal line). A Telegram send can wait on `tg`'s online check for more
+than 10 seconds under load, so one delivery (all notifier calls of one run together) may take `SERVICE_FAILOVER_NOTIFY_TIMEOUT` seconds
+(default 90; each call is stopped with `timeout -k 5`); what does not fit waits for the next run. The units' start deadlines leave room
+for that: `TimeoutStartSec=240` for the repair template (120 before), `300` for the scan (180 before). The notifier runs without the
+session lock's descriptor, so nothing it leaves behind can hold the lock, and a failed delivery logs the notifier's exit status.
+`SERVICE_FAILOVER_NOTIFY` still names another notifier called like `notify-send` (a smoke test, another channel; notify-send would show an
+owner notice twice, once per copy), and `SERVICE_FAILOVER_TG` another `tg` command. Nothing of the module needs `notify-send` or
+`libnotify-bin` any more. `tg` (installed by rig) is a Bun script: it and the interpreter its `#!` line names must resolve on the units'
+`PATH` (`~/.local/bin`, `~/.bun/bin`, Linuxbrew, ...; `install.sh` reads it from the scan unit), or `install.sh --check` reports drift and
+an install says `needs manual` (exit 10), since without it nobody is told of a unit no session is acting on. A deferral that the scan
+retries ("another repair session is running, deferred") stays a journal notice: a session that hangs for long is seen there, not on the
+phone.
+
+The pop-ups were first switched off on 2026-11-19 by hand, in the installed copy only (an edited repair script, the notifier and two
+`30-notify-journal.conf` drop-ins), and misfiled as [ubuntu-tweaks#261](https://github.com/alex-mextner/ubuntu-tweaks/issues/261). The
+installer removes a drop-in it did not declare in a directory named after a module unit (see below), so those drop-ins go with the first
+install of this version, whose units and repair script carry the same settings.
 
 `install.sh --check` also reports as `stale` (an install removes it) any file or symlink in a drop-in directory named after a module unit
 (`service-failover-*.d/`: the repair template's, the scan's, one for a single instance) that the module did not install, and a
@@ -113,7 +150,7 @@ independent check for this loss: it asks PipeWire, not systemd, whether a card e
 
 ## Secrets
 
-The brief goes to an autonomous agent session and the notification to the desktop; the journal of a failed service may hold any
+The brief goes to an autonomous agent session and the notice to the journal and, for some, to Telegram; the journal of a failed service may hold any
 credential in any shape. Masking by patterns never converged (ten review rounds of #197 each found one more shape), so nothing is
 masked: `bin/service-failover-journal` (python3; `journalctl -b -o json`, a few fields) **builds** what the brief and the notification
 say, and every part of it comes from a closed grammar G: the unit name the script passed, integers in checked ranges, the timestamps
