@@ -3,6 +3,9 @@
 # `95-pc-bind.conf` drop-ins next to them are what makes them run here.
 #
 # Linked but not listed:
+#   omp-auth-broker.service, omp-auth-broker-tunnel@<ssh alias>.service
+#                              need the omp logins on this PC and an ssh alias per consumer; scripts/omp-auth-broker/install.sh
+#                              enables them and configures the consumers (see the README next to it)
 #   glances.service            binds 0.0.0.0:61208 with no authentication; choose a loopback or tailnet bind first
 #   odroid-remote-log.service  ~/.local/bin/odroid-remote-log is not in files/ on master (ubuntu/README.md says it is: the
 #                              files PR did not carry it); it also needs the local ssh key to the ODROID

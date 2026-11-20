@@ -1,7 +1,7 @@
-"""clvm-auth-broker-tunnel.service: the remote scripts that record the tunnel's own box session and free it on restart.
+"""omp-auth-broker-tunnel@.service: the remote scripts that record the tunnel's own consumer session and free it on restart.
 
-The two scripts run on the clvm box through ssh. Here they run locally, after the same unescaping systemd does
-($$ -> $, %H -> hostname), against a temporary HOME. A small Python process stands in for the box's sshd-session:
+The two scripts run on the consumer machine (the instance's ssh alias) through ssh. Here they run locally, after the same unescaping systemd does
+($$ -> $, %H -> hostname, %i -> the ssh alias), against a temporary HOME. A small Python process stands in for the box's sshd-session:
 like the real one it holds a listening port (the forward) and runs the ExecStart script as its child, so the
 recorded $PPID is a process this test owns and killing it is what frees the port.
 """
@@ -23,8 +23,9 @@ pytestmark = pytest.mark.skipif(not BOOT_ID_FILE.exists() or shutil.which("ss") 
                                 reason="needs Linux /proc, iproute2 ss and tail")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-UNIT = ROOT / "ubuntu/files/.config/systemd/user/clvm-auth-broker-tunnel.service"
+UNIT = ROOT / "ubuntu/machines/ubuntu-pc/files/.config/systemd/user/omp-auth-broker-tunnel@.service"
 HOSTNAME = "testhost"
+INSTANCE = "consumer"
 TERMINATED = "terminated recorded stale tunnel process"
 
 # Listens on an ephemeral port (the stand-in for the -R forward), prints it, then runs the ExecStart script as its
@@ -46,8 +47,8 @@ def unit_line(key: str) -> str:
 
 
 def unit_argv(key: str) -> list[str]:
-    argv = shlex.split(unit_line(key).replace("%H", HOSTNAME).replace("$$", "$"))
-    assert argv[0] == "/usr/bin/ssh" and argv[-2] == "ultra@65.21.40.51"
+    argv = shlex.split(unit_line(key).replace("%H", HOSTNAME).replace("%i", INSTANCE).replace("$$", "$"))
+    assert argv[0] == "/usr/bin/ssh" and argv[-2] == INSTANCE
     return argv
 
 
@@ -110,7 +111,7 @@ def free_port():
 
 @pytest.fixture
 def pids_file(tmp_path):
-    return tmp_path / f".local/state/clvm-auth-broker-tunnel.{HOSTNAME}.pids"
+    return tmp_path / f".local/state/omp-auth-broker-tunnel.{HOSTNAME}.{INSTANCE}.pids"
 
 
 def run_pre(home: pathlib.Path, port: int) -> subprocess.CompletedProcess:
@@ -156,12 +157,12 @@ def children(pid: int) -> list[int]:
 
 
 @pytest.mark.parametrize("key", ["ExecStartPre", "ExecStart"])
-def test_unit_line_has_no_systemd_expansions_besides_escaped_dollar_and_hostname(key):
+def test_unit_line_has_no_systemd_expansions_besides_escaped_dollar_hostname_and_instance(key):
     # systemd would silently replace a single $NAME / ${NAME} or a %x specifier, and unescape a backslash even
     # inside quotes, before ssh ever sees the script.
     raw = unit_line(key)
     assert "$" not in raw.replace("$$", "")
-    assert "%" not in raw.replace("%H", "")
+    assert "%" not in raw.replace("%H", "").replace("%i", "")
     assert "\\" not in raw
 
 
@@ -224,7 +225,7 @@ def test_pre_spares_reused_pid_garbage_and_other_hosts_record(tmp_path, pids_fil
     try:
         pids_file.parent.mkdir(parents=True)
         pids_file.write_text(f"{BOOT_ID_FILE.read_text()}{bystander.pid} {int(starttime(bystander.pid)) + 1}\n* 1\n-1 1\n0\n\n")
-        other = pids_file.with_name("clvm-auth-broker-tunnel.otherhost.pids")
+        other = pids_file.with_name(f"omp-auth-broker-tunnel.otherhost.{INSTANCE}.pids")
         other.write_text(f"{BOOT_ID_FILE.read_text()}{bystander.pid} {starttime(bystander.pid)}\n")
         result = run_pre(tmp_path, free_port)
         assert result.returncode == 0 and result.stdout == "", result.stderr
