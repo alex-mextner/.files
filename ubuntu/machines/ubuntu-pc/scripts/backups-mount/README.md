@@ -80,8 +80,7 @@ file edited):
 
 * `xp`: `3d-printer-vision@`, `3d-printer-watch@` (templates, cover every instance), `agent-tv-backend` (agent-tv is socket-activated: the socket and proxy stay up, only the backend that works in xp is gated),
   `agenttools-hsw-editor-hsw-editor`, `ai.hyperide.model-freshness`, `aisis-dashboard`, `autoheal`, `hcb-alert-watcher`,
-  `hsw-heartbeat`, `hsw-heartbeat-20261021`, `hsw-observer-agent`, `hsw-review`, `router-discover`,
-  `router-inventory-update`, `router-scan`, `snap-orca-sync`
+  `hsw-heartbeat`, `hsw-heartbeat-20261021`, `hsw-observer-agent`, `hsw-review`, `snap-orca-sync`
 * `work`: `conloca-merges-hourly`, `conloca-monitor`, `conloca-watch`
 * `.npm`: `agenttools-harness-dashboard`
 * `xp` **and** `work`: `tmux-boot` (restores the saved panes into those trees; with a missing mount it is skipped and
