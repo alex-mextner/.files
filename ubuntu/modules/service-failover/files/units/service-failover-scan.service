@@ -4,5 +4,8 @@ Description=service-failover: find failed or restart-looping services on this an
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/service-failover-scan
-TimeoutStartSec=180
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# 180 s for the scan of every host, plus one delivery of the pending notices by --flush-notifications (90 s in all, see the
+# repair template) and a margin.
+TimeoutStartSec=300
+# ~/.bun/bin or Linuxbrew: tg (the default notifier's Telegram channel, run by --flush-notifications) is a Bun script
+Environment=PATH=%h/.local/bin:%h/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin

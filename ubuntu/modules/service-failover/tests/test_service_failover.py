@@ -188,7 +188,8 @@ class RepairTest(Base):
         self.assertEqual(len(self.notifications()), 3)  # another unit is its own announcement
 
     def test_a_notification_that_cannot_be_delivered_waits_and_is_delivered_by_the_next_flush(self):
-        # early in the login no notification daemon runs: the message must survive until one does
+        # the journal socket is not reachable (or Telegram, for a notice that goes there): the message must survive until it is
+        # reachable again
         self.set_state()
         (self.stub / "notify-down").write_text("")
         result = self.repair("foo.service")
@@ -209,6 +210,140 @@ class RepairTest(Base):
         result = self.repair("foo.service", SERVICE_FAILOVER_DRY_RUN="1")
         self.assertIn("DRY RUN: would notify", result.stdout)
         self.assertEqual(self.notifications(), [])
+
+    def test_notices_go_to_the_journal_and_only_the_ones_no_session_will_act_on_go_to_tg(self):
+        # #226: no desktop pop-up (Base fails any test that calls notify-send); a routine notice is a journal line for agents,
+        # a unit that no repair session will fix reaches the owner once via `tg --tag problem`
+        self.set_state()
+        self.repair("foo.service")
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(len(self.journal_lines()), 1, self.journal_lines())
+        self.assertTrue(self.journal_lines()[0].startswith("service-failover user.crit Service down: foo.service — a repair session was launched"),
+                        self.journal_lines())
+        self.assertEqual(self.tg_sends(), [])
+        launches = self.root / "state" / "launches"
+        self.set_state()
+        self.repair("bar.service", SERVICE_FAILOVER_DAILY_CAP="1")
+        self.set_state()
+        failing = self.root / "failing-launcher"
+        failing.write_text("#!/bin/bash\nexit 3\n")
+        failing.chmod(0o755)
+        for stamp in launches.iterdir():
+            stamp.unlink()
+        self.repair("baz.service", SERVICE_FAILOVER_LAUNCHER=str(failing))
+        self.assertEqual(len(self.journal_lines()), 3, self.journal_lines())
+        sends = self.tg_sends()
+        self.assertEqual(len(sends), 2, sends)
+        for send, unit, outcome in ((sends[0], "bar.service", "daily cap reached"),
+                                    (sends[1], "baz.service", "no repair session could be started: the launcher failed with exit 3")):
+            self.assertTrue(send.startswith("--tag problem --format html <h3>Context</h3>"), send)
+            for needle in (f"Service down: {unit}", outcome, "<h3>What is blocked</h3>", "<h3>Already tried</h3>",
+                           "<h3>Doing now</h3>", "<h3>Where to look</h3>", "journalctl --user -t service-failover"):
+                self.assertIn(needle, send)
+        self.assertEqual(list((self.root / "state" / "notify" / "pending").iterdir()), [])
+
+    def daily_cap_notice(self, **extra):
+        launches = self.root / "state" / "launches"
+        launches.mkdir(parents=True, exist_ok=True)
+        (launches / "1-old").write_text("")
+        self.set_state()
+        return self.repair("foo.service", SERVICE_FAILOVER_DAILY_CAP="1", **extra)
+
+    def test_a_slow_tg_send_is_still_delivered(self):
+        # tg's online problem check can take over 10 s under load: the old 10 s notifier timeout killed it every time
+        (self.stub / "tg-slow").write_text("15")
+        started = time.monotonic()
+        result = self.daily_cap_notice()
+        self.assertGreaterEqual(time.monotonic() - started, 15)
+        self.assertNotIn("notification pending", result.stdout)
+        self.assertEqual(len(self.tg_sends()), 1, self.tg_sends())
+        self.assertEqual(list((self.root / "state" / "notify" / "pending").iterdir()), [])
+
+    def test_the_notifier_timeout_is_configurable_and_a_notice_it_cut_stays_pending(self):
+        (self.stub / "tg-slow").write_text("5")
+        result = self.daily_cap_notice(SERVICE_FAILOVER_NOTIFY_TIMEOUT="1")
+        self.assertIn("notification pending", result.stdout)
+        self.assertEqual(self.tg_sends(), [])
+        self.assertEqual(len(list((self.root / "state" / "notify" / "pending").iterdir())), 1)
+
+    def test_a_failing_tg_leaves_the_owner_notice_pending_until_a_flush_delivers_it(self):
+        (self.stub / "tg-down").write_text("")
+        result = self.daily_cap_notice()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("notification pending", result.stdout)
+        self.assertEqual(self.tg_sends(), [])
+        self.assertEqual(len(self.journal_lines()), 1, self.journal_lines())  # the journal channel does not wait for Telegram
+        pending = self.root / "state" / "notify" / "pending"
+        self.assertEqual([p.name for p in pending.iterdir()], ["foo.service+owner"])
+        self.assertIn("1 notification(s) still pending", self.flush().stdout)
+        (self.stub / "tg-down").unlink()
+        self.assertIn("0 notification(s) still pending", self.flush().stdout)
+        self.assertEqual(len(self.tg_sends()), 1, self.tg_sends())
+        self.assertEqual(len(self.journal_lines()), 1, "a retry of the Telegram send writes no second journal line")
+        self.assertEqual(list(pending.iterdir()), [])
+
+    def test_a_telegram_outage_does_not_hold_back_the_journal_notices_of_other_units(self):
+        (self.stub / "tg-down").write_text("")
+        self.daily_cap_notice()                              # foo.service: its owner notice stays pending
+        for stamp in (self.root / "state" / "launches").iterdir():
+            stamp.unlink()
+        self.set_state()
+        # a session is launched: a journal-only notice, queued after foo.service+owner in name order
+        self.repair("zed.service")
+        self.assertTrue(any("Service down: zed.service" in line for line in self.journal_lines()), self.journal_lines())
+        self.assertEqual(len(self.journal_lines()), 2, self.journal_lines())
+
+    def test_a_journal_notice_earlier_in_the_window_does_not_hide_the_owner_notice(self):
+        # deferred while another session held the lock (a journal line), then the daily cap on the retry: the owner is told
+        self.set_state()
+        (self.root / "state").mkdir()
+        with open(self.root / "state" / "lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.repair("foo.service")
+        self.assertIn("deferred", self.notifications()[0])
+        self.assertEqual(self.tg_sends(), [])
+        self.daily_cap_notice()
+        self.assertEqual(len(self.tg_sends()), 1, self.tg_sends())
+        send = self.tg_sends()[0]
+        self.assertIn("daily cap reached", send)
+        self.assertEqual(len(self.journal_lines()), 2, "the journal also holds the outcome the owner is told of")
+        # the unit is still failed, so the scan retries it: the owner must not be told to start a second session by hand
+        self.assertIn("The scan requests a repair again every 5 minutes", send)
+        self.assertIn("do not start a second session by hand", send)
+        self.assertNotIn("Nothing:", send)
+
+    def test_a_hanging_tg_send_does_not_hold_back_journal_notices(self):
+        # journal notices go first: an owner copy that sorts first and hangs must not use up the budget they need
+        pending = self.root / "state" / "notify" / "pending"
+        pending.mkdir(parents=True)
+        (pending / "a.service+owner").write_text("Service down: a.service\ndaily cap reached. Summary: Result=exit-code\n")
+        (pending / "b.service").write_text("Service down: b.service\na repair session was launched. Summary: Result=exit-code\n")
+        (self.stub / "tg-slow").write_text("30")
+        out = subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True,
+                             env={**self.env, "SERVICE_FAILOVER_NOTIFY_TIMEOUT": "2"}).stdout
+        self.assertEqual(self.notifications(), ["Service down: b.service | a repair session was launched. Summary: Result=exit-code"])
+        self.assertEqual(self.tg_sends(), [])
+        self.assertIn("1 notification(s) still pending", out)
+
+    def test_one_delivery_stays_within_one_notifier_timeout_in_total(self):
+        # several slow owner notices: what does not fit in the budget waits for the next run instead of overrunning the deadline
+        pending = self.root / "state" / "notify" / "pending"
+        pending.mkdir(parents=True)
+        for name in ("a.service+owner", "b.service+owner", "c.service+owner"):
+            (pending / name).write_text(f"Service down: {name}\ndaily cap reached (4 of 4 repair sessions in 24 h). Summary: Result=exit-code\n")
+        (self.stub / "tg-slow").write_text("2")
+        started = time.monotonic()
+        out = subprocess.run(["bash", str(REPAIR), "--flush-notifications"], capture_output=True, text=True,
+                             env={**self.env, "SERVICE_FAILOVER_NOTIFY_TIMEOUT": "3"}).stdout
+        self.assertLess(time.monotonic() - started, 9)
+        self.assertEqual(len(self.tg_sends()), 1, self.tg_sends())
+        self.assertIn("2 notification(s) still pending", out)
+
+    def test_the_notifier_can_still_be_overridden(self):
+        self.set_state()
+        self.repair("foo.service", SERVICE_FAILOVER_NOTIFY=str(self.notify_send))
+        self.assertEqual(len(self.desktop_notifications()), 1, self.desktop_notifications())
+        self.assertEqual((self.journal_lines(), self.tg_sends()), ([], []))
 
     def test_a_restart_the_start_limit_refused_is_retried_after_reset_failed(self):
         # systemd keeps Result=exit-code when the limit hit during the auto-restart ("Start request repeated too quickly.
@@ -325,6 +460,9 @@ class RepairTest(Base):
         self.repair("wireplumber.service")
         self.assertNotIn("retried by the next scan", self.notifications()[0])
         self.assertIn("restart it by hand", self.notifications()[0])
+        # nothing retries the unit and no session will act on it: the owner is told
+        self.assertEqual(len(self.tg_sends()), 1, self.tg_sends())
+        self.assertIn("restart wireplumber.service by hand", self.tg_sends()[0])
 
     def test_a_numeric_success_status_does_not_clear_a_signal_death(self):
         self.set_state()
@@ -382,7 +520,8 @@ class RepairTest(Base):
         failing.write_text("#!/bin/bash\nexit 3\n")
         failing.chmod(0o755)
         self.repair("bar.service", SERVICE_FAILOVER_LAUNCHER=str(failing), SERVICE_FAILOVER_NOTIFY=str(probe))
-        self.assertEqual((self.stub / "lock-probe").read_text().split(), ["free", "free"])
+        # (each outcome is for the owner, so it is delivered twice: the journal copy and the owner copy)
+        self.assertEqual((self.stub / "lock-probe").read_text().split(), ["free"] * 4)
 
     def test_a_unit_that_finished_with_status_0_after_the_restart_needs_nothing(self):
         self.set_state()
@@ -401,12 +540,12 @@ class RepairTest(Base):
         self.assertTrue(self.notifications()[1].endswith("; (no log line)"), self.notifications())
 
     def test_a_long_non_ascii_log_line_is_cut_on_a_character_boundary(self):
-        # `cut -c` counts bytes under the C locale (a service without LANG); the notifier (like GLib) refuses a body that
-        # is not valid UTF-8, and a refused message would stay pending for ever
+        # `cut -c` counts bytes under the C locale (a service without LANG); a notifier may refuse a body that is not valid
+        # UTF-8 (notify-send, as GLib does; a Telegram send), and a refused message would stay pending for ever
         self.set_state()
         (self.stub / "journal").write_text("2026-11-11T01:36:44+01:00 pc foo[1]: x" + "ы" * 400 + "\n", encoding="utf-8")
-        self.repair("foo.service", LC_ALL="C")
-        notes = self.notifications()
+        self.repair("foo.service", LC_ALL="C", SERVICE_FAILOVER_NOTIFY=str(self.notify_send))
+        notes = self.desktop_notifications()
         self.assertEqual(len(notes), 1, notes)
 
     def test_a_message_another_run_has_claimed_is_not_delivered_a_second_time(self):
@@ -843,7 +982,7 @@ class RepairTest(Base):
         for outcome, exit_code in (("succeeds", 0), ("fails", 3)):
             with self.subTest(launcher=outcome):
                 shutil.rmtree(self.root / "state", ignore_errors=True)
-                for name in ("calls", "launching", "notifications"):
+                for name in ("calls", "launching", "logged"):
                     (self.stub / name).unlink(missing_ok=True)
                 slow = self.root / "slow-launcher"
                 slow.write_text('#!/bin/bash\n: > "$STUB/launching"\nsleep 2\n'
@@ -879,7 +1018,7 @@ class RepairTest(Base):
                                                ("the unit is healthy, notice claimed", healthy, 0, True)):
             with self.subTest(name):
                 shutil.rmtree(self.root / "state", ignore_errors=True)
-                for stub in ("calls", "notifications", "show-fails"):
+                for stub in ("calls", "logged", "show-fails"):
                     (self.stub / stub).unlink(missing_ok=True)
                 self.set_state()
                 (self.stub / "show-fails-after-restart").write_text("")
@@ -1149,7 +1288,10 @@ class InstallTest(Base):
                     "service-failover-repair@.service.d/20-limits.conf", "service-failover-scan.timer", "aisis-dashboard.service.d/30-failover-restart.conf"):
             self.assertTrue((unit_dir / rel).is_file(), rel)
         self.assertIn("Restart=on-failure", (unit_dir / "aisis-dashboard.service.d/30-failover-restart.conf").read_text())
-        self.assertTrue(os.access(self.root / "b" / "service-failover-repair", os.X_OK))
+        for script in ("service-failover-repair", "service-failover-scan", "service-failover-journal", "service-failover-notify-journal"):
+            self.assertTrue(os.access(self.root / "b" / script, os.X_OK), script)
+        self.assertIn("TimeoutStartSec=240", (unit_dir / "service-failover-repair@.service").read_text())
+        self.assertIn("TimeoutStartSec=300", (unit_dir / "service-failover-scan.service").read_text())
         self.assertEqual((self.root / "c" / "hosts").read_text().splitlines()[1:], ["local", "odroidn2"])
         self.assertEqual(self.run_install("--check", config=config).returncode, 0)
         second = self.run_install(config=config)
@@ -1178,17 +1320,38 @@ class InstallTest(Base):
         self.assertEqual(self.run_install("--check").returncode, 0)
         self.assertTrue((self.root / "u" / "service-failover-repair@.service.d" / "20-limits.conf").is_file())
 
-    def test_a_missing_desktop_notifier_is_drift_because_the_repair_stack_could_not_tell_the_user(self):
+    def test_a_missing_tg_is_drift_because_nobody_would_be_told_of_an_unrepairable_unit(self):
+        # #226: tg replaced notify-send as the channel a human reads; notify-send itself is required by nothing any more
         self.run_install()
-        check = self.run_install("--check", SERVICE_FAILOVER_NOTIFY="no-such-notifier")
+        check = self.run_install("--check", SERVICE_FAILOVER_TG="no-such-tg")
         self.assertEqual(check.returncode, 3)
-        self.assertIn("missing: no-such-notifier", check.stdout)
+        self.assertIn("missing: no-such-tg on the units' PATH", check.stdout)
+        result = self.run_install(SERVICE_FAILOVER_TG="no-such-tg")
+        self.assertEqual(result.returncode, 10)
+        self.assertIn("needs manual: no-such-tg", result.stderr)
+        # tg resolves, but the interpreter its #! line names through env does not (bun installed elsewhere)
+        interp = self.root / "bin" / "tg-needs-interp"
+        interp.write_text("#!/usr/bin/env no-such-interpreter\n")
+        interp.chmod(0o755)
+        check = self.run_install("--check", SERVICE_FAILOVER_TG=str(interp))
+        self.assertEqual(check.returncode, 3)
+        self.assertIn("or the interpreter it needs", check.stdout)
         self.assertEqual(self.run_install("--check").returncode, 0)
 
-    def test_a_missing_notifier_is_a_manual_step_of_the_install_too(self):
-        result = self.run_install(SERVICE_FAILOVER_NOTIFY="no-such-notifier")
-        self.assertEqual(result.returncode, 10)
-        self.assertIn("needs manual: no-such-notifier", result.stderr)
+    def test_the_hand_made_notifier_drop_ins_of_2026_11_19_are_stale_and_removed(self):
+        # the hand fix on ubuntu-pc put the notifier settings into 30-notify-journal.conf drop-ins; the module now carries them
+        self.run_install()
+        hand = [self.root / "u" / f"{unit}.d" / "30-notify-journal.conf" for unit in ("service-failover-repair@.service", "service-failover-scan.service")]
+        for path in hand:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("[Service]\nEnvironment=SERVICE_FAILOVER_NOTIFY_TIMEOUT=90\nTimeoutStartSec=240\n")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        for path in hand:
+            self.assertIn(f"stale: {path}", check.stdout)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(any(path.exists() for path in hand))
+        self.assertEqual(self.run_install("--check").returncode, 0)
 
     def test_a_symlinked_or_per_instance_drop_in_of_a_module_unit_is_drift_too(self):
         self.run_install()
@@ -1222,7 +1385,7 @@ class InstallTest(Base):
         self.assertEqual(self.run_install("--check").returncode, 0)
 
     def test_help_prints_the_whole_header(self):
-        self.assertIn("names the desktop notifier", self.run_install("--help").stdout)
+        self.assertIn("names the tg command", self.run_install("--help").stdout)
 
     def test_restart_only_installs_no_repair_stack(self):
         result = self.run_install("--restart-only")

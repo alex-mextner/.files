@@ -15,6 +15,7 @@ INSTALL = MODULE / "install.sh"
 REPAIR = MODULE / "bin" / "service-failover-repair"
 JOURNAL = MODULE / "bin" / "service-failover-journal"
 SCAN = MODULE / "bin" / "service-failover-scan"
+NOTIFY_JOURNAL = MODULE / "bin" / "service-failover-notify-journal"
 
 # systemctl keeps a unit's properties in $STUB/state (KEY=VALUE lines), logs every call, and `restart` brings the unit
 # up when $STUB/heals exists.
@@ -173,14 +174,35 @@ case "$1" in
 esac
 exit 0
 """
-# notify-send: records "title | body" per call; $STUB/notify-down makes it fail the way it does while no notification
-# daemon is running yet (early in the login).
-NOTIFIER = r"""#!/bin/bash
+# notify-send, for the tests of the SERVICE_FAILOVER_NOTIFY override (never on PATH): records "title | body" per call in
+# $STUB/notifications; $STUB/notify-down makes it fail the way it does while no notification daemon is running yet.
+NOTIFY_SEND = r"""#!/bin/bash
 [ -e "$STUB/notify-down" ] && { echo "Could not connect: No such file or directory" >&2; exit 1; }
 args=("$@"); n=${#args[@]}
 # like GLib's option parser: a body that is not valid UTF-8 is refused
 printf '%s' "${args[n-1]}" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || { echo "Invalid UTF-8 in the message" >&2; exit 1; }
 printf '%s | %s\n' "${args[n-2]}" "${args[n-1]}" >> "$STUB/notifications"
+"""
+# notify-send on PATH: a desktop pop-up is exactly what the owner ordered gone (#226), so every call is recorded and fails the test.
+NOTIFY_SEND_ON_PATH = r"""#!/bin/bash
+printf '%s\n' "$*" >> "$STUB/notify-send-calls"
+"""
+# logger: what the default notifier writes to the journal, one "TAG PRIORITY MESSAGE" line per call in $STUB/logged;
+# $STUB/notify-down makes it fail (the journal socket is not reachable), so the notice stays pending.
+LOGGER = r"""#!/bin/bash
+[ -e "$STUB/notify-down" ] && { echo "logger: socket /dev/log: Connection refused" >&2; exit 1; }
+tag=- pri=-
+while [ "$#" -gt 0 ]; do case "$1" in -t) tag=$2; shift 2 ;; -p) pri=$2; shift 2 ;; --) shift; break ;; *) break ;; esac; done
+printf '%s %s %s\n' "$tag" "$pri" "$*" >> "$STUB/logged"
+"""
+# tg (also named by SERVICE_FAILOVER_TG, so a real Telegram send can never happen): one line of arguments per call in $STUB/tg.
+# $STUB/tg-down: the send fails; $STUB/tg-slow holds the seconds a send takes (tg's online check under load); like the Bot
+# API, a message that is not valid UTF-8 is refused.
+TG = r"""#!/bin/bash
+[ -e "$STUB/tg-down" ] && { echo "tg: Telegram is not reachable" >&2; exit 1; }
+[ -e "$STUB/tg-slow" ] && sleep "$(cat "$STUB/tg-slow")"
+printf '%s' "$*" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || { echo "tg: Bad Request: text must be encoded in UTF-8" >&2; exit 1; }
+printf '%s\n' "$*" >> "$STUB/tg"
 """
 # wireplumber.service on 2026-11-11 01:36:49: a distribution unit, refused its next start after five fast restarts.
 WIREPLUMBER_STATE = ("InvocationID=old\nActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=5\nUnitFileState=enabled\n"
@@ -210,21 +232,30 @@ class Base(unittest.TestCase):
         self.bin = self.root / "bin"
         for d in (self.stub, self.bin):
             d.mkdir()
-        for name, text in (("systemctl", SYSTEMCTL), ("journalctl", JOURNALCTL), ("ssh", SSH), ("docker", DOCKER)):
+        for name, text in (("systemctl", SYSTEMCTL), ("journalctl", JOURNALCTL), ("ssh", SSH), ("docker", DOCKER),
+                           ("logger", LOGGER), ("tg", TG), ("notify-send", NOTIFY_SEND_ON_PATH)):
             (self.bin / name).write_text(text)
             (self.bin / name).chmod(0o755)
         launcher = self.root / "launcher"
         launcher.write_text(LAUNCHER)
         launcher.chmod(0o755)
-        notifier = self.root / "notify-send"
-        notifier.write_text(NOTIFIER)
-        notifier.chmod(0o755)
-        self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB": str(self.stub), "HOME": str(self.root / "home"),
+        # the override notifier of the tests that name one; by default the repair script uses its own notifier
+        # (service-failover-notify-journal next to it), which writes to the stub logger and the stub tg
+        self.notify_send = self.root / "notify-send"
+        self.notify_send.write_text(NOTIFY_SEND)
+        self.notify_send.chmod(0o755)
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("SERVICE_FAILOVER_")}
+        self.env = {**inherited, "PATH": f"{self.bin}:{os.environ['PATH']}", "STUB": str(self.stub), "HOME": str(self.root / "home"),
                     "SERVICE_FAILOVER_STATE": str(self.root / "state"), "SERVICE_FAILOVER_LAUNCHER": str(launcher),
-                    "SERVICE_FAILOVER_NOTIFY": str(notifier),
+                    "SERVICE_FAILOVER_TG": str(self.bin / "tg"),
                     "SERVICE_FAILOVER_SETTLE_S": "0", "MANAGERPID": "2103", "RIG_AGENT_LOG_DIR": str(self.root / "agent-logs")}
         self.env.pop("UBUNTU_TWEAK_MODULE_CONFIG", None)
         (self.root / "home").mkdir()
+        self.addCleanup(self.assert_no_desktop_popup)
+
+    def assert_no_desktop_popup(self):
+        calls = self.stub / "notify-send-calls"
+        self.assertFalse(calls.exists(), f"notify-send was called: {calls.read_text() if calls.exists() else ''}")
 
     def calls(self):
         path = self.stub / "calls"
@@ -234,6 +265,21 @@ class Base(unittest.TestCase):
         return [c for c in self.calls() if c.startswith("launcher ")]
 
     def notifications(self):
+        """The notices the default notifier wrote to the journal, as "title | body"."""
+        path = self.stub / "logged"
+        lines = path.read_text().splitlines() if path.exists() else []
+        return [line.split(" ", 2)[2].replace(" — ", " | ", 1) for line in lines]
+
+    def journal_lines(self):
+        path = self.stub / "logged"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def tg_sends(self):
+        path = self.stub / "tg"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def desktop_notifications(self):
+        """What the override notifier (self.notify_send, named by SERVICE_FAILOVER_NOTIFY) was given."""
         path = self.stub / "notifications"
         return path.read_text().splitlines() if path.exists() else []
 
