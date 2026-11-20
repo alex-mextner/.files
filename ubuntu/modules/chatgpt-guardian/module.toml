@@ -77,3 +77,13 @@ match = [
 ]
 class = "tracked"
 reason = "rendered from units/control and units/audit and enabled by the chatgpt-guardian module (options control_pass_dir, audit_timers and login_assist)"
+
+# The home native-record scanner is opt-in. Its templates come from the pinned PM source.
+# The private environment mirrors existing Guardian consent; apply never grants that consent.
+[[coverage]]
+match = [
+  "unit:pm-chatgpt-native-stall.service", "unit:pm-chatgpt-native-stall.timer",
+  "file:~/.config/pm-native-stall",
+]
+class = "tracked"
+reason = "native-stall-setup installs the pinned PM templates and private home environment when native_stall_home is enabled; it disables only the managed timer when the option or Guardian policy is disabled"

@@ -44,6 +44,10 @@
 #      asks whether the account's guardian browser is signed out of ChatGPT; if so it stops that account's guardian units (no restart loop), opens
 #      its profile in a window, notifies the owner (desktop notification + Telegram, once per cooldown), waits for the login, says 'login accepted'
 #      and starts the units again. Nothing happens for a signed-in account. Needs pm >= 0.13.1 (see pm_package)
+#  12. native_stall_home (option, opt-in): the pinned PM source supplies pm-chatgpt-native-stall.service/.timer.
+#      native-stall-setup derives a 0600 home.env from the existing home Guardian exact-principal policy and enables
+#      that timer only while the policy is enabled. Apply never grants consent. Disabling the option or policy stops
+#      only the managed timer, retaining the environment, scan checkpoint and any running oneshot.
 #
 # Options ([modules.chatgpt-guardian] of profile.toml / machine.toml, JSON in UBUNTU_TWEAK_MODULE_CONFIG):
 #   repo        git URL of agent-tools   (default https://git.hyperide.ai/ultrabricks/agent-tools.git)
@@ -82,7 +86,10 @@
 #   login_assist       true / false (default false): install the login-assist service template and enable its two instance timers (fact 11);
 #                      needs pm >= 0.13.1 (pm chatgpt login-assist), see pm_package, and the default home_port/glide_port. Setting it back to false does
 #                      NOT disable timers already enabled: systemctl --user disable --now pm-chatgpt-login-assist@home.timer pm-chatgpt-login-assist@glide.vc.timer
-set -euo pipefail
+#   native_stall_home  true / false (default false): manage the home native-record scanner of fact 12; requires the
+#                      pinned PM source to ship its scanner units and home_port 9226. The exact principal stays local
+#                      in Guardian policy and ~/.config/pm-native-stall/home.env; no account identity belongs in this profile.
+set -Eeuo pipefail
 
 usage() { awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
@@ -96,8 +103,42 @@ case "${1:-}" in
   *) echo "usage: $0 [--plan|--check|--print-sync-wrapper]" >&2; exit 2 ;;
 esac
 
-die() { echo "[modules.chatgpt-guardian] $1" >&2; exit 1; }
-manual() { echo "needs manual: $1" >&2; exit 10; }
+# Owner policy requires unique private /tmp logs at startup and completion, retained for inspection.
+# Fixtures remove their exact per-run logs; this installer never prunes another run's diagnostics.
+# Logs omit policy, credentials and environment values. Inability to create a log stops operational work.
+log_started=$SECONDS
+log_dir=$(umask 077; mktemp -d /tmp/chatgpt-guardian-install-XXXXXXXX)
+log_file="$log_dir/run.log"
+(umask 077; : > "$log_file")
+exec 3>>"$log_file"
+log_stage=initialization
+terminal_message=
+progress() {
+  log_stage=$1
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) stage=$log_stage mode=$mode elapsed=$((SECONDS-log_started))"
+  printf '%s\n' "$line" >&3
+  printf 'chatgpt-guardian: %s\n' "$log_stage" >&2
+}
+finish_log() {
+  local rc=$?
+  trap - EXIT
+  printf '%s stage=complete mode=%s returncode=%s elapsed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$rc" "$((SECONDS-log_started))" >&3
+  printf 'chatgpt-guardian result: %s; log: %s\n' "$rc" "$log_file" >&2
+  if [ -n "$terminal_message" ]; then
+    # A user-supplied repository URL can contain credentials. Retain only the
+    # stage/exit status, not arbitrary configuration-bearing diagnostic text.
+    printf '%s\n' "$terminal_message" >&2
+  fi
+  exec 3>&-
+  exit "$rc"
+}
+trap finish_log EXIT
+trap 'rc=$?; printf "%s stage=%s line=%s returncode=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$log_stage" "$LINENO" "$rc" >&3' ERR
+printf 'chatgpt-guardian log: %s\n' "$log_file" >&2
+progress initialization
+die() { terminal_message="[modules.chatgpt-guardian] $1"; progress failed; exit 1; }
+manual() { terminal_message="needs manual: $1"; progress needs-manual; exit 10; }
 
 command -v python3 >/dev/null || manual "python3 is not installed"
 
@@ -105,13 +146,14 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # -- options -----------------------------------------------------------------------------------
 # One python call validates UBUNTU_TWEAK_MODULE_CONFIG and prints its options as shell assignments.
+progress options
 options=$(python3 -B - <<'PY'
 import json, os, re, shlex, sys
 
 known = {"repo": "https://git.hyperide.ai/ultrabricks/agent-tools.git", "dir": "~/xp/agent-tools", "package": "", "pm_package": "",
          "chrome": "/usr/bin/google-chrome", "home_port": 9226, "glide_port": 9223, "xvfb": "",
          "chats_home": [], "chats_glide": [], "glide_email_domain": "glide.vc", "home_email_domain": "",
-         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False, "login_assist": False}
+         "home_memory_high": "3G", "home_memory_max": "4G", "home_private_display": False, "control_pass_dir": "", "audit_timers": False, "login_assist": False, "native_stall_home": False}
 config = json.loads(os.environ.get("UBUNTU_TWEAK_MODULE_CONFIG") or "{}")
 
 
@@ -149,6 +191,8 @@ if not isinstance(opt["audit_timers"], bool):
     fail("audit_timers must be true or false: %s" % opt["audit_timers"])
 if not isinstance(opt["login_assist"], bool):
     fail("login_assist must be true or false: %s" % opt["login_assist"])
+if not isinstance(opt["native_stall_home"], bool):
+    fail("native_stall_home must be true or false")
 UNIT = {"K": 1, "M": 1024, "G": 1024 ** 2, "T": 1024 ** 3}
 for key in ("home_memory_high", "home_memory_max"):
     if not isinstance(opt[key], str) or not re.fullmatch(r"[1-9][0-9]{0,5}[KMGT]", opt[key]):
@@ -189,6 +233,10 @@ if opt["audit_timers"] and not opt["pm_package"]:
     fail("audit_timers needs pm_package (a pm that merges a single account's audit into last-report.json, pm >= 0.10.3)")
 if opt["login_assist"] and not opt["pm_package"]:
     fail("login_assist needs pm_package (a pm with `pm chatgpt login-assist`, pm >= 0.13.1)")
+if opt["native_stall_home"] and not opt["pm_package"]:
+    fail("native_stall_home needs pm_package with native scanner units")
+if opt["native_stall_home"] and int(opt["home_port"]) != 9226:
+    fail("native_stall_home needs home_port 9226 (the PM home reader endpoint)")
 if opt["login_assist"] and (int(opt["home_port"]) != 9226 or int(opt["glide_port"]) != 9223):
     fail("login_assist needs the default DevTools ports (home_port 9226, glide_port 9223): pm login-assist has them built in")
 if opt["chrome"] != "user" and not opt["chrome"].startswith("/"):
@@ -202,6 +250,7 @@ for key in ("repo", "dir", "package", "pm_package", "chrome", "xvfb", "home_port
 print("opt_home_private_display=%s" % ("true" if opt["home_private_display"] else "false"))
 print("opt_audit_timers=%s" % ("true" if opt["audit_timers"] else "false"))
 print("opt_login_assist=%s" % ("true" if opt["login_assist"] else "false"))
+print("opt_native_stall_home=%s" % ("true" if opt["native_stall_home"] else "false"))
 for key in ("chats_home", "chats_glide"):
     print("opt_%s=(%s)" % (key, " ".join(shlex.quote(u) for u in opt[key])))
 PY
@@ -223,6 +272,7 @@ home_domain=$opt_home_domain
 control_dir=$opt_control_pass_dir
 audit_timers=$opt_audit_timers
 login_assist=$opt_login_assist
+native_stall_home=$opt_native_stall_home
 
 venv="$HOME/.local/share/agent-tools/chatgpt-guardian-venv"
 vpy="$venv/bin/python"
@@ -233,6 +283,15 @@ units_dir="$HOME/.config/systemd/user"
 dep_dir="$HOME/.config/agent-tools/chatgpt-guardian"
 chrome_user_dir="$HOME/.local/opt/google-chrome"
 chrome_user_bin="$chrome_user_dir/opt/google/chrome/chrome"
+native_setup() {
+  local flag=--disabled
+  if [ "$native_stall_home" = true ]; then flag=--enabled
+  elif [ ! -e "$units_dir/pm-chatgpt-native-stall.timer" ]; then
+    [ "${1:-}" != --plan ] || echo "home native scanner: not managed (native_stall_home is false)"
+    return 0
+  fi
+  python3 -B "$here/native-stall-setup" "$flag" --pm-package "$pm_package" "$@"
+}
 # A dedicated wrapper name: a generic ~/.local/bin/google-chrome would be picked up by xdg-open and every launcher.
 chrome_wrapper="$HOME/.local/bin/chatgpt-guardian-chrome"
 if [ "$chrome_opt" = user ]; then chrome="$chrome_wrapper"; else chrome=$chrome_opt; fi
@@ -564,6 +623,7 @@ if [ "$mode" = wrapper ]; then sync_wrapper_text; exit 0; fi
 
 # -- --check: read-only ------------------------------------------------------------------------
 if [ "$mode" = check ]; then
+  progress check
   problems=()
   has_package || problems+=("agent-tools package missing at $package")
   if has_package; then
@@ -637,8 +697,15 @@ if [ "$mode" = check ]; then
       if home_browser_on_desktop; then problems+=("$home_browser_unit.service still runs on the desktop display, not on :112: restart it"); fi
     fi
   else
-    echo "systemctl --user is unavailable (no user bus): the check cannot decide" >&2
-    exit 1
+    die "systemctl --user is unavailable (no user bus): the check cannot decide"
+  fi
+  if native_detail=$(native_setup --check); then
+    : # read-only check succeeded
+  else
+    native_rc=$?
+    [ "$native_rc" = 3 ] || die "home native scanner cannot be checked (see its private log)"
+    native_detail=${native_detail#drift: }
+    problems+=("${native_detail:-home native scanner configuration differs}")
   fi
   if [ ${#problems[@]} -gt 0 ]; then
     printf 'drift: %s\n' "${problems[@]}"
@@ -650,6 +717,7 @@ fi
 
 # -- --plan: read-only -------------------------------------------------------------------------
 if [ "$mode" = plan ]; then
+  progress plan
   if has_package; then echo "package: $package present"
   elif [ -e "$dir" ]; then echo "$dir exists but has no lib/agenttools_chatgpt/startup.py: needs manual"
   else echo "git clone $repo_url $dir"; fi
@@ -678,14 +746,21 @@ if [ "$mode" = plan ]; then
   if [ "$login_assist" != true ]; then echo "login helper: not managed (login_assist is false)"
   elif login_assist_ok && timer_on "${login_assist_instances[0]}" && timer_on "${login_assist_instances[1]}"; then echo "login helper: ${login_assist_instances[*]} (every 2 min) ok and enabled"
   else echo "login helper: install pm-chatgpt-login-assist@.service/.timer and enable ${login_assist_instances[*]} timers (a signed-out account gets a login window, a notification and one Telegram message)"; fi
+  native_setup --plan
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
 fi
 
 # -- install -----------------------------------------------------------------------------------
+progress user-manager
+sc show -p Id --value default.target >/dev/null 2>&1 || die "systemctl --user is unavailable (no user bus)"
+# A requested disable must succeed even if later package, browser or login gates fail.
+# This path never enables a timer or grants consent; activation remains after the gates.
+progress native-scanner-disable
+native_setup --disable-only || die "home native scanner disable check failed (see its private log)"
+progress package
 command -v git >/dev/null || manual "git is not installed (module base-tools installs it)"
-sc show -p Id --value default.target >/dev/null 2>&1 || { echo "systemctl --user is unavailable (no user bus)" >&2; exit 1; }
 
 if ! has_package; then
   [ ! -e "$dir" ] || manual "$dir exists but has no lib/agenttools_chatgpt/startup.py (the guardian is not on that checkout's branch): set [modules.chatgpt-guardian] package to the directory that has it"
@@ -710,6 +785,7 @@ if ! venv_ok || ! pkg_same; then
   venv_ok || die "the venv still cannot import agenttools_chatgpt + playwright"
 fi
 
+progress pm-package
 if ! pm_ok; then
   [ -f "$pm_package/pyproject.toml" ] || manual "pm_package $pm_package has no pyproject.toml (extract the committed pm-cli SHA there: git archive <sha> | tar -x -C $pm_package)"
   command -v uv >/dev/null || manual "uv is not installed (module base-tools installs it); hyper-pm is installed with uv"
@@ -718,6 +794,7 @@ if ! pm_ok; then
   pm_ok || die "the venv still holds a different hyper-pm than $pm_package"
 fi
 
+progress command-links
 mkdir -p "$(dirname "$cli_link")"
 if ! pm_link_ok; then
   [ ! -e "$pm_link" ] || [ -L "$pm_link" ] || manual "$pm_link exists and is not a symlink; move it away"
@@ -735,6 +812,7 @@ if ! sync_wrapper_ok; then
   mv -f "$sync_wrapper.tmp" "$sync_wrapper"
 fi
 
+progress browser-runtime
 if ! chrome_ok; then
   [ "$chrome_opt" = user ] || manual "Chrome is not executable at $chrome: install google-chrome-stable (sudo apt) or set [modules.chatgpt-guardian] chrome = \"user\" for the rootless copy"
   if [ ! -x "$chrome_user_bin" ]; then
@@ -764,6 +842,7 @@ xvfb_ok || manual "Xvfb is not installed: sudo apt install xvfb (the glide.vc br
 display_tools_ok || manual "xauth or mcookie is missing: sudo apt install xauth (mcookie comes with util-linux)"
 
 # per workspace: token + state, deployment file (the units' ConditionPathExists), enrolled chats
+progress workspace-state
 for ws in "${workspaces[@]}"; do
   if ! dep_ok "$ws"; then
     "$cli_link" --workspace "$ws" init >/dev/null
@@ -785,6 +864,7 @@ print(json.dumps({"workspace": sys.argv[1], "state": sys.argv[2]}, separators=("
 done
 
 # units
+progress unit-files
 mkdir -p "$units_dir"
 changed=0
 declare -A rewritten=()
@@ -888,6 +968,7 @@ start_unit() {
 }
 
 # Only stopped units are started: a running browser keeps its windows; a changed unit takes effect at its next restart.
+progress unit-starts
 for n in "${started_units[@]}"; do
   enable_unit "$n"
   unit_locked "$n" || start_unit "$n"
@@ -906,6 +987,7 @@ if [ "$audit_timers" = true ]; then
 fi
 # logins live in the browser profiles: report, never fake. The --apply guardian of a workspace is enabled and
 # started only once its profile is signed in.
+progress login-checks
 signed_out=()
 unreachable=()
 desktop_browser=0
@@ -968,16 +1050,53 @@ if [ "$login_assist" = true ]; then
     timer_on "$n" || sc enable --now "$n.timer" >/dev/null || echo "warning: $n.timer failed to start" >&2
   done
 fi
+# -- home native scanner activation ------------------------------------------------------------
+# Every home gate must pass; an unrelated glide login problem cannot strand the home timer.
+native_home_ready() {
+  [ "$desktop_browser" != 1 ] || return 1
+  local item
+  for item in "${signed_out[@]}" "${unreachable[@]}" "${login_held[@]}"; do
+    [ "$item" != home ] || return 1
+  done
+  for item in "${down[@]}"; do
+    case "$item" in chatgpt-guardian-home|chatgpt-guardian-home-*) return 1 ;; esac
+  done
+  is_active chatgpt-guardian-home && is_active chatgpt-guardian-home-browser && is_active chatgpt-guardian-home-observer
+}
+native_error=0
+native_deferred=0
+if [ "$native_stall_home" = true ]; then
+  progress native-scanner
+  if native_home_ready; then
+    native_setup || native_error=1
+  else
+    # The early pass may have deferred while the venv was broken. After repair,
+    # withdraw known old policy even when the home profile must remain untouched.
+    native_setup --disable-only || native_error=1
+    if native_setup --check >/dev/null; then
+      :
+    else
+      native_rc=$?
+      if [ "$native_rc" = 3 ]; then native_deferred=1; else native_error=1; fi
+    fi
+    if [ "$native_deferred" = 1 ]; then
+      echo "home native scanner: activation deferred until the home profile and services are ready"
+    fi
+  fi
+fi
+if [ "$native_error" = 1 ]; then
+  echo "home native scanner provisioning failed (see its private log)" >&2
+fi
+# -- account diagnostics -----------------------------------------------------------------------
+progress account-diagnostics
 if [ ${#down[@]} -gt 0 ]; then
-  echo "not running after start: ${down[*]} ($(down_hint "${down[@]}"))" >&2
-  exit 1
+  die "not running after start: ${down[*]} ($(down_hint "${down[@]}"))"
 fi
 if [ ${#login_held[@]} -gt 0 ]; then
   echo "login session in progress for ${login_held[*]} (relogin / profile-sync / the login helper holds the profile): its units, DevTools port and sign-in were left alone"
 fi
 if [ ${#unreachable[@]} -gt 0 ]; then
-  echo "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)" >&2
-  exit 1
+  die "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)"
 fi
 if [ "$desktop_browser" = 1 ]; then
   manual "the home browser still runs on the desktop display, not on the private display :112, so the home guardian was not started or, when it was running, stopped (its --private-display flag would claim a window that is shared with this desktop): restart $home_browser_unit.service (its window closes, the profile and its tabs are restored), then run apply again"
@@ -986,4 +1105,12 @@ if [ ${#signed_out[@]} -gt 0 ]; then
   if [ "$home_private_display" = true ]; then home_login="home = its private display :112 (no window on this desktop: stop the home units and sign in with a normal Chrome window on the profile ~/.local/share/agent-tools/chatgpt-guardian/profiles/home), DevTools port $home_port"
   else home_login="home = the browser window on this desktop, DevTools port $home_port"; fi
   manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} ($home_login; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
+fi
+if [ "$native_error" = 1 ]; then
+  progress native-scanner
+  die "home native scanner provisioning failed (see its private log)"
+fi
+if [ "$native_deferred" = 1 ]; then
+  progress native-scanner
+  manual "home native scanner activation is deferred while the home profile or services are unavailable; finish the existing login session or repair home readiness, then run apply again"
 fi
