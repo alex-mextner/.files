@@ -60,4 +60,5 @@ export PATH="$BUN_INSTALL/bin:$HOME/.cargo/bin:$PATH"
 [ -f "/home/ultra/.local/share/vastai/env.sh" ] && . "/home/ultra/.local/share/vastai/env.sh"  # vastai shell setup
 # >>> .files:zshrc (managed by ~/.files/install-ubuntu.sh; edit there) >>>
 [[ -o login ]] || source "$HOME/.files/.zprofile"
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"
 # <<< .files:zshrc <<<

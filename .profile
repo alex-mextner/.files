@@ -71,3 +71,6 @@ if [ -n "${BASH_VERSION:-}" ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc";
 # Machine-local settings (not in this repository: ubuntu-tweaks links ~/.profile.local from the profile's
 # machines/<host>/files/, or write it by hand)
 if [ -f "$HOME/.profile.local" ]; then . "$HOME/.profile.local"; fi
+
+# rig's harness wrappers (omp, claude, codex, opencode) must come before the real binaries; last, so nothing above can shadow them
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"
