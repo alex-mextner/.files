@@ -130,4 +130,5 @@ export FJ_FALLBACK_HOST=https://git.hyperide.ai
 # >>> .files:bashrc (managed by ~/.files/install-ubuntu.sh; edit there) >>>
 [ -f "$HOME/.files/aliases.sh" ] && . "$HOME/.files/aliases.sh"
 case ":$PATH:" in *":$HOME/.files/bin:"*) ;; *) PATH="$PATH:$HOME/.files/bin:$HOME/.files/ts-import-trace/bin" ;; esac
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"
 # <<< .files:bashrc <<<

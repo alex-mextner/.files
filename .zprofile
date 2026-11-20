@@ -246,3 +246,6 @@ if [[ $RANDOM > 8191 ]]; then
   echo '                ||----w |'
   echo '                ||     ||'
 fi
+
+# rig's harness wrappers (omp, claude, codex, opencode) must come before the real binaries; last, so nothing above can shadow them
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"

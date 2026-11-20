@@ -66,3 +66,9 @@ machine's `~/.profile`, `~/.bashrc`, `~/.zshrc`, includes `.gitconfig.shared` fr
 and merges `rig/config.yaml` into `~/.config/rig/config.yaml`. Machine-specific files are merged,
 never overwritten; running it twice changes nothing. A private submodule whose repository this machine cannot
 read is reported as a `manual:` step (the script names the owner account) instead of failing.
+
+Interactive `omp`, `claude`, `codex` and `opencode` start hosted in abduco under rig's crash supervisor: `rig/config.yaml`
+declares `harness_wrappers`, and `harness-wrappers.sh` (sourced last by `.profile`, `.zprofile` and the blocks the installer
+merges into `~/.profile`, `~/.bashrc` and `~/.zshrc`) puts `~/.local/share/rig/bin` before the real binaries, since rig
+never edits `PATH`. Print mode, subcommands and `--help` pass straight through. `tests/harness-wrappers.test.sh` checks
+the helper in bash, zsh and dash and the merged startup files as login and non-login interactive shells.

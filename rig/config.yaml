@@ -6,7 +6,6 @@
 #
 # Decisions that are NOT here on purpose (switch on with `rig config set ... --global --commit`):
 #   mode: autonomous        its review quorum needs 3 distinct models; no single-model fallback
-#   harness_wrappers        needs abduco (apt) and a PATH order only the user can choose
 #   tracked_files           background PRs from every worktree with the user's credentials
 #   git / profile           ~/.files/.gitconfig.shared is the git source of truth; rig profile needs
 #                           a private profile repo
@@ -24,6 +23,27 @@ harness:
 agent_hooks:
   enabled: true
   all: true
+# Interactive omp / claude / codex / opencode start hosted in abduco under rig's crash supervisor (DOT239).
+# rig never edits PATH: harness-wrappers.sh (sourced last by the profile files and the merged blocks) puts
+# ~/.local/share/rig/bin before the real binaries. omp is pinned to the real binary, not to the
+# ~/.local/bin/omp launcher: `rig harness exec` runs hosted AND pass-through launches (print mode,
+# subcommands) in the same per-session memory scope and signal domain and exports PI_INSTALL_DIR
+# (~/.local/lib/omp, where `omp update` must write) itself. The cgroup keys keep the oomd drop-in of omp.slice
+# (80% pressure for 60s, overriding the 40% of the tracked omp.slice unit) that rig already wrote on this
+# machine: without them a scoped `rig apply` of harness_wrappers would remove it as no longer configured.
+harness_wrappers:
+  enabled: true
+  dir: ~/.local/share/rig/bin
+  kinds:
+  - omp
+  - claude
+  - codex
+  - opencode
+  real_bin:
+    omp: ~/.local/lib/omp/omp
+  cgroup:
+    oomd_pressure_limit: 80
+    oomd_pressure_duration_sec: 60
 sysmon:
   enabled: true
   auto_remediate: false
