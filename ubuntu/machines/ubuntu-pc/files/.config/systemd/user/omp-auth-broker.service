@@ -1,0 +1,21 @@
+# omp auth-broker: this PC is the one machine that holds the omp logins (~/.omp/agent/agent.db).
+# Serves them over 127.0.0.1 only; OAuth refresh tokens never leave this host (the broker hands out
+# access tokens). Every other machine reaches it through omp-auth-broker-tunnel@<ssh alias>.service
+# (ssh -R), so its omp uses these accounts without a copied refresh token (a copied one rotates and
+# logs one side out). Setup and the consumer side: ../../../../scripts/omp-auth-broker/README.md.
+# First introduced for the clvm build box (tg#23281/#23282, 2026-10-21).
+[Unit]
+Description=omp auth-broker (credential vault served to other machines through ssh -R)
+After=network-online.target
+
+[Service]
+# Without it the ~/.local/bin/omp wrapper moves the broker into its own omp.slice scope, and MemoryMax
+# below would limit an empty cgroup.
+Environment=OMP_NO_SCOPE=1
+ExecStart=%h/.local/bin/omp auth-broker serve --bind=127.0.0.1:18765
+Restart=always
+RestartSec=10
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
