@@ -591,3 +591,24 @@ def test_new_instance_without_a_session_is_disabled_again(env):
     assert result.returncode == 1
     assert "pc\t--user disable --now omp-auth-broker-tunnel@clvm.service" in env.systemctl_calls()
     assert "auth" not in config(clvm)
+
+
+def test_no_alias_serves_the_enabled_instances_and_retries_clvm_while_the_old_unit_serves_it(env):
+    """A rerun after a token rotation reaches every current consumer: the enabled instances, plus clvm while the old
+    unit still holds it, and never a consumer whose instance was disabled."""
+    env.consumer("clvm")
+    env.consumer("home")
+    env.consumer("bread")
+    gone = env.base / "gone.service"
+    (env.unit_dir / "default.target.wants/omp-auth-broker-tunnel@home.service").symlink_to(gone)
+    (env.unit_dir / "clvm-auth-broker-tunnel.service").symlink_to(gone)
+    result = env.run("--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "home" in result.stdout and "clvm" in result.stdout
+    assert "bread" not in result.stdout
+
+
+def test_no_alias_and_nothing_enabled_is_an_error_that_names_the_fix(env):
+    result = env.run()
+    assert result.returncode == 2
+    assert "no tunnel instance is enabled yet" in result.stderr

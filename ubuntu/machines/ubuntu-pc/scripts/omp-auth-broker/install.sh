@@ -7,7 +7,7 @@
 # those two lines change, comments and other keys stay as they are). It is never in a command line on either side
 # (`omp config set <key> <token>` would put it in the consumer's /proc/<pid>/cmdline and, through the omp wrapper's
 # systemd-run scope description, in its journal), never printed, and only sent when the consumer's copy differs.
-# Usage: install.sh [--dry-run] [alias ...]   (default aliases: clvm home)
+# Usage: install.sh [--dry-run] [alias ...]   (default: the enabled tunnel instances, plus clvm while the old unit serves it)
 set -euo pipefail
 
 PORT=18765
@@ -105,7 +105,7 @@ try:
 except BaseException:
     os.unlink(tmp); raise'
 
-usage() { printf 'usage: %s [--dry-run] [alias ...]   (default aliases: clvm home)\n' "$0"; }
+usage() { printf 'usage: %s [--dry-run] [alias ...]   (default: the enabled omp-auth-broker-tunnel@ instances)\n' "$0"; }
 dry=0
 aliases=()
 for arg in "$@"; do
@@ -116,7 +116,20 @@ for arg in "$@"; do
     *) aliases+=("$arg") ;;
   esac
 done
-[ ${#aliases[@]} -gt 0 ] || aliases=(clvm home)
+# No alias given: the consumers this PC already serves (its enabled tunnel instances, plus clvm while the old unit
+# still serves it, so its migration is retried), so a rerun after a token rotation reaches every current consumer
+# and never re-adds one that was removed.
+if [ ${#aliases[@]} -eq 0 ]; then
+  for link in "$UNIT_DIR"/default.target.wants/omp-auth-broker-tunnel@*.service; do
+    [ -L "$link" ] || continue
+    inst="${link##*/omp-auth-broker-tunnel@}"; aliases+=("${inst%.service}")
+  done
+  if [ -L "$UNIT_DIR/$OLD_UNIT" ] || [ -L "$UNIT_DIR/default.target.wants/$OLD_UNIT" ] \
+     || systemctl --user is-active --quiet "$OLD_UNIT" 2>/dev/null; then
+    case " ${aliases[*]} " in *" $OLD_UNIT_ALIAS "*) ;; *) aliases+=("$OLD_UNIT_ALIAS") ;; esac
+  fi
+  [ ${#aliases[@]} -gt 0 ] || { printf 'error: no tunnel instance is enabled yet; name the consumers, e.g. %s clvm home\n' "$0" >&2; exit 2; }
+fi
 
 say() { printf '%s\n' "$*"; }
 # Quotes one argument for any POSIX shell: single quotes, with each embedded quote closed, escaped and reopened.
@@ -158,9 +171,6 @@ if systemctl --user is-active --quiet "$BROKER"; then
     run systemctl --user restart "$BROKER"
   fi
 fi
-if ! systemctl --user is-enabled --quiet "$BROKER" || ! systemctl --user is-active --quiet "$BROKER"; then
-  run systemctl --user enable --now "$BROKER"
-fi
 # `enable` points the wants link at the unit file's resolved path; one enabled from another checkout (or the old shared
 # file this setup replaced) is moved to this checkout's file.
 # Not `reenable`: its `disable` half also removes the unit link step 1 made for a non-template unit, and the `enable`
@@ -172,6 +182,9 @@ reenable_if_elsewhere() {
   fi
 }
 reenable_if_elsewhere "$BROKER" "$BROKER"
+if ! systemctl --user is-enabled --quiet "$BROKER" || ! systemctl --user is-active --quiet "$BROKER"; then
+  run systemctl --user enable --now "$BROKER"
+fi
 if [ "$dry" = 0 ]; then
   for _ in $(seq 20); do ss -Hltn "sport = :$PORT" | grep -q . && break; sleep 0.5; done
   ss -Hltn "sport = :$PORT" | grep -q . || { say "error: the broker is not listening on 127.0.0.1:$PORT" >&2; exit 1; }
@@ -240,7 +253,7 @@ for host in "${aliases[@]}"; do
   fi
   # The unit cannot clear an alias's own forwards (that would also clear its -R), so an alias that carries any would
   # break the tunnel after the old clvm unit is already gone; README step 1 forbids them, this enforces it.
-  if ssh -G "$host" 2>/dev/null | grep -qiE '^(remoteforward|localforward|dynamicforward|remotecommand) '; then
+  if ssh -G -o ClearAllForwardings=no "$host" 2>/dev/null | grep -qiE '^(remoteforward|localforward|dynamicforward|remotecommand) '; then
     skip "the ssh alias $host carries a forward or RemoteCommand; give the tunnel a plain alias"; continue
   fi
   own_record="omp-auth-broker-tunnel.$PC_HOST.$host.pids"
@@ -275,9 +288,11 @@ for host in "${aliases[@]}"; do
   # bearer never goes to a listener that is not proven to be this tunnel.
   if ! reenable_if_elsewhere "$unit" omp-auth-broker-tunnel@.service; then skip "reenabling $unit failed"; continue; fi
   # The units run in the user manager, whose environment (ssh agent, Match exec) can differ from this shell's. Prove it
-  # can reach the consumer before anything is enabled, and before the working old clvm tunnel is torn down.
+  # can reach the consumer before anything is enabled, and before the working old clvm tunnel is torn down. Stricter
+  # than the unit on purpose: IdentityAgent=none proves the key works without an agent (README step 1), since an
+  # agent the user manager sees while someone is logged in is gone after a reboot.
   if [ "$dry" = 0 ] \
-     && ! systemd-run --user --wait --pipe --quiet /usr/bin/ssh -T -a -x -o BatchMode=yes -o ConnectTimeout=10 \
+     && ! systemd-run --user --wait --pipe --quiet /usr/bin/ssh -T -a -x -o IdentityAgent=none -o BatchMode=yes -o ConnectTimeout=10 \
           -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none "$host" true </dev/null >/dev/null 2>&1; then
     if [ "$replaces_old" = 1 ]; then
       skip "the systemd user manager cannot ssh to $host (agent-only key?); $OLD_UNIT was left running, but its unit file is gone from the profile, so it will not come back after a drop or reboot"

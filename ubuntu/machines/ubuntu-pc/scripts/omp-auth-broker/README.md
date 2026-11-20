@@ -28,7 +28,7 @@ login for the `ultra` account with omp yet.
    ```
 
    Check it with `ssh -o BatchMode=yes clvm true`. The alias must have no `RemoteCommand`,
-   `RemoteForward`, `LocalForward`, `DynamicForward` or `ClearAllForwardings yes`: the tunnel uses
+   `RemoteForward`, `LocalForward` or `DynamicForward` (a `ClearAllForwardings yes` does not hide them): the tunnel uses
    the alias as is, so these would break it or collide with an interactive session, and the script
    skips such an alias. Give such a host a second, plain alias for the tunnel. Two aliases for the
    same consumer must not both get a tunnel: only one can hold its port. The key must work without
@@ -79,5 +79,5 @@ command line.
   the `broker:` block under `auth:` from the consumer's omp config (its token works on every other
   consumer too), then rotate the token with `omp auth-broker token --regenerate` and run
   `install.sh` for the remaining consumers.
-- After rotating the token with `omp auth-broker token --regenerate`, run `install.sh` again to send
-  the new one to every consumer.
+- After rotating the token with `omp auth-broker token --regenerate`, run `install.sh` with no alias:
+  it sends the new one to every consumer whose tunnel instance is enabled, and to no other.
