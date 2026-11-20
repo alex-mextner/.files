@@ -1,0 +1,93 @@
+# Repository-owned module CI: isolated fixtures only, never a live browser or systemd.
+name: Guardian module
+
+on:
+  pull_request:
+    paths:
+      - "ubuntu/modules/chatgpt-guardian/**"
+      - "ubuntu/machines/ubuntu-pc/machine.toml"
+      - ".github/workflows/guardian-module.yml"
+  push:
+    branches: [master]
+    paths:
+      - "ubuntu/modules/chatgpt-guardian/**"
+      - "ubuntu/machines/ubuntu-pc/machine.toml"
+      - ".github/workflows/guardian-module.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guardian-module-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fixtures:
+    name: Guardian module fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the exact PM source declared by the machine
+        run: |
+          set -euo pipefail
+          pm_sha="$(uv run python -c 'import pathlib,re,tomllib
+          config=tomllib.loads(pathlib.Path("ubuntu/machines/ubuntu-pc/machine.toml").read_text())
+          sha=pathlib.Path(config["modules"]["chatgpt-guardian"]["pm_package"]).name
+          assert re.fullmatch(r"[0-9a-f]{40}",sha), "PM source must name a full commit"
+          print(sha)')"
+          git init --quiet "${RUNNER_TEMP}/pm-source"
+          git -C "${RUNNER_TEMP}/pm-source" remote add origin https://git.hyperide.ai/ultrabricks/pm-cli.git
+          git -C "${RUNNER_TEMP}/pm-source" fetch --depth=1 origin "${pm_sha}"
+          git -C "${RUNNER_TEMP}/pm-source" checkout --detach FETCH_HEAD
+          test "$(git -C "${RUNNER_TEMP}/pm-source" rev-parse HEAD)" = "${pm_sha}"
+          echo "PYTHONPATH=${RUNNER_TEMP}/pm-source" >> "${GITHUB_ENV}"
+          echo "Verified PM source ${pm_sha}"
+
+      - name: Verify the pinned PM runtime contract
+        run: |
+          set -euo pipefail
+          uv run python - "${RUNNER_TEMP}/pm-source" <<'PY'
+          import pathlib, sys, tomllib
+          from pmlib.chatgpt_control.guardian_client import GuardianClient
+          config = tomllib.loads(pathlib.Path("ubuntu/machines/ubuntu-pc/machine.toml").read_text())
+          if config["modules"]["chatgpt-guardian"].get("native_stall_home", False):
+              units = pathlib.Path(sys.argv[1]) / "pmlib/chatgpt_control/units"
+              for kind in ("service", "timer"):
+                  assert (units / f"pm-chatgpt-native-stall.{kind}").is_file(), "Pinned PM source lacks scanner units"
+          print("Verified real GuardianClient import and declared native unit availability")
+          PY
+
+      - name: Run the whole Guardian module fixture suite
+        run: |
+          set -euo pipefail
+          uv run --with "pytest>=8,<9" pytest \
+            ubuntu/modules/chatgpt-guardian/tests \
+            ubuntu/modules/chatgpt-guardian/control-pass/tests \
+            -q -rs -p no:cacheprovider --junitxml="${RUNNER_TEMP}/guardian-module-junit.xml"
+
+      - name: Require a nonempty run without failures or skips
+        if: always()
+        run: |
+          set -euo pipefail
+          uv run python - "${RUNNER_TEMP}/guardian-module-junit.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          assert cases, "Module CI did not execute any cases"
+          assert any("test_native_stall_install." in c.attrib.get("classname", "") for c in cases), "Native scanner fixtures did not execute"
+          bad = [c for c in cases if any(c.find(tag) is not None for tag in ("failure", "error", "skipped"))]
+          assert not bad, "Module fixtures failed, errored or skipped: " + ", ".join(c.attrib.get("name", "?") for c in bad)
+          print(f"Verified {len(cases)} module fixture cases with zero skips")
+          PY

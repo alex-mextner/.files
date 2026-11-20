@@ -6,6 +6,7 @@ No network and no change to the real systemd: `systemctl` is a stub on PATH, HOM
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tomllib
@@ -46,11 +47,22 @@ def fake_bin(tmp_path):
     return bin_dir
 
 
+def clean_logs(done):
+    # These exact per-invocation paths belong to this isolated fixture; preserve other runs' logs.
+    for raw in set(re.findall(r"log: (/tmp/chatgpt-guardian-(?:native|install)-[^\s]+/run.log)", done.stderr)):
+        log = Path(raw)
+        assert log.stat().st_mode & 0o777 == 0o600
+        assert log.parent.stat().st_mode & 0o777 == 0o700
+        shutil.rmtree(log.parent)
+
+
 def run(home, fake_bin, *args, config=None, **env_extra):
     env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}", "UBUNTU_TWEAK_MODULE_CONFIG": json.dumps(config or {})}
     env.pop("XDG_CONFIG_HOME", None)
     env.update(env_extra)
-    return subprocess.run([str(INSTALL), *args], env=env, capture_output=True, text=True, timeout=60, check=False)
+    done = subprocess.run([str(INSTALL), *args], env=env, capture_output=True, text=True, timeout=60, check=False)
+    clean_logs(done)
+    return done
 
 
 @pytest.fixture()
@@ -95,6 +107,9 @@ def test_unknown_option_is_refused(home, fake_bin):
         ({"home_private_display": "true"}, "home_private_display must be true or false"),
         ({"home_private_display": 1}, "home_private_display must be true or false"),
         ({"home_private_display": None}, "home_private_display must be true or false"),
+        ({"native_stall_home": "true"}, "native_stall_home must be true or false"),
+        ({"native_stall_home": True}, "native_stall_home needs pm_package"),
+        ({"native_stall_home": True, "pm_package": "/tmp/pm", "home_port": 9227}, "native_stall_home needs home_port 9226"),
     ],
 )
 def test_bad_options_are_refused(home, fake_bin, config, message):
@@ -573,6 +588,7 @@ def test_the_wrapper_survives_a_checkout_path_that_bash_quotes_with_dollar_quote
     home.mkdir()
     env = {**os.environ, "HOME": str(home), "LC_ALL": "C", "UBUNTU_TWEAK_MODULE_CONFIG": "{}", "UBUNTU_TWEAK_LANG": "en", "CHATGPT_RELOGIN_PROBE_TIMEOUT": "1"}
     printed = subprocess.run([str(module / "install.sh"), "--print-sync-wrapper"], env=env, capture_output=True, text=True, timeout=60, check=False)
+    clean_logs(printed)
     assert printed.returncode == 0, printed.stderr
     wrapper = tmp_path / "wrapper"
     wrapper.write_text(printed.stdout, encoding="utf-8")
