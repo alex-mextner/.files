@@ -297,7 +297,7 @@ match = [
   "file:~/.config/chatgpt-native-ha.env",
 ]
 class = "untracked"
-reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge, ChatGPT native + HA gui session with its Xvfb copy, tinyprint bridge venv); the units are declared but not enabled until this lands"
+reason = "code and runtime of user services deployed by hand without a repository the profile can clone (physical-desktop bridge; the ChatGPT native + HA gui runtime, whose Xvfb/x11vnc copy the guardian displays still use and whose unit is retired; tinyprint bridge venv); the remaining units are declared but not enabled until this lands"
 ticket = "alex-mextner/.files#58"
 
 [[coverage]]

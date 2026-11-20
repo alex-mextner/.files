@@ -69,7 +69,7 @@ def unit_argv(key: str, port: int | None = None) -> list[str]:
     (line,) = unit_lines(key)
     line = re.sub(r"\$\{(\w+)\}", lambda m: env[m.group(1)], line.replace("%H", HOSTNAME)).replace("$$", "$")
     argv = shlex.split(line)
-    assert argv[0] == "/usr/bin/ssh" and argv[-2] == "ultra@65.21.40.51"
+    assert argv[0] == "/usr/bin/ssh" and argv[-2] == "ultra@clvm"
     return argv
 
 

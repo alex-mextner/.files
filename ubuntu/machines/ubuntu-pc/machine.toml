@@ -231,15 +231,15 @@ gate_why = "the dock code that apply links must be released first; these pull re
 gate_why_ru = "код дока, который подключает apply, сначала должен выйти релизом; эти pull request-ы hyperdock ещё открыты"
 
 # Two scratch directories of finished ctmux work on the Hetzner build server (not git repositories, 137M and 424K). The
-# server is reached as ultra@65.21.40.51 with the plain ssh key, it has no entry in ~/.ssh/config. Optional: leaving them
+# server is reached through the ssh alias clvm in ~/.ssh/config. Optional: leaving them
 # costs disk space only, so they never keep finish-setup from reporting "all done". The script asks y/N before it removes
 # anything and its two paths are literals (scripts/build-server-cleanup).
 [[finish.steps]]
 id = "build-server-cleanup"
 title = "Remove two scratch directories from the build server"
 title_ru = "Удалить два временных каталога на билд-сервере"
-why = "finished ctmux work left /home/ultra/projects/rig-ctmux-20261023 and /home/ultra/projects/ubuntu-sync-ctmux-20261022 on ultra@65.21.40.51; deleting is the owner's call"
-why_ru = "после завершённой работы над ctmux на ultra@65.21.40.51 остались /home/ultra/projects/rig-ctmux-20261023 и /home/ultra/projects/ubuntu-sync-ctmux-20261022; удалять их решаешь ты"
+why = "finished ctmux work left /home/ultra/projects/rig-ctmux-20261023 and /home/ultra/projects/ubuntu-sync-ctmux-20261022 on clvm; deleting is the owner's call"
+why_ru = "после завершённой работы над ctmux на clvm остались /home/ultra/projects/rig-ctmux-20261023 и /home/ultra/projects/ubuntu-sync-ctmux-20261022; удалять их решаешь ты"
 action = "Read the two paths and answer y to remove them"
 action_ru = "Посмотри два пути и ответь y, чтобы удалить их"
 check = ["./machines/ubuntu-pc/scripts/build-server-cleanup", "check"]

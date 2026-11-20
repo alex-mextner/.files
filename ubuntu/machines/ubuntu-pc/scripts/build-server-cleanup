@@ -1,7 +1,7 @@
 #!/bin/sh
 # build-server-cleanup: finish step of the ubuntu-pc profile (machine.toml, [[finish.steps]] build-server-cleanup).
 #
-# The Hetzner build server ultra@65.21.40.51 (plain ssh key login, it is not in ~/.ssh/config) still holds two scratch
+# The Hetzner build server (ssh alias clvm in ~/.ssh/config, which holds its address) still holds two scratch
 # directories of finished ctmux work: not git repositories, nothing in them is the only copy.
 #   /home/ultra/projects/rig-ctmux-20261023            (137M)
 #   /home/ultra/projects/ubuntu-sync-ctmux-20261022    (424K)
@@ -16,7 +16,7 @@ command_word=${1:-}
 set -- /home/ultra/projects/rig-ctmux-20261023 /home/ultra/projects/ubuntu-sync-ctmux-20261022
 
 lang=${UBUNTU_TWEAK_LANG:-en}
-host=ultra@65.21.40.51
+host=ultra@clvm
 
 say() { # say ENGLISH RUSSIAN
   if [ "$lang" = ru ]; then printf '%s\n' "$2"; else printf '%s\n' "$1"; fi
@@ -26,7 +26,7 @@ ask() { # ask ENGLISH RUSSIAN: the prompt, no newline
 }
 # ConnectTimeout bounds the connect; ServerAlive* ends a connection that goes silent afterwards (a stalled server, a dropped network).
 remote() {
-  ssh -n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$host" "$@"
+  ssh -n -a -x -o ClearAllForwardings=yes -o RemoteCommand=none -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$host" "$@"
 }
 
 # Names what is still on the server. Returns 0 when nothing is left, 1 when something is or the server cannot be asked.
