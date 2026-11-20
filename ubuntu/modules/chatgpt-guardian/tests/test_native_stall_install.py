@@ -543,7 +543,7 @@ home_private_display=true
 home_port=9226
 glide_port=9223
 home_browser_unit=chatgpt-guardian-home-browser
-progress() { :; }
+progress() { printf 'stage=%s\n' "$1"; }
 die() { printf '%s\n' "$1" >&2; exit 1; }
 manual() { printf 'needs manual: %s\n' "$1" >&2; exit 10; }
 is_active() { return 0; }
@@ -667,6 +667,61 @@ native_setup() {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls_after(), [])
         self.assertFalse((self.home / ".config/pm-native-stall/home.env").exists())
+
+    def test_ambiguous_timer_targets_are_refused(self):
+        for directives in (
+            "Unit=other.service\nUnit=pm-chatgpt-native-stall.service\n",
+            "Unit=other.service\nUnit=\n",
+            "Unit=\n",
+        ):
+            with self.subTest(directives=directives):
+                (self.templates / f"{UNIT}.timer").write_text(
+                    self.timer.replace(f"Unit={UNIT}.service\n", directives),
+                    encoding="utf-8",
+                )
+                result = self.setup("--verify-templates", enabled=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.calls_after(), [])
+
+    def test_ambiguous_continuations_and_nonstandard_separators_are_refused(self):
+        slash = chr(92)
+        service_prefix = "[Service]\n"
+        variants = [
+            self.service.replace(
+                service_prefix,
+                service_prefix + "Nice=10 " + suffix + "\nExecStart=/extra\n",
+            )
+            for suffix in (slash * 2, slash + " ", slash + "\n")
+        ]
+        variants += [
+            self.service.replace("--json\n", "--json" + chr(0x2028) + "#comment\n"),
+            self.service.replace("--apply --json", "--apply" + chr(0xA0) + "--json"),
+        ]
+        for changed in variants:
+            with self.subTest(template=changed):
+                (self.templates / f"{UNIT}.service").write_text(changed, encoding="utf-8")
+                result = self.setup("--verify-templates", enabled=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(self.calls_after(), [])
+
+    def test_converged_scanner_is_not_reported_as_deferred(self):
+        self.assertEqual(self.setup().returncode, 0)
+        position = len(self.calls_after())
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("activation deferred", result.stdout)
+        self.assertNotIn("drift:", result.stdout)
+        self.assertEqual(self.mutations(position), [])
+        self.assertTrue(json.loads(self.manager.read_text())["active"])
+
+    def test_deferred_native_failure_and_account_diagnostics_have_distinct_stages(self):
+        self.policy.write_text("{broken", encoding="utf-8")
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        stages = [line for line in result.stdout.splitlines() if line.startswith("stage=")]
+        self.assertEqual(stages, [
+            "stage=native-scanner", "stage=account-diagnostics", "stage=native-scanner",
+        ])
 
     def test_whole_check_does_not_open_an_uninitialized_home_store(self):
         self.deployment.unlink()

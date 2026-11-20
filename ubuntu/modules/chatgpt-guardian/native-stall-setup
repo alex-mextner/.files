@@ -61,15 +61,36 @@ class Log:
         print(f"home native scanner result: {code}; log: {self.path}", file=sys.stderr)
 
 
+def unit_physical_line(raw):
+    """Read the supported subset; refuse ambiguous escapes and line separators."""
+    raw = raw.removesuffix("\r")
+    if any(
+        (ord(char) < 32 and char != "\t") or char in "\x85\u2028\u2029"
+        for char in raw
+    ):
+        raise Problem("the pinned PM scanner template has an unsupported line separator")
+    line = raw.strip(" \t")
+    if line.startswith(("#", ";")):
+        return None, False
+    slashes = len(raw) - len(raw.rstrip("\\"))
+    if slashes > 1 or (line.endswith("\\") and not raw.endswith("\\")):
+        raise Problem("the pinned PM scanner template has an ambiguous continuation")
+    return line, slashes == 1
+
+
 def unit_lines(text):
-    """Read logical systemd lines, including standard continuation lines."""
+    """Accept ordinary lines and single-backslash continuations without guessing."""
     continued = ""
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(("#", ";")):
+    for raw in text.split("\n"):
+        line, continuation = unit_physical_line(raw)
+        if line is None:
+            continue
+        if not line:
+            if continued:
+                raise Problem("the pinned PM scanner template has an ambiguous continuation")
             continue
         continued += line
-        if continued.endswith("\\"):
+        if continuation:
             continued = continued[:-1] + " "
             continue
         yield continued
@@ -87,9 +108,9 @@ def unit_directives(text):
             section = line[1:-1]
             continue
         key, separator, value = line.partition("=")
-        if not section or not separator or not key.strip():
+        if not section or not separator or not key.strip(" \t"):
             raise Problem("the pinned PM scanner template has an invalid directive")
-        fields.setdefault((section, key.strip()), []).append(value.strip())
+        fields.setdefault((section, key.strip(" \t")), []).append(value.strip(" \t"))
     return fields
 
 
@@ -97,7 +118,7 @@ def unit_list(fields, section, key):
     values = []
     for value in fields.get((section, key), []):
         if value:
-            values.append(" ".join(value.split()))
+            values.append(re.sub(r"[ \t]+", " ", value))
         else:
             values.clear()
     return values
@@ -116,7 +137,8 @@ def verify_template_contract(templates):
         unit_value(service, "Service", "Type") != "oneshot"
         or unit_list(service, "Service", "EnvironmentFile") != ["%h/.config/pm-native-stall/home.env"]
         or unit_list(service, "Service", "ExecStart") != [expected_command]
-        or unit_value(timer, "Timer", "Unit", f"{UNIT}.service") != f"{UNIT}.service"
+        # The same-name default is supported; explicit targets must be unambiguous.
+        or timer.get(("Timer", "Unit"), []) not in ([], [f"{UNIT}.service"])
     ):
         raise Problem("the pinned PM scanner templates have an incompatible runtime contract")
 

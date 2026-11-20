@@ -1066,26 +1066,29 @@ native_home_ready() {
 native_error=0
 native_deferred=0
 if [ "$native_stall_home" = true ]; then
+  progress native-scanner
   if native_home_ready; then
-    progress native-scanner
     native_setup || native_error=1
   else
     # The early pass may have deferred while the venv was broken. After repair,
     # withdraw known old policy even when the home profile must remain untouched.
     native_setup --disable-only || native_error=1
-    if native_setup --check; then
+    if native_setup --check >/dev/null; then
       :
     else
       native_rc=$?
       if [ "$native_rc" = 3 ]; then native_deferred=1; else native_error=1; fi
     fi
-    echo "home native scanner: activation deferred until the home profile and services are ready"
+    if [ "$native_deferred" = 1 ]; then
+      echo "home native scanner: activation deferred until the home profile and services are ready"
+    fi
   fi
 fi
 if [ "$native_error" = 1 ]; then
   echo "home native scanner provisioning failed (see its private log)" >&2
 fi
 # -- account diagnostics -----------------------------------------------------------------------
+progress account-diagnostics
 if [ ${#down[@]} -gt 0 ]; then
   die "not running after start: ${down[*]} ($(down_hint "${down[@]}"))"
 fi
@@ -1103,5 +1106,11 @@ if [ ${#signed_out[@]} -gt 0 ]; then
   else home_login="home = the browser window on this desktop, DevTools port $home_port"; fi
   manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} ($home_login; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
 fi
-[ "$native_error" != 1 ] || die "home native scanner provisioning failed (see its private log)"
-[ "$native_deferred" != 1 ] || manual "home native scanner activation is deferred while the home profile or services are unavailable; finish the existing login session or repair home readiness, then run apply again"
+if [ "$native_error" = 1 ]; then
+  progress native-scanner
+  die "home native scanner provisioning failed (see its private log)"
+fi
+if [ "$native_deferred" = 1 ]; then
+  progress native-scanner
+  manual "home native scanner activation is deferred while the home profile or services are unavailable; finish the existing login session or repair home readiness, then run apply again"
+fi
