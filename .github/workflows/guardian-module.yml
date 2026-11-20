@@ -58,14 +58,23 @@ jobs:
         run: |
           set -euo pipefail
           uv run python - "${RUNNER_TEMP}/pm-source" <<'PY'
-          import pathlib, sys, tomllib
+          import pathlib, re, subprocess, sys, tomllib
           from pmlib.chatgpt_control.guardian_client import GuardianClient
           config = tomllib.loads(pathlib.Path("ubuntu/machines/ubuntu-pc/machine.toml").read_text())
-          if config["modules"]["chatgpt-guardian"].get("native_stall_home", False):
-              units = pathlib.Path(sys.argv[1]) / "pmlib/chatgpt_control/units"
-              for kind in ("service", "timer"):
-                  assert (units / f"pm-chatgpt-native-stall.{kind}").is_file(), "Pinned PM source lacks scanner units"
-          print("Verified real GuardianClient import and declared native unit availability")
+          package = pathlib.Path(sys.argv[1])
+          project = tomllib.loads((package / "pyproject.toml").read_text())["project"]
+          version = re.match(r"^(\d+)\.(\d+)(?:\.|$)", project["version"])
+          assert version is not None, "Pinned PM has no recognized version"
+          native_required = tuple(map(int, version.groups())) >= (0, 15)
+          units = package / "pmlib/chatgpt_control/units"
+          candidates = [units / f"pm-chatgpt-native-stall.{kind}" for kind in ("service", "timer")]
+          if native_required or config["modules"]["chatgpt-guardian"].get("native_stall_home", False) or any(p.exists() for p in candidates):
+              subprocess.run([
+                  sys.executable, "ubuntu/modules/chatgpt-guardian/native-stall-setup",
+                  "--disabled", "--verify-templates", "--pm-package", str(package),
+              ], check=True)
+              print("Verified pinned native service/timer runtime contract with native automation disabled")
+          print("Verified real pinned GuardianClient import")
           PY
 
       - name: Run the whole Guardian module fixture suite

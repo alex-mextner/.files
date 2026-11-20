@@ -31,6 +31,10 @@ class Problem(Exception):
     """A sanitized diagnostic: never include raw policy or subprocess output."""
 
 
+class Unavailable(Problem):
+    """A prerequisite which the ordinary installer can restore."""
+
+
 class Log:
     def __init__(self):
         directory = Path(tempfile.mkdtemp(prefix="chatgpt-guardian-native-", dir="/tmp"))
@@ -57,12 +61,73 @@ class Log:
         print(f"home native scanner result: {code}; log: {self.path}", file=sys.stderr)
 
 
+def unit_lines(text):
+    """Read logical systemd lines, including standard continuation lines."""
+    continued = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        continued += line
+        if continued.endswith("\\"):
+            continued = continued[:-1] + " "
+            continue
+        yield continued
+        continued = ""
+    if continued:
+        raise Problem("the pinned PM scanner template has an incomplete continuation")
+
+
+def unit_directives(text):
+    """Keep repeated directives; list resets are interpreted only for checked keys."""
+    section = ""
+    fields = {}
+    for line in unit_lines(text):
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        key, separator, value = line.partition("=")
+        if not section or not separator or not key.strip():
+            raise Problem("the pinned PM scanner template has an invalid directive")
+        fields.setdefault((section, key.strip()), []).append(value.strip())
+    return fields
+
+
+def unit_list(fields, section, key):
+    values = []
+    for value in fields.get((section, key), []):
+        if value:
+            values.append(" ".join(value.split()))
+        else:
+            values.clear()
+    return values
+
+
+def unit_value(fields, section, key, default=""):
+    values = fields.get((section, key), [])
+    return (values[-1] or default) if values else default
+
+
+def verify_template_contract(templates):
+    service = unit_directives(templates["service"])
+    timer = unit_directives(templates["timer"])
+    expected_command = "%h/.local/bin/pm chatgpt native-stall once --workspace home --apply --json"
+    if (
+        unit_value(service, "Service", "Type") != "oneshot"
+        or unit_list(service, "Service", "EnvironmentFile") != ["%h/.config/pm-native-stall/home.env"]
+        or unit_list(service, "Service", "ExecStart") != [expected_command]
+        or unit_value(timer, "Timer", "Unit", f"{UNIT}.service") != f"{UNIT}.service"
+    ):
+        raise Problem("the pinned PM scanner templates have an incompatible runtime contract")
+
+
 class Scanner:
     def __init__(self, home, package, enabled, mode, log):
         self.home, self.package = home, package
         self.enabled, self.mode, self.log = enabled, mode, log
         self.units = home / ".config/systemd/user"
         self.env_file = home / ".config/pm-native-stall/home.env"
+        self.pending_file = self.env_file.parent / "setup-pending.json"
         self.guardian = home / ".local/bin/chatgpt-guardian"
         self.deployment = home / ".config/agent-tools/chatgpt-guardian/home.json"
 
@@ -87,12 +152,17 @@ class Scanner:
     def principal(self):
         # `status` may initialize a missing store. Provisioning never creates one.
         if not self.deployment.is_file():
-            raise Problem("Guardian home deployment is not initialized")
+            raise Unavailable("Guardian home deployment is not initialized")
         if not self.guardian.is_file() or not os.access(self.guardian, os.X_OK):
-            raise Problem("Guardian is not installed yet")
-        result = self.call("read-home-policy", [str(self.guardian), "--workspace", "home", "status"])
-        if result.returncode or len(result.stdout) > 2 * 1024 * 1024:
-            raise Problem("Guardian home policy is unavailable")
+            raise Unavailable("Guardian is not installed yet")
+        try:
+            result = self.call("read-home-policy", [str(self.guardian), "--workspace", "home", "status"])
+        except Problem:
+            raise Unavailable("Guardian home policy is unavailable") from None
+        if result.returncode:
+            raise Unavailable("Guardian home policy is unavailable")
+        if len(result.stdout) > 2 * 1024 * 1024:
+            raise Problem("Guardian home policy exceeds its size bound")
         try:
             controls = json.loads(result.stdout)["controls"]
             if not isinstance(controls, dict):
@@ -126,6 +196,7 @@ class Scanner:
             if not path.is_file():
                 raise Problem("the pinned PM source does not ship native scanner units")
             result[kind] = HEADER + self.text(path)
+        verify_template_contract(result)
         return result
 
     def managed(self):
@@ -158,6 +229,7 @@ class Scanner:
 
     def validate_private(self):
         self.validate_target(self.env_file)
+        self.validate_target(self.pending_file)
         parent = self.env_file.parent
         if parent.is_symlink() or (
             parent.exists() and (not parent.is_dir() or parent.stat().st_uid != os.getuid())
@@ -184,9 +256,61 @@ class Scanner:
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, path)
+            self.sync_directory(path.parent)
         finally:
             Path(temporary).unlink(missing_ok=True)
         self.log.record("write", target="private-environment" if private else path.name, mode=oct(mode))
+
+    @staticmethod
+    def sync_directory(path):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def pending_actions(self):
+        if not self.pending_file.exists():
+            return {"reload": False, "restart_timer": False}
+        try:
+            value = json.loads(self.text(self.pending_file))
+            if not isinstance(value, dict) or set(value) != {"reload", "restart_timer"}:
+                raise ValueError
+            if any(type(item) is not bool for item in value.values()):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise Problem("scanner setup pending actions are unrecognized") from None
+        return value
+
+    def manager_needs_reload(self):
+        if not all((self.units / f"{UNIT}.{kind}").is_file() for kind in ("service", "timer")):
+            return False, False  # missing files already make the desired definition drift
+        result = self.sc(
+            "show", "-p", "NeedDaemonReload", "--value",
+            f"{UNIT}.service", f"{UNIT}.timer",
+        )
+        values = [value for value in result.splitlines() if value]
+        if len(values) != 2 or any(value not in ("yes", "no") for value in values):
+            raise Problem("the user manager could not report pending scanner definitions")
+        return "yes" in values, values[1] == "yes"
+
+    def apply_units(self, templates, drift, environment, env_drift, enabled, active, actions):
+        # Intent precedes file replacement, so a crash or failed reload/restart
+        # cannot be hidden by matching on-disk files on the next apply.
+        if any(actions.values()):
+            self.write(self.pending_file, json.dumps(actions) + "\n", 0o600, private=True)
+        for kind in drift:
+            self.write(self.units / f"{UNIT}.{kind}", templates[kind], 0o644)
+        if env_drift:
+            self.write(self.env_file, environment, 0o600, private=True)
+        if actions["reload"]:
+            self.sc("daemon-reload")
+        if not enabled or not active:
+            self.sc("enable", "--now", f"{UNIT}.timer")
+        if actions["restart_timer"] and active:
+            self.sc("restart", f"{UNIT}.timer")
+        self.pending_file.unlink(missing_ok=True)
+        self.sync_directory(self.pending_file.parent)
 
     def disable(self):
         # Disabling never depends on release files, login state or private env contents.
@@ -235,6 +359,10 @@ class Scanner:
         return 0
 
     def run(self):
+        if self.mode == "verify-templates":
+            self.templates()
+            print("home native scanner: pinned PM template contract verified")
+            return 0
         if self.mode == "disable-only":
             return self.disable_only()
         if not self.enabled and not self.managed():
@@ -277,22 +405,19 @@ class Scanner:
             or stat.S_IMODE(self.env_file.parent.stat().st_mode) != 0o700
         )
         timer_drift = not enabled or not active
+        pending = self.pending_actions()
+        reload_needed, timer_reload = self.manager_needs_reload()
+        actions = {
+            "reload": bool(drift) or reload_needed or pending["reload"],
+            "restart_timer": (("timer" in drift or timer_reload) and active) or pending["restart_timer"],
+        }
         if self.mode == "check":
-            if drift or env_drift or timer_drift:
+            if drift or env_drift or timer_drift or any(actions.values()) or self.pending_file.exists():
                 print("drift: home native scanner units, private environment or timer state differ")
                 return 3
             return 0
 
-        for kind in drift:
-            self.write(self.units / f"{UNIT}.{kind}", templates[kind], 0o644)
-        if env_drift:
-            self.write(self.env_file, environment, 0o600, private=True)
-        if drift:
-            self.sc("daemon-reload")
-        if not enabled or not active:
-            self.sc("enable", "--now", f"{UNIT}.timer")
-        if "timer" in drift and active:
-            self.sc("restart", f"{UNIT}.timer")
+        self.apply_units(templates, drift, environment, env_drift, enabled, active, actions)
         print("home native scanner: installed; timer enabled for existing Guardian consent")
         return 0
 
@@ -306,6 +431,7 @@ def main():
         modes.add_argument("--plan", action="store_const", const="plan", dest="mode")
         modes.add_argument("--check", action="store_const", const="check", dest="mode")
         modes.add_argument("--disable-only", action="store_const", const="disable-only", dest="mode")
+        modes.add_argument("--verify-templates", action="store_const", const="verify-templates", dest="mode")
         options = parser.add_mutually_exclusive_group(required=True)
         options.add_argument("--enabled", action="store_true", dest="enabled")
         options.add_argument("--disabled", action="store_false", dest="enabled")
@@ -317,6 +443,12 @@ def main():
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
         raise
+    except Unavailable as exc:
+        code = 3 if args.mode == "check" else 1
+        log.record("unavailable", reason=str(exc))
+        print(("drift: " if code == 3 else "home native scanner: ") + str(exc),
+              file=sys.stdout if code == 3 else sys.stderr)
+        return code
     except Problem as exc:
         log.record("refused", reason=str(exc))
         print("home native scanner: " + str(exc), file=sys.stderr)

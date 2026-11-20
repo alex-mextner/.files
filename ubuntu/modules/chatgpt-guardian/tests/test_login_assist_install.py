@@ -13,7 +13,7 @@ from test_install import MODULE, fake_bin, home, run  # noqa: F401  (fixtures)
 
 SRC = MODULE / "units/login-assist"
 NAMES = ["pm-chatgpt-login-assist@.service", "pm-chatgpt-login-assist@.timer"]
-LOGIN_ENABLE = between("# the login helper timers go on last", "if [ ${#down[@]} -gt 0 ]")
+LOGIN_ENABLE = between("# the login helper timers go on last", "# -- home native scanner activation")
 INSTANCES = ["pm-chatgpt-login-assist@home", "pm-chatgpt-login-assist@glide.vc"]
 
 

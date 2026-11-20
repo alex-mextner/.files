@@ -126,7 +126,8 @@ finish_log() {
   printf '%s stage=complete mode=%s returncode=%s elapsed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$mode" "$rc" "$((SECONDS-log_started))" >&3
   printf 'chatgpt-guardian result: %s; log: %s\n' "$rc" "$log_file" >&2
   if [ -n "$terminal_message" ]; then
-    printf '%s\n' "$terminal_message" >&3
+    # A user-supplied repository URL can contain credentials. Retain only the
+    # stage/exit status, not arbitrary configuration-bearing diagnostic text.
     printf '%s\n' "$terminal_message" >&2
   fi
   exec 3>&-
@@ -671,13 +672,6 @@ if [ "$mode" = check ]; then
   if control_active && ! control_ok; then problems+=("the control pass in $control_dir (${control_files[*]}, bin-quiet stubs) or $control_unit.service/.timer is missing or differs"); fi
   if [ "$audit_timers" = true ] && ! audit_ok; then problems+=("a pm-chatgpt-audit-<account> service/timer is missing or differs, or $here/audit-gate is not executable"); fi
   if [ "$login_assist" = true ] && ! login_assist_ok; then problems+=("pm-chatgpt-login-assist@.service/.timer in $units_dir is missing or differs"); fi
-  if native_detail=$(native_setup --check); then
-    : # read-only check succeeded
-  else
-    native_rc=$?
-    [ "$native_rc" = 3 ] || die "home native scanner cannot be checked (see its private log)"
-    problems+=("${native_detail:-home native scanner configuration differs}")
-  fi
   while IFS= read -r f; do problems+=("stale drop-in $f"); done < <(stale_list)
   if sc show -p Id --value default.target >/dev/null 2>&1; then
     for n in "${unit_names[@]}"; do
@@ -703,8 +697,15 @@ if [ "$mode" = check ]; then
       if home_browser_on_desktop; then problems+=("$home_browser_unit.service still runs on the desktop display, not on :112: restart it"); fi
     fi
   else
-    echo "systemctl --user is unavailable (no user bus): the check cannot decide" >&2
-    exit 1
+    die "systemctl --user is unavailable (no user bus): the check cannot decide"
+  fi
+  if native_detail=$(native_setup --check); then
+    : # read-only check succeeded
+  else
+    native_rc=$?
+    [ "$native_rc" = 3 ] || die "home native scanner cannot be checked (see its private log)"
+    native_detail=${native_detail#drift: }
+    problems+=("${native_detail:-home native scanner configuration differs}")
   fi
   if [ ${#problems[@]} -gt 0 ]; then
     printf 'drift: %s\n' "${problems[@]}"
@@ -1049,16 +1050,50 @@ if [ "$login_assist" = true ]; then
     timer_on "$n" || sc enable --now "$n.timer" >/dev/null || echo "warning: $n.timer failed to start" >&2
   done
 fi
+# -- home native scanner activation ------------------------------------------------------------
+# Every home gate must pass; an unrelated glide login problem cannot strand the home timer.
+native_home_ready() {
+  [ "$desktop_browser" != 1 ] || return 1
+  local item
+  for item in "${signed_out[@]}" "${unreachable[@]}" "${login_held[@]}"; do
+    [ "$item" != home ] || return 1
+  done
+  for item in "${down[@]}"; do
+    case "$item" in chatgpt-guardian-home|chatgpt-guardian-home-*) return 1 ;; esac
+  done
+  is_active chatgpt-guardian-home && is_active chatgpt-guardian-home-browser && is_active chatgpt-guardian-home-observer
+}
+native_error=0
+native_deferred=0
+if [ "$native_stall_home" = true ]; then
+  if native_home_ready; then
+    progress native-scanner
+    native_setup || native_error=1
+  else
+    # The early pass may have deferred while the venv was broken. After repair,
+    # withdraw known old policy even when the home profile must remain untouched.
+    native_setup --disable-only || native_error=1
+    if native_setup --check; then
+      :
+    else
+      native_rc=$?
+      if [ "$native_rc" = 3 ]; then native_deferred=1; else native_error=1; fi
+    fi
+    echo "home native scanner: activation deferred until the home profile and services are ready"
+  fi
+fi
+if [ "$native_error" = 1 ]; then
+  echo "home native scanner provisioning failed (see its private log)" >&2
+fi
+# -- account diagnostics -----------------------------------------------------------------------
 if [ ${#down[@]} -gt 0 ]; then
-  echo "not running after start: ${down[*]} ($(down_hint "${down[@]}"))" >&2
-  exit 1
+  die "not running after start: ${down[*]} ($(down_hint "${down[@]}"))"
 fi
 if [ ${#login_held[@]} -gt 0 ]; then
   echo "login session in progress for ${login_held[*]} (relogin / profile-sync / the login helper holds the profile): its units, DevTools port and sign-in were left alone"
 fi
 if [ ${#unreachable[@]} -gt 0 ]; then
-  echo "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)" >&2
-  exit 1
+  die "the DevTools port of ${unreachable[*]} did not answer: its browser is not up (journalctl --user -u chatgpt-guardian-<workspace>-browser)"
 fi
 if [ "$desktop_browser" = 1 ]; then
   manual "the home browser still runs on the desktop display, not on the private display :112, so the home guardian was not started or, when it was running, stopped (its --private-display flag would claim a window that is shared with this desktop): restart $home_browser_unit.service (its window closes, the profile and its tabs are restored), then run apply again"
@@ -1068,7 +1103,5 @@ if [ ${#signed_out[@]} -gt 0 ]; then
   else home_login="home = the browser window on this desktop, DevTools port $home_port"; fi
   manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} ($home_login; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
 fi
-
-# Scanner activation comes after the normal profile and login gates. This never grants consent.
-progress native-scanner
-native_setup || die "home native scanner provisioning failed (see its private log)"
+[ "$native_error" != 1 ] || die "home native scanner provisioning failed (see its private log)"
+[ "$native_deferred" != 1 ] || manual "home native scanner activation is deferred while the home profile or services are unavailable; finish the existing login session or repair home readiness, then run apply again"

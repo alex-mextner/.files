@@ -37,7 +37,7 @@ class NativeScannerInstall(unittest.TestCase):
             "EnvironmentFile=%h/.config/pm-native-stall/home.env\n"
             "ExecStart=%h/.local/bin/pm chatgpt native-stall once --workspace home --apply --json\n"
         )
-        self.timer = "[Timer]\nOnUnitInactiveSec=1min\n[Install]\nWantedBy=timers.target\n"
+        self.timer = "[Timer]\nOnUnitInactiveSec=1min\nUnit=pm-chatgpt-native-stall.service\n[Install]\nWantedBy=timers.target\n"
         (self.templates / f"{UNIT}.service").write_text(self.service, encoding="utf-8")
         (self.templates / f"{UNIT}.timer").write_text(self.timer, encoding="utf-8")
         self.deployment = self.home / ".config/agent-tools/chatgpt-guardian/home.json"
@@ -61,15 +61,25 @@ with open(os.environ["DOT237_CALLS"], "a") as log:
     log.write(json.dumps(["systemctl", *args]) + "\\n")
 if not args or args.pop(0) != "--user":
     sys.exit(91)
+path = Path(os.environ["DOT237_MANAGER"])
+state = json.loads(path.read_text())
 if args == ["daemon-reload"]:
+    if state.pop("fail_reload_once", False):
+        path.write_text(json.dumps(state))
+        sys.exit(1)
+    state.pop("needs_reload", None)
+    state.pop("timer_needs_reload", None)
+    path.write_text(json.dumps(state))
     sys.exit(0)
 if args == ["show", "-p", "Id", "--value", "default.target"]:
     print("default.target")
     sys.exit(0)
+if args == ["show", "-p", "NeedDaemonReload", "--value", "pm-chatgpt-native-stall.service", "pm-chatgpt-native-stall.timer"]:
+    print("yes" if state.get("needs_reload") else "no")
+    print("yes" if state.get("timer_needs_reload") else "no")
+    sys.exit(0)
 if not args or args[-1] != "pm-chatgpt-native-stall.timer":
     sys.exit(92)
-path = Path(os.environ["DOT237_MANAGER"])
-state = json.loads(path.read_text())
 command = args[0]
 if command == "is-enabled":
     if not (Path(os.environ["HOME"]) / ".config/systemd/user/pm-chatgpt-native-stall.timer").exists():
@@ -85,6 +95,9 @@ if args == ["enable", "--now", "pm-chatgpt-native-stall.timer"]:
 elif args == ["disable", "--now", "pm-chatgpt-native-stall.timer"]:
     state.update(active=False, enabled=False)
 elif args == ["restart", "pm-chatgpt-native-stall.timer"]:
+    if state.pop("fail_restart_once", False):
+        path.write_text(json.dumps(state))
+        sys.exit(1)
     state["active"] = True
 else:
     sys.exit(93)
@@ -348,6 +361,312 @@ path.write_text(json.dumps(state))
         position = len(self.calls_after())
         self.assertEqual(self.setup("--disable-only").returncode, 0)
         self.assertEqual(self.mutations(position), [])
+
+    def test_missing_or_failed_guardian_is_repairable_check_drift(self):
+        guardian = self.home / ".local/bin/chatgpt-guardian"
+        working = guardian.read_text(encoding="utf-8")
+        for failure in ("missing", "failed"):
+            with self.subTest(failure=failure):
+                if failure == "missing":
+                    guardian.unlink()
+                else:
+                    self.executable(guardian, "import sys\nsys.exit(1)\n")
+                result = self.install("--check")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("drift: Guardian", result.stdout)
+                self.assertNotIn("drift: drift:", result.stdout)
+                self.assertEqual(self.mutations(), [])
+                guardian.write_text(working, encoding="utf-8")
+                guardian.chmod(0o755)
+
+    def test_incompatible_real_template_contract_is_refused_before_writes(self):
+        for kind, original, changed in (
+            ("service", self.service, self.service.replace("home.env", "other.env")),
+            ("service", self.service, self.service.replace("--workspace home", "--workspace glide")),
+            ("timer", self.timer, self.timer.replace("native-stall.service", "other.service")),
+        ):
+            with self.subTest(kind=kind, contract=changed):
+                template = self.templates / f"{UNIT}.{kind}"
+                template.write_text(changed, encoding="utf-8")
+                result = self.setup()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("incompatible runtime contract", result.stderr)
+                self.assertFalse((self.home / ".config/pm-native-stall/home.env").exists())
+                self.assertEqual(self.mutations(), [])
+                template.write_text(original, encoding="utf-8")
+
+    def test_failed_reload_is_retried_after_the_files_already_match(self):
+        self.assertEqual(self.setup().returncode, 0)
+        position = len(self.calls_after())
+        (self.templates / f"{UNIT}.service").write_text(self.service + "Nice=10\n", encoding="utf-8")
+        self.manager.write_text(json.dumps({
+            "active": True, "enabled": True, "fail_reload_once": True,
+        }), encoding="utf-8")
+        self.assertEqual(self.setup().returncode, 1)
+        pending = self.home / ".config/pm-native-stall/setup-pending.json"
+        self.assertTrue(pending.is_file())
+        self.assertEqual(self.setup("--check").returncode, 3)
+        self.assertEqual(self.setup().returncode, 0)
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.mutations(position), [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "daemon-reload"],
+        ])
+
+    def test_failed_timer_restart_is_retried_after_the_files_already_match(self):
+        self.assertEqual(self.setup().returncode, 0)
+        position = len(self.calls_after())
+        (self.templates / f"{UNIT}.timer").write_text(
+            self.timer.replace("1min", "2min"), encoding="utf-8",
+        )
+        self.manager.write_text(json.dumps({
+            "active": True, "enabled": True, "fail_restart_once": True,
+        }), encoding="utf-8")
+        self.assertEqual(self.setup().returncode, 1)
+        pending = self.home / ".config/pm-native-stall/setup-pending.json"
+        self.assertTrue(pending.is_file())
+        self.assertEqual(self.setup().returncode, 0)
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.mutations(position), [
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "restart", f"{UNIT}.timer"],
+            ["systemctl", "--user", "daemon-reload"],
+            ["systemctl", "--user", "restart", f"{UNIT}.timer"],
+        ])
+
+    def test_manager_reload_drift_is_repaired_without_rewriting_units(self):
+        self.assertEqual(self.setup().returncode, 0)
+        unit = self.home / f".config/systemd/user/{UNIT}.service"
+        before = unit.stat().st_mtime_ns
+        for flag in ("needs_reload", "timer_needs_reload"):
+            with self.subTest(flag=flag):
+                position = len(self.calls_after())
+                self.manager.write_text(json.dumps({
+                    "active": True, "enabled": True, flag: True,
+                }), encoding="utf-8")
+                self.assertEqual(self.setup("--check").returncode, 3)
+                self.assertEqual(self.setup().returncode, 0)
+                self.assertEqual(unit.stat().st_mtime_ns, before)
+                expected = [["systemctl", "--user", "daemon-reload"]]
+                if flag == "timer_needs_reload":
+                    expected.append(["systemctl", "--user", "restart", f"{UNIT}.timer"])
+                self.assertEqual(self.mutations(position), expected)
+
+    def test_terminal_configuration_is_not_copied_to_retained_logs(self):
+        marker = "private-fixture-path-marker"
+        broken = self.root / marker
+        broken.mkdir()
+        result = self.install(dir=str(broken), package=str(broken))
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn(marker, result.stderr.splitlines()[-1])
+        logs = re.findall(
+            r"log: (/tmp/chatgpt-guardian-(?:native|install)-[^\s]+/run.log)", result.stderr,
+        )
+        self.assertTrue(logs)
+        for raw in logs:
+            self.assertNotIn(marker, Path(raw).read_text(encoding="utf-8"))
+
+    def test_real_home_activation_is_independent_of_glide_and_preserves_home_gates(self):
+        script = (MODULE / "install.sh").read_text(encoding="utf-8")
+        section = script.split(
+            "# -- home native scanner activation", 1,
+        )[1].split("\n", 1)[1].split("# -- account diagnostics", 1)[0]
+        harness = r"""
+set -Eeuo pipefail
+desktop_browser=0
+native_stall_home=true
+signed_out=(glide)
+unreachable=(glide)
+login_held=(glide)
+down=(chatgpt-guardian-glide-browser)
+case "$DOT237_CASE" in
+  signed-out) signed_out+=(home) ;;
+  unreachable) unreachable+=(home) ;;
+  login-held) login_held+=(home) ;;
+  desktop) desktop_browser=1 ;;
+  unit-down) down+=(chatgpt-guardian-home-browser) ;;
+  disabled) native_stall_home=false ;;
+esac
+progress() { :; }
+die() { printf '%s\n' "$1" >&2; exit 1; }
+is_active() {
+  [ "$DOT237_CASE" != inactive ] || [ "$1" != chatgpt-guardian-home-observer ]
+}
+native_setup() {
+  "$DOT237_PYTHON" -B "$DOT237_HELPER" --pm-package "$DOT237_PM" --enabled "$@"
+}
+"""
+        for case in (
+            "signed-out", "unreachable", "login-held", "desktop", "unit-down",
+            "inactive", "disabled", "glide-failure",
+        ):
+            with self.subTest(case=case):
+                position = len(self.calls_after())
+                result = subprocess.run(
+                    ["bash", "-c", harness + section],
+                    env={
+                        **self.env, "DOT237_CASE": case, "DOT237_PYTHON": sys.executable,
+                        "DOT237_HELPER": str(MODULE / "native-stall-setup"),
+                        "DOT237_PM": str(self.pm),
+                    },
+                    capture_output=True, text=True, timeout=20, check=False,
+                )
+                self.clean_logs(result)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if case == "glide-failure":
+                    self.assertEqual(json.loads(self.manager.read_text()), {
+                        "active": True, "enabled": True,
+                    })
+                    self.assertEqual(self.mutations(position), [
+                        ["systemctl", "--user", "daemon-reload"],
+                        ["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"],
+                    ])
+                else:
+                    self.assertEqual(self.mutations(position), [])
+                    self.assertFalse((self.home / ".config/pm-native-stall/home.env").exists())
+                    self.assertFalse(json.loads(self.manager.read_text())["active"])
+
+    def activation_tail(self, *, held=True, glide_signed_out=False):
+        script = (MODULE / "install.sh").read_text(encoding="utf-8")
+        tail = script.split("# -- home native scanner activation", 1)[1].split("\n", 1)[1]
+        harness = r"""
+set -Eeuo pipefail
+desktop_browser=0
+native_stall_home=true
+signed_out=()
+unreachable=()
+login_held=()
+down=()
+[ "$DOT237_HELD" != 1 ] || login_held+=(home)
+[ "$DOT237_GLIDE_OUT" != 1 ] || signed_out+=(glide)
+home_private_display=true
+home_port=9226
+glide_port=9223
+home_browser_unit=chatgpt-guardian-home-browser
+progress() { :; }
+die() { printf '%s\n' "$1" >&2; exit 1; }
+manual() { printf 'needs manual: %s\n' "$1" >&2; exit 10; }
+is_active() { return 0; }
+native_setup() {
+  "$DOT237_PYTHON" -B "$DOT237_HELPER" --pm-package "$DOT237_PM" --enabled "$@"
+}
+"""
+        result = subprocess.run(
+            ["bash", "-c", harness + tail],
+            env={
+                **self.env, "DOT237_HELD": str(int(held)),
+                "DOT237_GLIDE_OUT": str(int(glide_signed_out)),
+                "DOT237_PYTHON": sys.executable,
+                "DOT237_HELPER": str(MODULE / "native-stall-setup"),
+                "DOT237_PM": str(self.pm),
+            },
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.clean_logs(result)
+        return result
+
+    def test_new_scanner_deferred_by_login_returns_manual_instead_of_success(self):
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn("needs manual:", result.stderr.splitlines()[-1])
+        self.assertFalse((self.home / ".config/pm-native-stall/home.env").exists())
+        self.assertEqual(self.mutations(), [])
+
+    def test_post_repair_withdrawal_runs_even_while_home_login_is_held(self):
+        self.assertEqual(self.setup().returncode, 0)
+        env = self.home / ".config/pm-native-stall/home.env"
+        previous = env.read_bytes()
+        self.set_policy({})
+        position = len(self.calls_after())
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(env.read_bytes(), previous)
+        self.assertEqual(self.mutations(position), [
+            ["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"],
+        ])
+        self.assertFalse(json.loads(self.manager.read_text())["active"])
+
+    def test_changed_principal_withdraws_old_timer_and_reports_deferred_drift(self):
+        self.assertEqual(self.setup().returncode, 0)
+        env = self.home / ".config/pm-native-stall/home.env"
+        previous = env.read_bytes()
+        self.set_policy({"native-stall:principal": "replacement@example.test"})
+        position = len(self.calls_after())
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertEqual(env.read_bytes(), previous)
+        self.assertEqual(self.mutations(position), [
+            ["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"],
+        ])
+        self.assertFalse(json.loads(self.manager.read_text())["active"])
+
+    def test_unknown_post_repair_policy_is_an_error_without_timer_mutation(self):
+        self.assertEqual(self.setup().returncode, 0)
+        self.policy.write_text("{broken", encoding="utf-8")
+        position = len(self.calls_after())
+        result = self.activation_tail()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.mutations(position), [])
+        self.assertTrue(json.loads(self.manager.read_text())["active"])
+
+    def test_native_failure_preserves_the_other_account_diagnostic(self):
+        (self.templates / f"{UNIT}.service").write_text(
+            self.service.replace("home.env", "other.env"), encoding="utf-8",
+        )
+        result = self.activation_tail(held=False, glide_signed_out=True)
+        self.assertEqual(result.returncode, 10, result.stderr)
+        self.assertIn("incompatible runtime contract", result.stderr)
+        self.assertIn("sign in to ChatGPT", result.stderr.splitlines()[-1])
+        self.assertIn("glide", result.stderr.splitlines()[-1])
+        self.assertEqual(self.mutations(), [])
+
+    def test_valid_systemd_template_forms_preserve_the_exact_runtime_contract(self):
+        variants = (
+            ("timer", self.timer, self.timer.replace(f"Unit={UNIT}.service\n", "")),
+            ("service", self.service, self.service + "Environment=ONE=1\nEnvironment=TWO=2\n"),
+            ("service", self.service, self.service.replace(
+                " once --workspace", " once " + chr(92) + "\n    --workspace",
+            )),
+            ("service", self.service, self.service.replace(
+                "ExecStart=", "ExecStart=/old-command\nExecStart=\nExecStart=", 1,
+            )),
+        )
+        for kind, original, changed in variants:
+            with self.subTest(kind=kind, template=changed):
+                template = self.templates / f"{UNIT}.{kind}"
+                template.write_text(changed, encoding="utf-8")
+                result = self.setup("--check")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertNotIn("incompatible runtime contract", result.stderr)
+                self.assertEqual(self.mutations(), [])
+                template.write_text(original, encoding="utf-8")
+
+    def test_additional_effective_commands_or_environment_files_are_refused(self):
+        for extra in ("ExecStart=/extra-command", "EnvironmentFile=/other.env"):
+            with self.subTest(extra=extra):
+                (self.templates / f"{UNIT}.service").write_text(
+                    self.service.replace("[Service]\n", "[Service]\n" + extra + "\n"),
+                    encoding="utf-8",
+                )
+                result = self.setup("--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("incompatible runtime contract", result.stderr)
+                self.assertEqual(self.mutations(), [])
+
+    def test_missing_pinned_templates_are_an_error_instead_of_repair_drift(self):
+        (self.templates / f"{UNIT}.timer").unlink()
+        result = self.setup("--check")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not ship native scanner units", result.stderr)
+        self.assertEqual(self.mutations(), [])
+
+    def test_explicit_template_verification_needs_no_home_state_or_policy(self):
+        self.deployment.unlink()
+        (self.home / ".local/bin/chatgpt-guardian").unlink()
+        result = self.setup("--verify-templates", enabled=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls_after(), [])
+        self.assertFalse((self.home / ".config/pm-native-stall/home.env").exists())
 
     def test_whole_check_does_not_open_an_uninitialized_home_store(self):
         self.deployment.unlink()
