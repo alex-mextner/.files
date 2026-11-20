@@ -64,9 +64,6 @@ GATES=(
   "hsw-heartbeat.service xp"
   "hsw-observer-agent.service xp"
   "hsw-review.service xp"
-  "router-discover.service xp"
-  "router-inventory-update.service xp"
-  "router-scan.service xp"
   "snap-orca-sync.service xp"
   "tmux-boot.service xp work"
 )

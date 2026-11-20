@@ -702,7 +702,7 @@ def network_alias(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # The router (Ubee) hangs when polled often. It is polled ONLY by the hourly
-# router-inventory-update.timer and by this endpoint (the card's "Обновить" button / the
+# router-inventory-update.timer (runs on odroid, not this PC) and by this endpoint (the card's "Обновить" button / the
 # button.network_devices_update entity). Requests are serialized, and a poll younger than
 # NETWORK_UPDATE_MIN_AGE seconds is reused instead of hitting the router again.
 NETWORK_UPDATE_MIN_AGE = float(os.environ.get("NETWORK_UPDATE_MIN_AGE", "60"))
