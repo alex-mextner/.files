@@ -23,8 +23,8 @@ enabled = true
 [modules.chatgpt-guardian]
 # The promoted guardian release: agenttools-chatgpt 0.3.41, agent-tools tree bcd5919a (main 8d2be78: PR 1189 a 401/403 of an owned tab opens a 60 s recovery window instead of latching 'human challenge', #1187/#1077); re-promote the main-branch build for the next release, never an older one.
 package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/bcd5919a3a53efe0514ff5737cf34749c14ab035/lib/agenttools_chatgpt"
-# pm CLI (hyper-pm) installed into the guardian venv: 0.13.3 (commit 1513426, pm-cli PR 96: login-assist judges the home account by the CHATGPT_RELOGIN_DOMAIN of its Guardian unit, pm-cli#95; PR 88 and 87 before) = 0.10.3 (single-account audit merge) + `pm chatgpt login-assist` (pm-cli ticket 75).
-pm_package = "/home/ultra/.local/share/pm-releases/151342668404f9f06107af109c37bf1eafface6d"
+# pm CLI (hyper-pm) installed into the guardian venv: 0.14.2 (commit d7cb292, pm-cli PR 109: the audit names why a chat was not read, retries transient reads, waits out one 429, recovers from one classifier failure and keeps out of the Guardian patrol's way, pm-cli#103) = 0.13.3 + audit resilience.
+pm_package = "/home/ultra/.local/share/pm-releases/d7cb2921c1048ca798d90d9abbb8cc2e386a3eaf"
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).
