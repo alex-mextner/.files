@@ -30,7 +30,7 @@ FAKE_SSH = r"""#!/usr/bin/env bash
 dump=0
 while [ "${1#-}" != "$1" ]; do case "$1" in -o) shift 2 ;; -G) dump=1; shift ;; *) shift ;; esac; done
 host=$1; shift
-if [ "$dump" = 1 ]; then cat "$FAKE_BASE/ssh-G-$host" 2>/dev/null; exit 0; fi
+if [ "$dump" = 1 ]; then printf '%s\n' "remotecommand none" "clearallforwardings no" "exitonforwardfailure no"; cat "$FAKE_BASE/ssh-G-$host" 2>/dev/null; exit 0; fi
 printf '%s\t%s\n' "$host" "$*" >> "$FAKE_BASE/ssh.log"
 [ -d "$FAKE_BASE/consumers/$host" ] || { echo "ssh: Could not resolve hostname $host" >&2; exit 255; }
 grep -qxF "$host" "$FAKE_BASE/ssh-fail-config" 2>/dev/null && [[ "$*" == *" config "* ]] && exit 255
@@ -172,7 +172,7 @@ def config(home: pathlib.Path) -> dict:
 
 
 def changes(calls: list[str]) -> list[str]:
-    return [c for c in calls if any(v in c for v in (" enable", " reenable", " stop", " restart"))]
+    return [c for c in calls if any(v in c for v in (" enable", " reenable", " disable", " stop", " restart"))]
 
 
 def test_configures_consumer_and_never_puts_bearer_in_a_command_line(env):
@@ -476,11 +476,12 @@ def test_regular_unit_file_is_refused(env):
     assert env.ssh_log() == ""
 
 
-def test_alias_with_its_own_forward_is_skipped_before_anything_changes(env):
+@pytest.mark.parametrize("alias_line", ["remoteforward 18765 [127.0.0.1]:18765", "remotecommand tmux attach"])
+def test_alias_with_its_own_forward_is_skipped_before_anything_changes(env, alias_line):
     clvm = env.consumer("clvm")
     (env.unit_dir / "clvm-auth-broker-tunnel.service").symlink_to(env.base / "old-checkout/clvm-auth-broker-tunnel.service")
     env.pc_state("is-active clvm-auth-broker-tunnel.service")
-    (env.base / "ssh-G-clvm").write_text("hostname 192.0.2.1\nremoteforward 18765 [127.0.0.1]:18765\n")
+    (env.base / "ssh-G-clvm").write_text(f"hostname 192.0.2.1\n{alias_line}\n")
     result = env.run("clvm")
     assert result.returncode == 1
     assert "skip clvm: the ssh alias clvm carries a forward or RemoteCommand" in result.stdout

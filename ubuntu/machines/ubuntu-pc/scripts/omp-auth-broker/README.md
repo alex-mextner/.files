@@ -40,7 +40,11 @@ login for the `ultra` account with omp yet.
 3. Make sure no consumer runs a broker of its own on port 18765, and no machine still runs the old
    `clvm-auth-broker-tunnel.service`: run `systemctl --user disable --now
    omp-auth-broker.service clvm-auth-broker-tunnel.service` on each of them. The script refuses a
-   consumer where either is active or enabled.
+   consumer where either is active or enabled. Both units used to ship in the shared profile, so a
+   machine that applied it keeps two links to files that no longer exist; remove them with
+   `rm -f ~/.config/systemd/user/omp-auth-broker.service
+   ~/.config/systemd/user/clvm-auth-broker-tunnel.service` (not on this PC) and run
+   `systemctl --user daemon-reload`.
 4. Run `./install.sh --dry-run clvm home`, read the plan, then `./install.sh clvm home`. Run it
    from `~/.files`, not from a worktree: the unit links point into the checkout the script runs
    from (a rerun from `~/.files` moves them back and says so).

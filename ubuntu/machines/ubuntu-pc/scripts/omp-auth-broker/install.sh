@@ -189,7 +189,8 @@ if [ "$dry" = 0 ]; then
   for _ in $(seq 20); do ss -Hltn "sport = :$PORT" | grep -q . && break; sleep 0.5; done
   ss -Hltn "sport = :$PORT" | grep -q . || { say "error: the broker is not listening on 127.0.0.1:$PORT" >&2; exit 1; }
 fi
-token="$(OMP_NO_SCOPE=1 "$OMP" auth-broker token | tail -n 1 | tr -d '[:space:]')"
+token="$(OMP_NO_SCOPE=1 "$OMP" auth-broker token | tail -n 1 | tr -d '[:space:]')" \
+  || { say "error: omp auth-broker token failed; is omp-auth-broker.service running?" >&2; exit 1; }
 [ -n "$token" ] || { say "error: omp auth-broker token printed nothing" >&2; exit 1; }
 token_sha="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
 
@@ -208,7 +209,7 @@ old_unit_running() {
 # which is never worse than no tunnel.
 retire_old_unit() {
   # shellcheck disable=SC2016
-  if ! run ssh_c "$1" 'f=~/.local/state/'"$OLD_RECORD"'; [ -r "$f" ] || exit 0
+  if ! run ssh_c "$1" 'f=~/.local/state/'"$(sq "$OLD_RECORD")"'; [ -r "$f" ] || exit 0
     { read -r b; if [ "$b" = "$(cat /proc/sys/kernel/random/boot_id)" ]; then while read -r p s; do
       case "$p" in ""|*[!0-9]*) continue;; esac
       [ -n "$s" ] && [ "$(cut -d" " -f22 "/proc/$p/stat" 2>/dev/null)" = "$s" ] && kill "$p" 2>/dev/null; done; fi; } <"$f"
@@ -230,7 +231,7 @@ retire_old_unit() {
 # after ExitOnForwardFailure let the forward through).
 session_on() {
   # shellcheck disable=SC2016
-  ssh_c "$1" 'f=~/.local/state/'"$2"'; [ -r "$f" ] || exit 1
+  ssh_c "$1" 'f=~/.local/state/'"$(sq "$2")"'; [ -r "$f" ] || exit 1
     { read -r b; read -r p s; } <"$f"
     case "$p" in ""|*[!0-9]*) exit 1;; esac; [ -n "$s" ] || exit 1
     [ "$b" = "$(cat /proc/sys/kernel/random/boot_id)" ] && [ "$(cut -d" " -f22 "/proc/$p/stat" 2>/dev/null)" = "$s" ]' 2>/dev/null
@@ -253,7 +254,7 @@ for host in "${aliases[@]}"; do
   fi
   # The unit cannot clear an alias's own forwards (that would also clear its -R), so an alias that carries any would
   # break the tunnel after the old clvm unit is already gone; README step 1 forbids them, this enforces it.
-  if ssh -G -o ClearAllForwardings=no "$host" 2>/dev/null | grep -qiE '^(remoteforward|localforward|dynamicforward|remotecommand) '; then
+  if ssh -G -o ClearAllForwardings=no "$host" 2>/dev/null | grep -viE '^remotecommand none$' | grep -qiE '^(remoteforward|localforward|dynamicforward|remotecommand) '; then
     skip "the ssh alias $host carries a forward or RemoteCommand; give the tunnel a plain alias"; continue
   fi
   own_record="omp-auth-broker-tunnel.$PC_HOST.$host.pids"
