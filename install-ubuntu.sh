@@ -208,15 +208,20 @@ profile_body='if [ -n "$BASH_VERSION" ] || [ -n "$ZSH_VERSION" ]; then
   [ -f "$HOME/.files/.profile" ] && . "$HOME/.files/.profile"
   # tools installed on this machine win over the copies in ~/.files/bin
   [ -d "$HOME/.local/bin" ] && PATH="$HOME/.local/bin:$PATH"
-fi'
+fi
+# the rig harness wrappers go before the real binaries: after every PATH edit above, and outside the guard
+# because the helper is plain POSIX sh, so dash logins get them too
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"'
 merge_block "$HOME/.profile" profile "$profile_body"
 
 bashrc_body='[ -f "$HOME/.files/aliases.sh" ] && . "$HOME/.files/aliases.sh"
-case ":$PATH:" in *":$HOME/.files/bin:"*) ;; *) PATH="$PATH:$HOME/.files/bin:$HOME/.files/ts-import-trace/bin" ;; esac'
+case ":$PATH:" in *":$HOME/.files/bin:"*) ;; *) PATH="$PATH:$HOME/.files/bin:$HOME/.files/ts-import-trace/bin" ;; esac
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"'
 merge_block "$HOME/.bashrc" bashrc "$bashrc_body"
 
 # Login zsh shells read the linked ~/.zprofile; every other interactive zsh sources it here.
-zshrc_body='[[ -o login ]] || source "$HOME/.files/.zprofile"'
+zshrc_body='[[ -o login ]] || source "$HOME/.files/.zprofile"
+[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"'
 merge_block "$HOME/.zshrc" zshrc "$zshrc_body"
 
 # First in the file, like the include in the macOS .gitconfig: the machine's own keys win on overlap.
