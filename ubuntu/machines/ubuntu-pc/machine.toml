@@ -21,10 +21,10 @@ enabled = true
 # ChatGPT guardian (profile module chatgpt-guardian): works through the ChatGPT web login of two dedicated Chrome
 # profiles, never through an OpenAI API key. This PC has no root for apt, so Chrome is the rootless copy under ~/.local/opt.
 [modules.chatgpt-guardian]
-# The promoted guardian release: agenttools-chatgpt 0.3.41, agent-tools tree bcd5919a (main 8d2be78: PR 1189 a 401/403 of an owned tab opens a 60 s recovery window instead of latching 'human challenge', #1187/#1077); re-promote the main-branch build for the next release, never an older one.
-package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/bcd5919a3a53efe0514ff5737cf34749c14ab035/lib/agenttools_chatgpt"
-# pm CLI (hyper-pm) installed into the guardian venv: 0.14.2 (commit d7cb292, pm-cli PR 109: the audit names why a chat was not read, retries transient reads, waits out one 429, recovers from one classifier failure and keeps out of the Guardian patrol's way, pm-cli#103) = 0.13.3 + audit resilience.
-pm_package = "/home/ultra/.local/share/pm-releases/d7cb2921c1048ca798d90d9abbb8cc2e386a3eaf"
+# Guardian 0.4.1 (agent-tools#1401): shared request admission, preserving the installed native-record overlays recorded by baseline manifest a4b6d89bd0021b89c04cce3b3497de411f6d0931c551653763b3f348c7849690. Promote only a reviewed, compatible successor from main; never downgrade to an older build.
+package = "/home/ultra/.local/share/agent-tools/chatgpt-guardian-releases/guardian-1401-0.4.1/lib/agenttools_chatgpt"
+# PM CLI 0.15.1 (pm-cli#115), installed into the Guardian venv: shared request admission and backend Retry-After handling, preserving installed snapshot 795332539a624c56314560c910c2e92a209839e0 and its native-record recovery changes. Keep the paired Guardian release compatible when promoting a successor.
+pm_package = "/home/ultra/.local/share/pm-releases/pm-115-0.15.1"
 enabled = true
 chrome = "user"
 # omp's browser relay owns 127.0.0.1:9224 here, so the home account's browser listens on 9226 (the module default).
