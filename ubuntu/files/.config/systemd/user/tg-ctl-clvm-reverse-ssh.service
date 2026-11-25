@@ -1,7 +1,7 @@
 # Reverse SSH link for tg-ctl: the clvm build box's 127.0.0.1:18766 -> this workstation's sshd (127.0.0.1:22).
 # Loopback-only bind on the box. The box authenticates back here with its dedicated key (~/.ssh/tg-ctl-ubuntu),
 # whose authorized_keys line on this workstation is forced-command restricted (comment tg-ctl-clvm-20261028).
-# Independent of clvm-auth-broker-tunnel.service (port 18765); do not merge them. Linked into ~/.config/systemd/user
+# Independent of omp-auth-broker-tunnel@clvm.service (port 18765); do not merge them. Linked into ~/.config/systemd/user
 # like every leaf of ubuntu/files by the ubuntu-tweak files planner (`ubuntu-tweak apply`), not by install-ubuntu.sh.
 #
 # The box's sshd has no ClientAliveInterval (server-side, no root to change it), so after a network drop the dead
@@ -15,7 +15,7 @@
 # up to 5 s for the port to be released; while it is still held the record is kept so the next attempt retries.
 # (The check and the kill are two steps; a wrong kill needs the session to exit and the box to cycle its whole pid
 # space, pid_max 4194304, between them, which is accepted rather than adding a pidfd helper.)
-# A holder it never recorded is only reported in the journal. No pattern kill: clvm-auth-broker-tunnel (18765) and
+# A holder it never recorded is only reported in the journal. No pattern kill: omp-auth-broker-tunnel@clvm (18765) and
 # tg-laya-clvm-forward share this box and user and must stay up. A start whose forward is refused never
 # overwrites the record: with ExitOnForwardFailure the client exits before the remote command runs.
 # The record is keyed by this workstation's hostname (%H) so a second workstation running this unit never kills

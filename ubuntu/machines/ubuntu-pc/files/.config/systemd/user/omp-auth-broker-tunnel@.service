@@ -1,0 +1,55 @@
+# Reverse tunnel, one instance per consumer machine: <consumer>'s 127.0.0.1:18765 -> this PC's omp
+# auth-broker (omp-auth-broker.service). The instance name is an ssh Host alias of this PC's
+# ~/.ssh/config (omp-auth-broker-tunnel@clvm.service connects to `clvm`), so the address and user
+# of every consumer stay in that local file and never in this repository. The consumer's omp has
+# auth.broker.url pointed at 127.0.0.1:18765, so it uses this PC's omp accounts without copying
+# OAuth refresh tokens (copied refresh tokens rotate and log one side out). Setup and the consumer
+# side: ../../../../scripts/omp-auth-broker/README.md.
+#
+# A consumer's sshd may have no ClientAliveInterval (the clvm box has none, and no root to change
+# it), so after a network drop the dead previous session keeps listening on 18765 for about two
+# hours and every restart fails with "remote port forwarding failed" (alex-mextner/.files#193).
+# ExecStart therefore records its own remote session in
+# ~/.local/state/omp-auth-broker-tunnel.<hostname>.<alias>.pids on the consumer: the sshd-session holding the
+# forward ($PPID of the remote shell) and the idling shell itself, each with its /proc starttime,
+# under the consumer's boot_id. ExecStartPre terminates only those recorded pids, and only while the
+# boot_id and starttime still match (a pid reused in this or a later boot is left alone), then waits
+# up to 5 s for 18765 to be released; while it is still held the record is kept so the next attempt
+# retries. A holder it never recorded is only reported in the journal.
+# No pattern kill: other tunnels of the same user (tg-ctl-clvm-reverse-ssh on 18766,
+# tg-laya-clvm-forward on the clvm box) must stay up. A start whose forward is refused never
+# overwrites the record: with ExitOnForwardFailure the client exits before the remote command runs.
+# The file is keyed by this PC's hostname (%H) so a second broker host running this unit never
+# kills the first one's healthy session (two broker hosts sharing a hostname would collide), and by
+# the alias (%i) so two aliases that reach the same consumer do not kill each other's session: the
+# second one only fails with "never recorded" while the first holds the port.
+# The consumer must be Linux: the scripts read /proc and call ss and GNU tail --pid.
+# (%m would survive renames but exposes the confidential machine id to every account on the box.)
+# Recording is best-effort: a full disk on the consumer costs only the self-heal, never the tunnel.
+# The idle step is `exec tail --pid=$PPID -f /dev/null`, not `sleep infinity`: a session without a
+# terminal does not signal its command on disconnect, so a plain sleep would outlive every clean stop
+# on the consumer. exec keeps the recorded pid and starttime, and the idle process forks nothing, so
+# a consumer out of processes or memory cannot end a healthy tunnel.
+# ClearAllForwardings=no: a `ClearAllForwardings yes` in ~/.ssh/config would otherwise drop the -R without an error,
+# the session record would still be written, and the record would vouch for a port nobody forwards.
+# -a -x: unlike -N, the remote command opens a long-lived session channel, which must not carry the
+# local ssh-agent or X11 to every process of this user on the consumer.
+# systemd needs every literal $ written as $$, so the remote shell's $$ appears here as $$$$.
+# Until 2026-11-20 this was clvm-auth-broker-tunnel.service, pinned to the clvm box only.
+[Unit]
+Description=Reverse SSH tunnel for the omp auth-broker to %i
+After=network-online.target omp-auth-broker.service
+Wants=omp-auth-broker.service
+
+[Service]
+ExecStartPre=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none %i 'f=~/.local/state/omp-auth-broker-tunnel.%H.%i.pids; k=0; if [ -r "$$f" ]; then read -r b <"$$f"; if [ "$$b" = "$$(cat /proc/sys/kernel/random/boot_id)" ]; then while read -r p s; do case "$$p" in ""|*[!0-9]*) continue;; esac; [ -n "$$s" ] && [ "$$(cut -d" " -f22 "/proc/$$p/stat" 2>/dev/null)" = "$$s" ] && kill "$$p" 2>/dev/null && { k=1; echo "terminated recorded stale tunnel process $$p"; }; done <"$$f"; fi; fi; if [ "$$k" = 1 ]; then for i in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :18765" | grep -q . || break; sleep 0.5; done; fi; if ss -Hltn "sport = :18765" | grep -q .; then if [ "$$k" = 1 ]; then echo "127.0.0.1:18765 on %i is still in use 5 s after terminating the recorded session" >&2; exit 0; fi; echo "127.0.0.1:18765 on %i is held by a session this unit never recorded" >&2; fi; rm -f "$$f"; exit 0'
+ExecStart=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ClearAllForwardings=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:18765:127.0.0.1:18765 %i '[ "$$PPID" -gt 1 ] || exit 0; mkdir -p ~/.local/state; { cat /proc/sys/kernel/random/boot_id; echo $$PPID $$(cut -d" " -f22 /proc/$$PPID/stat); echo $$$$ $$(cut -d" " -f22 /proc/$$$$/stat); } >~/.local/state/omp-auth-broker-tunnel.%H.%i.pids; exec tail --pid=$$PPID -f /dev/null'
+Restart=always
+RestartSec=15
+# ssh exits 255 both on SIGTERM and when the connection drops. Counting that as success keeps a deliberate
+# `disable --now` from leaving the unit failed for service-failover to restart (#205); Restart=always still
+# brings the tunnel back after a drop.
+SuccessExitStatus=255
+
+[Install]
+WantedBy=default.target
