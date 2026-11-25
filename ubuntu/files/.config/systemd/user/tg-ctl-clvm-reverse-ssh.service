@@ -27,6 +27,11 @@
 # process forks nothing, so a box out of processes or memory cannot end a healthy link.
 # -a -x: unlike -N, the remote command opens a long-lived session channel, which must not carry the local
 # ssh-agent or X11 to every process of this user on the box.
+# The box is dialed as ultra@clvm: the address lives in the ssh alias clvm in ~/.ssh/config (coverage.d/secrets.toml,
+# entry ~/.ssh), one place for every user of the box. -o RemoteCommand=none keeps an alias RemoteCommand from
+# refusing the remote script, and ExecStartPre also clears the alias's forwards (ExecStart cannot: that would clear its
+# own -R), so the alias must carry no LocalForward/RemoteForward/DynamicForward. Without the alias the name does not
+# resolve (or resolves elsewhere and fails StrictHostKeyChecking) and the unit retries every 15 s.
 # BOX_PORT and RECORD are written once here; systemd substitutes ${NAME} in the command lines (inside the quoted
 # remote scripts too) and needs every other literal $ written as $$.
 [Unit]
@@ -38,8 +43,8 @@ StartLimitIntervalSec=0
 [Service]
 Environment=BOX_PORT=18766
 Environment=RECORD=.local/state/tg-ctl-clvm-reverse-ssh.%H.pids
-ExecStartPre=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none ultra@65.21.40.51 'f=~/${RECORD}; k=0; if [ -r "$$f" ]; then { read -r b; read -r p s; } <"$$f"; if [ "$$b" = "$$(cat /proc/sys/kernel/random/boot_id)" ]; then case "$$p" in ""|*[!0-9]*) ;; *) [ -n "$$s" ] && [ "$$(cut -d" " -f22 "/proc/$$p/stat" 2>/dev/null)" = "$$s" ] && kill "$$p" 2>/dev/null && { k=1; echo "terminated recorded stale tunnel process $$p"; };; esac; fi; fi; if [ "$$k" = 1 ]; then for i in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :${BOX_PORT}" | grep -q . || break; sleep 0.5; done; fi; if ss -Hltn "sport = :${BOX_PORT}" | grep -q .; then if [ "$$k" = 1 ]; then echo "127.0.0.1:${BOX_PORT} on the box is still in use 5 s after terminating the recorded session" >&2; exit 0; fi; echo "127.0.0.1:${BOX_PORT} on the box is held by a session this unit never recorded" >&2; fi; rm -f "$$f"; exit 0'
-ExecStart=/usr/bin/ssh -T -a -x -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:${BOX_PORT}:127.0.0.1:22 ultra@65.21.40.51 '[ "$$PPID" -gt 1 ] || exit 0; mkdir -p ~/.local/state; { cat /proc/sys/kernel/random/boot_id; echo $$PPID $$(cut -d" " -f22 /proc/$$PPID/stat); } >~/${RECORD}; exec tail --pid=$$PPID -f /dev/null'
+ExecStartPre=/usr/bin/ssh -T -a -x -o RemoteCommand=none -o ClearAllForwardings=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none ultra@clvm 'f=~/${RECORD}; k=0; if [ -r "$$f" ]; then { read -r b; read -r p s; } <"$$f"; if [ "$$b" = "$$(cat /proc/sys/kernel/random/boot_id)" ]; then case "$$p" in ""|*[!0-9]*) ;; *) [ -n "$$s" ] && [ "$$(cut -d" " -f22 "/proc/$$p/stat" 2>/dev/null)" = "$$s" ] && kill "$$p" 2>/dev/null && { k=1; echo "terminated recorded stale tunnel process $$p"; };; esac; fi; fi; if [ "$$k" = 1 ]; then for i in 1 2 3 4 5 6 7 8 9 10; do ss -Hltn "sport = :${BOX_PORT}" | grep -q . || break; sleep 0.5; done; fi; if ss -Hltn "sport = :${BOX_PORT}" | grep -q .; then if [ "$$k" = 1 ]; then echo "127.0.0.1:${BOX_PORT} on the box is still in use 5 s after terminating the recorded session" >&2; exit 0; fi; echo "127.0.0.1:${BOX_PORT} on the box is held by a session this unit never recorded" >&2; fi; rm -f "$$f"; exit 0'
+ExecStart=/usr/bin/ssh -T -a -x -o RemoteCommand=none -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:${BOX_PORT}:127.0.0.1:22 ultra@clvm '[ "$$PPID" -gt 1 ] || exit 0; mkdir -p ~/.local/state; { cat /proc/sys/kernel/random/boot_id; echo $$PPID $$(cut -d" " -f22 /proc/$$PPID/stat); } >~/${RECORD}; exec tail --pid=$$PPID -f /dev/null'
 Restart=always
 RestartSec=15
 

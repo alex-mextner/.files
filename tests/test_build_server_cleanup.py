@@ -12,8 +12,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 PROFILE = ROOT / "ubuntu"
 SCRIPT = PROFILE / "machines/ubuntu-pc/scripts/build-server-cleanup"
 MACHINE = PROFILE / "machines/ubuntu-pc/machine.toml"
-HOST = "ultra@65.21.40.51"
-SSH_OPTIONS = "-n -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
+HOST = "ultra@clvm"
+SSH_OPTIONS = "-n -a -x -o ClearAllForwardings=yes -o RemoteCommand=none -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
 DIRS = ["/home/ultra/projects/rig-ctmux-20261023", "/home/ultra/projects/ubuntu-sync-ctmux-20261022"]
 
 # Fake ssh. It parses exactly the call shapes of the script: `ssh -n -o K=V -o K=V HOST test ! -e PATH`, `... HOST true`
@@ -21,14 +21,14 @@ DIRS = ["/home/ultra/projects/rig-ctmux-20261023", "/home/ultra/projects/ubuntu-
 # logged. Without -n it reads (and loses) its standard input, as real ssh does.
 FAKE_SSH = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_REMOTE/calls"
-if [ -n "$FAKE_SSH_FAIL" ]; then echo "ssh: connect to host 65.21.40.51 port 22: $FAKE_SSH_FAIL" >&2; exit 255; fi
+if [ -n "$FAKE_SSH_FAIL" ]; then echo "ssh: connect to host clvm port 22: $FAKE_SSH_FAIL" >&2; exit 255; fi
 no_stdin=0
 while [ "${1#-}" != "$1" ]; do
   case "$1" in -n) no_stdin=1; shift ;; -o) shift 2 ;; *) shift ;; esac
 done
 [ "$no_stdin" = 1 ] || cat > /dev/null
 host=$1; shift
-[ "$host" = "ultra@65.21.40.51" ] || { echo "unexpected host $host" >&2; exit 254; }
+[ "$host" = "ultra@clvm" ] || { echo "unexpected host $host" >&2; exit 254; }
 case "$1" in
   true) exit 0 ;;
   test)  # test ! -e PATH
@@ -126,7 +126,7 @@ def test_an_unreachable_server_is_pending_with_the_reason_never_done(remote):
     done = remote.run("check", FAKE_SSH_FAIL="Connection timed out")
     assert done.returncode == 1
     assert "Connection timed out" in done.stdout + done.stderr
-    assert "65.21.40.51" in done.stdout + done.stderr
+    assert "clvm" in done.stdout + done.stderr
     assert len(remote.calls()) == 1, "one timeout, not one per directory"
 
 

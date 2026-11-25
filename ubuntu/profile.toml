@@ -143,7 +143,6 @@ machine_files = [
   ".config/monitors.xml",
   ".config/gtk-3.0/bookmarks",
   ".config/mimeapps.list",
-  ".local/bin/ha-mdns-publish.py",
   ".config/environment.d/50-omp.conf",
   ".bashrc",
   ".zshrc",

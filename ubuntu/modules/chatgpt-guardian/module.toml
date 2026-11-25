@@ -57,7 +57,7 @@ run = ["./relogin", "run"]
 # read-only. It reuses ./relogin's stop / start / verify / DevTools-probe code by import. The header of ./profile-sync has the workflow, the exit codes and the limits.
 
 # The seven units install.sh renders from units/ and enables, plus the home display when home_private_display is true. guardian-tunnel.service is not here: it is the user's own unit
-# (files/.config/systemd/user), the module only gates it off with a drop-in until a platform API key exists.
+# (machines/ubuntu-pc/files/.config/systemd/user, the only machine that runs it), the module only gates it off with a drop-in until a platform API key exists.
 [[coverage]]
 match = [
   "unit:chatgpt-guardian-home.service", "unit:chatgpt-guardian-home-browser.service", "unit:chatgpt-guardian-home-observer.service",
