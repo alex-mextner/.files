@@ -1,3 +1,6 @@
+# aliases.zsh: zsh aliases and functions (git, docker, ...). Sourced by .zshrc, so interactive zsh only.
+# Does NOT belong here: exports/PATH (-> .profile), sh-compatible aliases shared with bash (-> aliases.sh).
+
 function take-webcam-picture() {
   #imagesnap -w 1 "$HOME/Pictures/webcam/$(date '+%Y-%m-%d-%H.%M.jpg')"
   imagesnap -w 1 "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Photos/webcam/$(date '+%Y-%m-%d-%H.%M.jpg')"
@@ -188,7 +191,7 @@ alias port='sudo lsof -iTCP -sTCP:LISTEN -n -P'
 # ZSH SPECIFIC Aliases and functions
 # ---------------------------------------------------
 
-alias zshc="vim ~/.zprofile; source ~/.zprofile"
+alias zshc="vim ~/.zshrc; source ~/.zshrc"
 # alias ohmyzsh="~/.oh-my-zsh"
 
 # ^Z instead of `fg`

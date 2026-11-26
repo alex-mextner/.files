@@ -1,4 +1,5 @@
 #! /bin/zsh
+# spectrum.zsh: 256-colour helpers (FG/BG arrays, spectrum_ls). Sourced by .zshrc (interactive only).
 # A script to make using 256 colors in zsh less painful.
 # P.C. Shyamshankar <sykora@lucentbeing.com>
 # Copied from http://github.com/sykora/etc/blob/master/zsh/functions/spectrum/

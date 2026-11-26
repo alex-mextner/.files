@@ -5,11 +5,11 @@
 #   install-ubuntu.sh --plan     read-only: print what apply would change
 #   install-ubuntu.sh --check    read-only: exit 1 when something is pending (10: a manual step remains)
 #
-# The macOS bootstrap lives in installer.sh (brew, casks); this is its Linux counterpart. Idempotent:
+# installer.sh is the bootstrap for both systems (Homebrew, links); this is the Ubuntu user-level part. Idempotent:
 # a second run changes nothing. It never needs root and never overwrites a machine-specific file:
-#   linked        .zprofile .vimrc .gitattributes .hyper.js  and the .tmux plugin dir
+#   linked        .zprofile .zshrc .vimrc .gitattributes .hyper.js  and the .tmux plugin dir
 #                 (an existing different file is moved to <name>.pre-dotfiles-<timestamp> first)
-#   merged        ~/.profile ~/.bashrc ~/.zshrc (one marked block each), ~/.gitconfig (an [include] of
+#   merged        ~/.profile ~/.bashrc (one marked block each), ~/.gitconfig (an [include] of
 #                 .gitconfig.shared at the top: keys in ~/.gitconfig win over it, keys in
 #                 ~/.config/git/config, which git reads earlier, do not) and the rig global config
 #                 (rig/config.yaml, see rig/merge-config.py: the repository wins for every key it
@@ -200,7 +200,7 @@ done < <(gitm submodule status 2>/dev/null)
 applying && repoint_submodules
 
 # -- links ----------------------------------------------------------------------------------------------
-for f in .zprofile .vimrc .gitattributes .hyper.js .tmux; do link_into_home "$f"; done
+for f in .zprofile .zshrc .vimrc .gitattributes .hyper.js .tmux; do link_into_home "$f"; done
 
 # -- merges ---------------------------------------------------------------------------------------------
 # bash/zsh only: ~/.profile is also read by dash (sh) logins, which cannot parse .files/.profile.
@@ -218,11 +218,6 @@ bashrc_body='[ -f "$HOME/.files/aliases.sh" ] && . "$HOME/.files/aliases.sh"
 case ":$PATH:" in *":$HOME/.files/bin:"*) ;; *) PATH="$PATH:$HOME/.files/bin:$HOME/.files/ts-import-trace/bin" ;; esac
 [ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"'
 merge_block "$HOME/.bashrc" bashrc "$bashrc_body"
-
-# Login zsh shells read the linked ~/.zprofile; every other interactive zsh sources it here.
-zshrc_body='[[ -o login ]] || source "$HOME/.files/.zprofile"
-[ -r "$HOME/.files/harness-wrappers.sh" ] && . "$HOME/.files/harness-wrappers.sh"'
-merge_block "$HOME/.zshrc" zshrc "$zshrc_body"
 
 # First in the file, like the include in the macOS .gitconfig: the machine's own keys win on overlap.
 inc='~/.files/.gitconfig.shared'
@@ -263,15 +258,15 @@ else
     rm -rf "$zplug_tmp"
   fi
 fi
-zplug_ok() { zsh -c 'source "$HOME/.files/.zprofile" >/dev/null 2>&1; zplug check' </dev/null >/dev/null 2>&1; }
+zplug_ok() { zsh -c 'source "$HOME/.files/.zshrc" >/dev/null 2>&1; zplug check' </dev/null >/dev/null 2>&1; }
 if [ -r "$HOME/.zplug/init.zsh" ] && command -v zsh >/dev/null 2>&1; then
   if zplug_ok; then
     ok "zplug plugins installed"
   else
-    todo "zplug install (plugins declared in .zprofile are missing)"
+    todo "zplug install (plugins declared in .zshrc are missing)"
     if applying; then
       # `zplug install` exits 1 even when every plugin installed; the check afterwards is the verdict.
-      zsh -c 'source "$HOME/.files/.zprofile" >/dev/null 2>&1; zplug install' </dev/null >/dev/null 2>&1
+      zsh -c 'source "$HOME/.files/.zshrc" >/dev/null 2>&1; zplug install' </dev/null >/dev/null 2>&1
       zplug_ok || manual "zplug plugins did not install; run: zsh -ic 'zplug install'"
     fi
   fi

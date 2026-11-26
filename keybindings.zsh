@@ -1,3 +1,5 @@
+# keybindings.zsh: zle key bindings. Sourced by .zshrc (interactive only).
+
 # Use emacs key bindings: ^A, ^E
 bindkey -e
 

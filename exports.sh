@@ -1,4 +1,5 @@
-# See .profile
+# exports.sh: Homebrew prefix detection and PATH. sh-compatible, sourced by .profile (login env, not interactive).
+# Does NOT belong here: aliases (-> aliases.sh / aliases.zsh), anything zsh-only or interactive (-> .zshrc).
 
 #export PKG_CONFIG_PATH="/opt/local/lib/pkgconfig:$PKG_CONFIG_PATH"
 

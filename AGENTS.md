@@ -11,10 +11,15 @@ git and `bin/` helpers sit at the top level; `ubuntu/` is the settings profile o
 engine; `rig/config.yaml` is the user's global rig config and `rig.yaml` is this repository's own.
 
 - Ubuntu: `./install-ubuntu.sh --plan` shows what it would change, `./install-ubuntu.sh` applies it,
-  `--check` exits 1 while something is pending. It links, merges (never overwrites) the machine's
-  `~/.profile`, `~/.bashrc`, `~/.zshrc`, `~/.gitconfig`, and merges `rig/config.yaml` into the rig
+  `--check` exits 1 while something is pending. It links `.zprofile` and `.zshrc`, merges (never
+  overwrites) the machine's `~/.profile`, `~/.bashrc`, `~/.gitconfig`, and merges `rig/config.yaml` into the rig
   global config. Converge the machine to that config with `rig apply commit`.
-- macOS: `installer.sh` (brew, casks). Shared git settings live in `.gitconfig.shared`.
+- Both systems: `installer.sh [--dry-run]` links the rc files, bootstraps Homebrew and its formulae (Linux:
+  the `brew` list of `ubuntu/packages.toml`; macOS: casks too) and, on Ubuntu, runs the `ubuntu-tweak`
+  engine. Shared git settings live in `.gitconfig.shared`.
+- Shell startup files split by purpose, each with a header saying what belongs in it: `.profile` (sh-compatible
+  login env), `.zprofile` (zsh login only), `.zshrc` (interactive: aliases, prompt, plugins). Put a new
+  export in `.profile`, a new alias in `aliases.sh` / `aliases.zsh`, never an alias in a login file.
 - Files must work on both systems: guard anything macOS-only (`/opt/homebrew`, `pbcopy`, `gsed`) so
   a missing tool never prints an error at shell start.
 - Never commit a secret (`gitleaks dir .` runs as the local ship gate and in CI). Machine-specific
