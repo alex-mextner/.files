@@ -78,6 +78,7 @@ body() {
 chain="$scratch/chain"
 fake_home "$chain"
 ln -s "$repo/.zprofile" "$chain/.zprofile"
+ln -s "$repo/.zshrc" "$chain/.zshrc"
 {
   echo '# >>> .files:profile >>>'; body profile; echo '# <<< .files:profile <<<'
 } > "$chain/.profile"
@@ -86,10 +87,6 @@ ln -s "$repo/.zprofile" "$chain/.zprofile"
   echo 'export PATH="$HOME/.local/bin:$PATH"'
   echo '# >>> .files:bashrc >>>'; body bashrc; echo '# <<< .files:bashrc <<<'
 } > "$chain/.bashrc"
-{
-  echo 'export PATH="$HOME/.local/bin:$PATH"'
-  echo '# >>> .files:zshrc >>>'; body zshrc; echo '# <<< .files:zshrc <<<'
-} > "$chain/.zshrc"
 for f in .profile .bashrc .zshrc; do
   check "the merged body of $f sources the helper" grep -q 'harness-wrappers.sh' "$chain/$f"
 done

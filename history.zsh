@@ -1,3 +1,5 @@
+# history.zsh: zsh command history. Sourced by .zshrc (interactive only).
+
 ## Command history configuration
 if [ -z "$HISTFILE" ]; then
     HISTFILE=$HOME/.zsh_history

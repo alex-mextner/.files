@@ -16,6 +16,7 @@ preview = "install.sh --plan"
 [[coverage]]
 match = [
   "file:~/.zprofile",
+  "file:~/.zshrc",
   "file:~/.profile",
   "file:~/.vimrc",
   "file:~/.gitattributes",
@@ -23,7 +24,7 @@ match = [
   "file:~/.tmux",
 ]
 class = "tracked"
-reason = "linked into ~/.files by this module (install-ubuntu.sh link_into_home) or by the plan's rc links (~/.profile, ~/.zprofile)"
+reason = "linked into ~/.files by this module (install-ubuntu.sh link_into_home) or by the plan's rc links (~/.profile, ~/.zprofile, ~/.zshrc)"
 
 [[coverage]]
 match = ["file:~/.gitconfig"]

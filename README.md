@@ -1,9 +1,25 @@
 # .files
 dotfiles (mac, webdev, frontend, iterm)
 
-#### installation
+#### Fresh machine
 
-Ubuntu settings profile (managed by `ubuntu-tweak`): see [ubuntu/README.md](ubuntu/README.md).
+```sh
+git clone https://github.com/alex-mextner/.files ~/.files
+~/.files/installer.sh --dry-run   # print what it would do, change nothing
+~/.files/installer.sh             # macOS or Ubuntu: links, Homebrew and its formulae
+```
+
+`installer.sh` runs on macOS and on Ubuntu. On Ubuntu it ends by running the `ubuntu-tweak` engine (or prints how to
+install it): apt packages, GNOME settings and services are the engine's, see [ubuntu/README.md](ubuntu/README.md).
+
+#### Shell startup files
+
+| File | Read by | Holds |
+| --- | --- | --- |
+| `.profile` | login sh/bash, the Ubuntu session, `.zprofile` | sh-compatible environment: PATH, brew shellenv, EDITOR, BUN_INSTALL, cargo |
+| `.zprofile` | zsh login shells | sources `.profile`, zsh-syntax login env |
+| `.zshrc` | every interactive zsh | history, options, keybindings, aliases, completion, prompt, zplug plugins |
+| `~/.zshenv` | every zsh, also `ssh host cmd` | not in this repository: the engine links only the three files above |
 
 
 #### Fancy Gallery
@@ -61,14 +77,14 @@ git clone https://github.com/alex-mextner/.files ~/.files
 rig apply commit                    # converge the machine to rig/config.yaml
 ```
 
-It links `.zprofile .vimrc .gitattributes .hyper.js .tmux`, adds one marked block each to the
-machine's `~/.profile`, `~/.bashrc`, `~/.zshrc`, includes `.gitconfig.shared` from `~/.gitconfig`
+It links `.zprofile .zshrc .vimrc .gitattributes .hyper.js .tmux`, adds one marked block each to the
+machine's `~/.profile` and `~/.bashrc`, includes `.gitconfig.shared` from `~/.gitconfig`
 and merges `rig/config.yaml` into `~/.config/rig/config.yaml`. Machine-specific files are merged,
 never overwritten; running it twice changes nothing. A private submodule whose repository this machine cannot
 read is reported as a `manual:` step (the script names the owner account) instead of failing.
 
 Interactive `omp`, `claude`, `codex` and `opencode` start hosted in abduco under rig's crash supervisor: `rig/config.yaml`
-declares `harness_wrappers`, and `harness-wrappers.sh` (sourced last by `.profile`, `.zprofile` and the blocks the installer
-merges into `~/.profile`, `~/.bashrc` and `~/.zshrc`) puts `~/.local/share/rig/bin` before the real binaries, since rig
+declares `harness_wrappers`, and `harness-wrappers.sh` (sourced last by `.profile`, `.zprofile`, `.zshrc` and the blocks
+the installer merges into `~/.profile` and `~/.bashrc`) puts `~/.local/share/rig/bin` before the real binaries, since rig
 never edits `PATH`. Print mode, subcommands and `--help` pass straight through. `tests/harness-wrappers.test.sh` checks
 the helper in bash, zsh and dash and the merged startup files as login and non-login interactive shells.

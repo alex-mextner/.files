@@ -145,7 +145,6 @@ machine_files = [
   ".config/mimeapps.list",
   ".config/environment.d/50-omp.conf",
   ".bashrc",
-  ".zshrc",
   ".local/share/applications/hsw-review.desktop",
   ".local/share/applications/snapmaker-orca.desktop",
 ]
