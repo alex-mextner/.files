@@ -123,7 +123,7 @@ The pop-ups were first switched off on 2026-11-19 by hand, in the installed copy
 installer removes a drop-in it did not declare in a directory named after a module unit (see below), so those drop-ins go with the first
 install of this version, whose units and repair script carry the same settings.
 
-`install.sh --check` also reports as `stale` (an install removes it) any file or symlink in a drop-in directory named after a module unit
+`install.sh --check` also reports as `stale` (an install removes it) any file or symlink in a drop-in directory named after a module unit A drop-in whose file name contains `operator` (`99-operator-stop-*.conf`, `zz-operator-paused-*.conf`: an operator pausing repairs of a unit) is the operator's: it is neither reported nor removed.
 (`service-failover-*.d/`: the repair template's, the scan's, one for a single instance) that the module did not install, and a
 `SERVICE_FAILOVER_*` variable in the user manager's environment (`systemctl --user set-environment`; an install unsets it): each one can turn
 every repair into a dry run, and a file or a variable nobody declared is exactly what the module exists to find.

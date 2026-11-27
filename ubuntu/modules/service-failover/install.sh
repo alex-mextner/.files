@@ -163,6 +163,8 @@ find_stale() { # find_stale PATH: stale when it exists, carries the marker and i
 }
 find_unowned() { # find_unowned PATH: stale when it sits in a directory the module owns outright and nothing wants it
   local f=$1 w s
+  # An operator's pause (99-operator-stop-*.conf, zz-operator-paused-*.conf: ConditionPathExists=!MARKER) is the owner's, not drift.
+  case "${f##*/}" in *operator*) return 0 ;; esac
   for w in "${want[@]}"; do case "$w" in *"|$f|"*) return 0 ;; esac; done
   for s in "${stale[@]}"; do [ "$s" = "$f" ] && return 0; done
   stale+=("$f")
