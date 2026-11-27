@@ -496,6 +496,45 @@ profile_locked() { # profile_locked WS (home | glide.vc): true while another run
   return 1
 }
 unit_locked() { case $1 in *glide*) profile_locked glide.vc ;; *home*) profile_locked home ;; *) return 1 ;; esac; } # unit_locked UNIT-NAME
+# An operator stop is a drop-in `<unit>.service.d|.timer.d/*operator-stop*.conf` with `ConditionPathExists=!MARKER`: while MARKER exists the unit is skipped
+# (inactive, Result=success). Apply must neither enable nor start such a unit (revive documents the same); it is reported, never undone.
+operator_held=()
+operator_marker=
+operator_stop_marker() { # operator_stop_marker UNIT: print the marker of the operator stop that holds UNIT; false when none is in force
+  local f m d name names
+  names=("$1" "${1%%@*}@") # an instance (pm-chatgpt-login-assist@home) is held by the template's drop-in
+  case $1 in # a unit whose browser or private display is held cannot run either (the guardian BindsTo= its browser)
+    chatgpt-guardian-glide-browser) names+=(chatgpt-guardian-glide-display) ;;
+    chatgpt-guardian-glide|chatgpt-guardian-glide-observer) names+=(chatgpt-guardian-glide-browser chatgpt-guardian-glide-display) ;;
+    chatgpt-guardian-home-browser) [ "${home_private_display:-}" != true ] || names+=(chatgpt-guardian-home-display) ;;
+    chatgpt-guardian-home|chatgpt-guardian-home-observer)
+      names+=(chatgpt-guardian-home-browser)
+      [ "${home_private_display:-}" != true ] || names+=(chatgpt-guardian-home-display) ;;
+  esac
+  for name in "${names[@]}"; do
+    for d in "$units_dir/$name.service.d" "$units_dir/$name.timer.d"; do
+      for f in "$d"/*operator-stop*.conf; do
+        [ -f "$f" ] || continue
+        # every negated ConditionPathExists= counts (systemd skips the unit when any of them fails)
+        while IFS= read -r m; do
+          # the systemd path specifiers a drop-in may use for the marker
+          m=${m//%h/$HOME}; m=${m//%S/${XDG_STATE_HOME:-$HOME/.local/state}}; m=${m//%E/${XDG_CONFIG_HOME:-$HOME/.config}}; m=${m//%t/${XDG_RUNTIME_DIR:-/run/user/$UID}}
+          if [ -n "$m" ] && [ -e "$m" ]; then printf '%s' "$m"; return 0; fi
+        done < <(sed -n 's/^[[:space:]]*ConditionPathExists[[:space:]]*=[[:space:]]*![[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' "$f")
+      done
+    done
+  done
+  return 1
+}
+operator_stopped() { operator_stop_marker "$1" >/dev/null; } # operator_stopped UNIT
+hold_operator_stopped() { # hold_operator_stopped UNIT: true (and remembered for the final report) when an operator stop holds UNIT
+  local m held
+  m=$(operator_stop_marker "$1") || return 1
+  operator_marker=${m##*/}
+  for held in "${operator_held[@]}"; do [ "$held" != "$1" ] || return 0; done
+  operator_held+=("$1")
+  return 0
+}
 hold_profile() { # hold_profile WS: take the shared lock for the probe + start of one account (the helper then answers busy); false when a login session holds it
   # 0700 / 0600 like relogin and pm: a world-readable lock would let any local user hold it shared and block every exclusive taker
   local old_umask; old_umask=$(umask); umask 077
@@ -615,25 +654,26 @@ if [ "$mode" = check ]; then
   while IFS= read -r f; do problems+=("stale drop-in $f"); done < <(stale_list)
   if sc show -p Id --value default.target >/dev/null 2>&1; then
     for n in "${unit_names[@]}"; do
+      if operator_stopped "$n"; then continue; fi
       is_enabled "$n" || problems+=("$n.service is not enabled")
     done
-    [ "$(sc is-enabled "$revive_unit.timer" 2>/dev/null || true)" = enabled ] || problems+=("$revive_unit.timer is not enabled")
-    if control_active && ! timer_on "$control_unit"; then problems+=("$control_unit.timer is not enabled and active"); fi
+    operator_stopped "$revive_unit" || [ "$(sc is-enabled "$revive_unit.timer" 2>/dev/null || true)" = enabled ] || problems+=("$revive_unit.timer is not enabled")
+    if control_active && ! operator_stopped "$control_unit" && ! timer_on "$control_unit"; then problems+=("$control_unit.timer is not enabled and active"); fi
     if [ "$audit_timers" = true ]; then
-      for ws in "${workspaces[@]}"; do timer_on "$(audit_unit "$ws")" || problems+=("$(audit_unit "$ws").timer is not enabled and active"); done
+      for ws in "${workspaces[@]}"; do operator_stopped "$(audit_unit "$ws")" || timer_on "$(audit_unit "$ws")" || problems+=("$(audit_unit "$ws").timer is not enabled and active"); done
     fi
     if [ "$login_assist" = true ]; then
-      for n in "${login_assist_instances[@]}"; do timer_on "$n" || problems+=("$n.timer is not enabled and active"); done
+      for n in "${login_assist_instances[@]}"; do operator_stopped "$n" || timer_on "$n" || problems+=("$n.timer is not enabled and active"); done
     fi
     for ws in "${workspaces[@]}"; do
       if dep_ok "$ws" && ! profile_locked "$ws"; then
         for n in "chatgpt-guardian-${ws_unit[$ws]}-browser" "chatgpt-guardian-${ws_unit[$ws]}" "chatgpt-guardian-${ws_unit[$ws]}-observer"; do
-          is_active "$n" || problems+=("$n.service is not active")
+          operator_stopped "$n" || is_active "$n" || problems+=("$n.service is not active")
         done
       fi
     done
     if [ "$home_private_display" = true ] && dep_ok home; then
-      is_active "$home_display_unit" || problems+=("$home_display_unit.service is not active")
+      operator_stopped "$home_display_unit" || is_active "$home_display_unit" || problems+=("$home_display_unit.service is not active")
       if home_browser_on_desktop; then problems+=("$home_browser_unit.service still runs on the desktop display, not on :112: restart it"); fi
     fi
   else
@@ -679,6 +719,9 @@ if [ "$mode" = plan ]; then
   elif login_assist_ok && timer_on "${login_assist_instances[0]}" && timer_on "${login_assist_instances[1]}"; then echo "login helper: ${login_assist_instances[*]} (every 2 min) ok and enabled"
   else echo "login helper: install pm-chatgpt-login-assist@.service/.timer and enable ${login_assist_instances[*]} timers (a signed-out account gets a login window, a notification and one Telegram message)"; fi
   [ ! -f "$tunnel_unit" ] || echo "guardian-tunnel.service: gate behind ~/.config/guardian-connect/.credential-ok (no platform API key is created)"
+  operator_plan=()
+  for n in "${unit_names[@]}" "$revive_unit" "$control_unit" "$(audit_unit home)" "$(audit_unit glide.vc)" "${login_assist_instances[@]}"; do if operator_stopped "$n"; then operator_plan+=("$n"); fi; done
+  [ ${#operator_plan[@]} -eq 0 ] || echo "operator stop in force: ${operator_plan[*]} stay stopped (not enabled, not started; apply ends needing manual)"
   echo "logins: each browser profile must be signed in to ChatGPT (reported, not done); only a signed-in profile gets its guardian enabled and started"
   exit 0
 fi
@@ -889,19 +932,20 @@ start_unit() {
 
 # Only stopped units are started: a running browser keeps its windows; a changed unit takes effect at its next restart.
 for n in "${started_units[@]}"; do
+  if hold_operator_stopped "$n"; then continue; fi
   enable_unit "$n"
   unit_locked "$n" || start_unit "$n"
 done
 # restarts units that ended `failed` (never an operator-stopped one), whether or not a profile is signed in yet
-sc enable --now "$revive_unit.timer" >/dev/null || echo "warning: $revive_unit.timer failed to start" >&2
+hold_operator_stopped "$revive_unit" || sc enable --now "$revive_unit.timer" >/dev/null || echo "warning: $revive_unit.timer failed to start" >&2
 # the control pass and the audits are driven by their timers; an enabled and running timer is left alone (never restarted)
 for n in "${rewritten_timers[@]}"; do # a rewritten schedule takes effect now (restarting a timer never interrupts a running pass or audit)
-  if timer_on "$n"; then sc restart "$n.timer" || echo "warning: $n.timer failed to restart" >&2; fi
+  if ! hold_operator_stopped "$n" && timer_on "$n"; then sc restart "$n.timer" || echo "warning: $n.timer failed to restart" >&2; fi
 done
-if control_active && ! timer_on "$control_unit"; then sc enable --now "$control_unit.timer" >/dev/null || echo "warning: $control_unit.timer failed to start" >&2; fi
+if control_active && ! hold_operator_stopped "$control_unit" && ! timer_on "$control_unit"; then sc enable --now "$control_unit.timer" >/dev/null || echo "warning: $control_unit.timer failed to start" >&2; fi
 if [ "$audit_timers" = true ]; then
   for ws in "${workspaces[@]}"; do
-    timer_on "$(audit_unit "$ws")" || sc enable --now "$(audit_unit "$ws").timer" >/dev/null || echo "warning: $(audit_unit "$ws").timer failed to start" >&2
+    hold_operator_stopped "$(audit_unit "$ws")" || timer_on "$(audit_unit "$ws")" || sc enable --now "$(audit_unit "$ws").timer" >/dev/null || echo "warning: $(audit_unit "$ws").timer failed to start" >&2
   done
 fi
 # logins live in the browser profiles: report, never fake. The --apply guardian of a workspace is enabled and
@@ -911,6 +955,11 @@ unreachable=()
 desktop_browser=0
 login_held=()
 for ws in "${workspaces[@]}"; do
+  # an operator-stopped account is left alone: no DevTools probing, no wait, and neither signed out nor unreachable
+  ws_held=0
+  if hold_operator_stopped "chatgpt-guardian-${ws_unit[$ws]}"; then ws_held=1; fi
+  if hold_operator_stopped "chatgpt-guardian-${ws_unit[$ws]}-browser"; then ws_held=1; fi
+  [ "$ws_held" = 0 ] || continue
   if ! hold_profile "$ws"; then login_held+=("$ws"); continue; fi
   state=unreachable
   for _ in $(seq "$login_attempts"); do
@@ -965,7 +1014,7 @@ done
 # the login helper timers go on last: its first run (the timer fires at once) stops units of a signed-out account, which the checks above must not mistake for failed starts
 if [ "$login_assist" = true ]; then
   for n in "${login_assist_instances[@]}"; do
-    timer_on "$n" || sc enable --now "$n.timer" >/dev/null || echo "warning: $n.timer failed to start" >&2
+    hold_operator_stopped "$n" || timer_on "$n" || sc enable --now "$n.timer" >/dev/null || echo "warning: $n.timer failed to start" >&2
   done
 fi
 if [ ${#down[@]} -gt 0 ]; then
@@ -986,4 +1035,7 @@ if [ ${#signed_out[@]} -gt 0 ]; then
   if [ "$home_private_display" = true ]; then home_login="home = its private display :112 (no window on this desktop: stop the home units and sign in with a normal Chrome window on the profile ~/.local/share/agent-tools/chatgpt-guardian/profiles/home), DevTools port $home_port"
   else home_login="home = the browser window on this desktop, DevTools port $home_port"; fi
   manual "sign in to ChatGPT in the guardian browser profile(s): ${signed_out[*]} ($home_login; glide.vc = the private display :111, port $glide_port: run finish-setup, its step glide-chatgpt-login stops the glide units, opens the profile in a normal Chrome window, waits until you have signed in and closed it and starts the units again); then run apply again"
+fi
+if [ ${#operator_held[@]} -gt 0 ]; then
+  manual "operator stop in force (marker $operator_marker): ${operator_held[*]} left stopped; remove the 99-operator-stop drop-ins and the marker only when the owner asks to resume, then run apply again"
 fi
