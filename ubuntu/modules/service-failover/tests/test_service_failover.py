@@ -1320,6 +1320,25 @@ class InstallTest(Base):
         self.assertEqual(self.run_install("--check").returncode, 0)
         self.assertTrue((self.root / "u" / "service-failover-repair@.service.d" / "20-limits.conf").is_file())
 
+    def test_an_operator_drop_in_in_an_instance_directory_survives_and_is_not_stale(self):
+        self.run_install()
+        inst = self.root / "u" / "service-failover-repair@foo.service.service.d"
+        inst.mkdir()
+        paused = [inst / "99-operator-stop-20261128.conf", inst / "zz-operator-paused-x.conf"]
+        for p in paused:
+            p.write_text("[Unit]\nConditionPathExists=!/tmp/marker\n")
+        smoke = inst / "90-smoke-dry.conf"
+        smoke.write_text("[Service]\nEnvironment=SERVICE_FAILOVER_DRY_RUN=1\n")
+        check = self.run_install("--check")
+        self.assertEqual(check.returncode, 3)
+        self.assertIn(f"stale: {smoke}", check.stdout)
+        for p in paused:
+            self.assertNotIn(str(p), check.stdout)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertFalse(smoke.exists())
+        self.assertTrue(all(p.is_file() for p in paused))
+        self.assertEqual(self.run_install("--check").returncode, 0)
+
     def test_a_missing_tg_is_drift_because_nobody_would_be_told_of_an_unrepairable_unit(self):
         # #226: tg replaced notify-send as the channel a human reads; notify-send itself is required by nothing any more
         self.run_install()
